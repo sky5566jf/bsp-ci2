@@ -1,0 +1,34 @@
+name: build-dylibs
+on:
+  push:
+    branches: [ main ]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build bs_unlock.dylib
+        run: |
+          xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 \
+            -miphoneos-version-min=13.0 -framework Foundation \
+            -install_name @rpath/bs_unlock.dylib \
+            bs_unlock.m fishhook.c -o bs_unlock.dylib
+          codesign -f -s - bs_unlock.dylib
+      - name: Build bs_test.dylib
+        run: |
+          xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 \
+            -miphoneos-version-min=13.0 -framework Foundation \
+            -install_name @rpath/bs_test.dylib \
+            bs_test.m -o bs_test.dylib
+          codesign -f -s - bs_test.dylib
+      - name: Sanity strings
+        run: |
+          strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.23q" || (echo "MISSING v6.23q" && exit 1)
+          otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dylibs
+          path: |
+            bs_unlock.dylib
+            bs_test.dylib
