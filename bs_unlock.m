@@ -489,6 +489,7 @@
 #include <errno.h>       // ★ v6.3：bs_read_beta_ver 的 errno 诊断
 #include <sys/mman.h>    // ★ v6.23：mprotect（运行时中和厂商 valid_time setter）
 #include <mach/mach.h>   // ★ v6.23b：mach_task_self + vm_allocate/vm_remap/vm_deallocate
+#include <mach/mach_vm.h> // ★ v6.23q：mach_vm_region / mach_vm_read_overwrite（keyhunt 扫内存）
 // ★ iOS SDK 不允许 mach_vm.h（"mach_vm.h unsupported"）→ 用 legacy vm_* 系列
 //（vm_address_t 在 arm64 上就是 64 位，行为等价，ellekit 设备侧同款用法）
 #include <mach/vm_statistics.h> // ★ v6.23b：VM_FLAGS_ANYWHERE / VM_FLAGS_OVERWRITE
