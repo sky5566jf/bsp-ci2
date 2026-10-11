@@ -413,6 +413,14 @@
 //       纯 C AES 表运行期生成（FIPS-197 自检失败即禁用），零 CI 链接改动。
 //       特征串 "keyhunt" / "FOUND ver="。
 //
+// v6.23r ★ 修复 net block 快扫路径 bug（2026-10-11 深夜，.71 真卡卡大厅驱动）：
+//       bs_block_init 快扫读的是 DATA_DIR/bs_pull.conf（App 数据目录，不存在）
+//       → fp=NULL → bv 缺省 1 + mode 空 → probe 真卡机例外**从未生效**，
+//       每次启动都装 block；Agent 长连接 22:12 断线重连时 DNS 被自己拦死
+//       （vps.beibeiplay.com blocked），脚本失联卡大厅。改为先读 PULL_CONF
+//       （Media 根真实 conf），读不到回落 DATA_DIR（兼容历史放置）。
+//       特征串不变："blockvps=0 -> net block skipped"。
+//
 // v6.23o ★★ md5 强制比对自愈（2026-10-05 深夜，1005 修复后 2h 内再坏驱动）：
 //       服务端零改动（/ver 的 md5 字段 v3.x 就有）。
 //
@@ -628,7 +636,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23q"
+#define BS_DYLIB_VER       "v6.23r"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3788,7 +3796,12 @@ static void *bs_block_init(void *arg) {
     (void)arg;
     char mode[24] = {0};
     int bv = 1;
-    FILE *fp = fopen(DATA_DIR "/bs_pull.conf", "r");
+    // ★ v6.23r 修复：快扫原来读 DATA_DIR/bs_pull.conf（App 数据目录，通常不存在），
+    //   导致 fp=NULL → bv 缺省 1 + mode 空 → probe 例外永不生效，每次启动都装 block。
+    //   真实 conf 在 PULL_CONF（Media 根）。改为先读 PULL_CONF，读不到再回落 DATA_DIR
+    //   （兼容曾把 conf 放 App 数据目录的设备）。
+    FILE *fp = fopen(PULL_CONF, "r");
+    if (!fp) fp = fopen(DATA_DIR "/bs_pull.conf", "r");
     if (fp) {
         char line[256];
         while (fgets(line, sizeof(line), fp)) {
