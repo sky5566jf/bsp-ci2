@@ -423,6 +423,16 @@
 //          重启 App 清拉黑）。心跳 code=7 同样拉黑（本机卡被别机接管场景）。
 //       ③ 激活成功清拉黑。特征串 "taken over" / "act"。
 //
+// v6.23t ★ 拉黑落盘 + 真输入判定（2026-10-13，堵重启抢回窗口）：
+//       问题：v6.23s 的 g_card_kicked 只在内存 —— 被踢机重启后拉黑丢失，而
+//       agent.log 尾部 64KB 扫描（无 offset）仍能抓到同一卡号 → 以 act=new 抢回
+//       → 与接管方 60s 心跳互踢振荡。
+//       修法：① bs_card.txt 追加 kicked= / kickts= 两行，随缓存落盘与读回；
+//             ② 解除拉黑须「真重新输入」= 捕获到行首 [Y/M/D H:M:S] 时间戳
+//                晚于 kickts 的激活日志行；旧日志残留时间戳必 ≤ kickts，不算。
+//       效果：被踢机不换卡/不重新输卡 → 重启后依旧静默封禁，绝不抢回。
+//       特征串 "kicked=" / "newer input seen after kick"。
+//
 // v6.23r ★ 修复 net block 快扫路径 bug（2026-10-11 深夜，.71 真卡卡大厅驱动）：
 //       bs_block_init 快扫读的是 DATA_DIR/bs_pull.conf（App 数据目录，不存在）
 //       → fp=NULL → bv 缺省 1 + mode 空 → probe 真卡机例外**从未生效**，
@@ -646,7 +656,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23s"
+#define BS_DYLIB_VER       "v6.23t"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -755,6 +765,7 @@ static volatile long g_card_expire    = 0;     // 到期 unix ts（0=未知）
 static volatile long g_card_lastok    = 0;     // 最近一次校验成功时间
 static char          g_card_cur[80]   = {0};   // 上次见过的卡密（变更→重新激活）
 static char          g_card_kicked[80]= {0};   // ★ v6.23s 被 code=7 踢掉的卡（本地拉黑，防接管振荡）
+static long          g_card_kickts    = 0;     // ★ v6.23t 被踢时刻（unix ts）——解除拉黑须「更晚的新输入」
 static char          g_card_devid[64] = {0};   // device_id：hw.serial，回退 token
 static char          g_cardval[80]    = {0};   // ★ v6.21：conf cardval= 手动卡密（兜底通道）
 
@@ -3853,8 +3864,11 @@ static void bs_card_cache_save(void) {
     snprintf(path, sizeof(path), "%s/bs_card.txt", DATA_DIR);
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "expire=%ld\nlastok=%ld\ncard=%s\n",
-            g_card_expire, g_card_lastok, g_card_cur);
+    // ★ v6.23t：kicked/kickts 一并落盘 —— 被踢设备重启后内存拉黑会丢，
+    //   而 agent.log 尾部扫描（无 offset）仍能抓到同一卡号 → 会以 act=new
+    //   抢回，与接管方 60s 心跳互踢。落盘后重启仍拉黑，须真输入才解除。
+    fprintf(f, "expire=%ld\nlastok=%ld\ncard=%s\nkicked=%s\nkickts=%ld\n",
+            g_card_expire, g_card_lastok, g_card_cur, g_card_kicked, g_card_kickts);
     fclose(f);
 }
 
@@ -3870,10 +3884,12 @@ static void bs_card_cache_load(void) {
         if (!strncmp(line, "expire=", 7))  g_card_expire = strtol(line + 7, NULL, 10);
         if (!strncmp(line, "lastok=", 7)) g_card_lastok = strtol(line + 7, NULL, 10);
         if (!strncmp(line, "card=", 5))   snprintf(g_card_cur, sizeof(g_card_cur), "%s", line + 5);
+        if (!strncmp(line, "kicked=", 7)) snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", line + 7);
+        if (!strncmp(line, "kickts=", 7)) g_card_kickts = strtol(line + 7, NULL, 10);
     }
     fclose(f);
-    bs_log("[card] cache loaded expire=%ld lastok=%ld card=%.20s...",
-           g_card_expire, g_card_lastok, g_card_cur);
+    bs_log("[card] cache loaded expire=%ld lastok=%ld card=%.20s... kicked=%.20s (%ld)",
+           g_card_expire, g_card_lastok, g_card_cur, g_card_kicked, g_card_kickts);
 }
 
 /// device_id：优先硬件序列号（卸载重装不变），回退 token。
@@ -4113,6 +4129,7 @@ static void *bs_cardwatch(void *arg) {
         //（厂商验卡失败不写内存全局 → getter 读空）。每 tick 扫 agent.log 末尾
         // 64KB，取**最后一次**激活事件的卡号 —— 无 offset 状态，丢不了增量。
         static char   lg_card[80] = {0};
+        static long   lg_ts       = 0;    // ★ v6.23t 该次激活事件的时间戳（行首 [Y/M/D H:M:S]）
         static int    lg_seen = 0;        // 首次成功扫到文件时打一次性诊断
         struct stat lst;
         if (stat(DATA_DIR "/log/agent.log", &lst) == 0 && lst.st_size > 0) {
@@ -4133,6 +4150,21 @@ static void *bs_cardwatch(void *arg) {
                             const char *cl = strchr(hit, '\n');
                             if (cl) {
                                 cl++;                       // 卡号行首
+                                // ★ v6.23t：解析行首 "[YYYY/MM/DD HH:MM:SS] " —— 用于区分
+                                //   「真重新输入」（时间戳晚于被踢时刻）与「日志残留兜底」。
+                                long evt_ts = 0;
+                                if (cl[0] == '[') {
+                                    int Y=0,Mo=0,D=0,h=0,mi=0,se=0;
+                                    if (sscanf(cl, "[%d/%d/%d %d:%d:%d]",
+                                               &Y,&Mo,&D,&h,&mi,&se) == 6) {
+                                        struct tm tmv;
+                                        memset(&tmv, 0, sizeof(tmv));
+                                        tmv.tm_year = Y - 1900; tmv.tm_mon = Mo - 1;
+                                        tmv.tm_mday = D; tmv.tm_hour = h;
+                                        tmv.tm_min  = mi; tmv.tm_sec = se;
+                                        evt_ts = (long)mktime(&tmv);
+                                    }
+                                }
                                 size_t cn = 0;
                                 while (cl[cn] && cl[cn] != '\n' && cl[cn] != '\r') cn++;
                                 // ★ v6.21c：卡号 = 行内**末尾连续** [0-9A-Z] 段。
@@ -4148,12 +4180,21 @@ static void *bs_cardwatch(void *arg) {
                                        (((cl[beg-1] >= '0' && cl[beg-1] <= '9')) ||
                                         ((cl[beg-1] >= 'A' && cl[beg-1] <= 'Z')))) beg--;
                                 size_t klen = end - beg;
-                                if (klen >= 8 && klen <= 40 &&
-                                    (strncmp(lg_card, cl + beg, klen) != 0 || lg_card[klen])) {
-                                    snprintf(lg_card, sizeof(lg_card), "%.*s",
-                                             (int)klen, cl + beg);
-                                    bs_log("[card] captured from agent.log: %.32s",
-                                           lg_card);
+                                if (klen >= 8 && klen <= 40) {
+                                    // ★ v6.23t：卡号相同但时间戳更新 = 又重新输了一次同一张卡
+                                    //   （尾部扫描无 offset，每 tick 都命中同一行 —— 时间戳不变
+                                    //   故不会反复刷日志）。旧条件只看卡号变化，会漏掉这个场景。
+                                    int is_new = (strncmp(lg_card, cl + beg, klen) != 0 ||
+                                                  lg_card[klen]);
+                                    int ts_new = (evt_ts > 0 && evt_ts > lg_ts);
+                                    if (is_new || ts_new) {
+                                        if (is_new)
+                                            snprintf(lg_card, sizeof(lg_card), "%.*s",
+                                                     (int)klen, cl + beg);
+                                        lg_ts = evt_ts;              // ★ v6.23t
+                                        bs_log("[card] captured from agent.log: %.32s (ts=%ld)",
+                                               lg_card, lg_ts);
+                                    }
                                 }
                             }
                         }
@@ -4203,7 +4244,11 @@ static void *bs_cardwatch(void *arg) {
         static char last_fail[80] = {0};
         static long last_try      = 0;
         if (have_card && strcmp(card, g_card_cur) != 0) {
-            if (g_card_kicked[0] && strcmp(card, g_card_kicked) == 0) {
+            // ★ v6.23t：是否「真重新输入」—— 卡值来自日志捕获、且该激活事件的时间戳
+            //   晚于被踢时刻。日志残留（旧行）时间戳必 ≤ kickts，不算真输入。
+            int real_input = (lg_card[0] && strcmp(card, lg_card) == 0 &&
+                              lg_ts > 0 && lg_ts > g_card_kickts);
+            if (g_card_kicked[0] && strcmp(card, g_card_kicked) == 0 && !real_input) {
                 // ★ v6.23s：被接管卡本地拉黑 —— 自动重试会以 act=new 抢回，
                 //   与接管方 60s 心跳互踢振荡；静默等真输入（换卡或重启 App）
                 static long last_kick_log = 0;
@@ -4213,6 +4258,11 @@ static void *bs_cardwatch(void *arg) {
                            "waiting for new input", card);
                 }
             } else {
+            if (real_input && g_card_kicked[0] && strcmp(card, g_card_kicked) == 0) {
+                g_card_kicked[0] = 0;               // ★ v6.23t 真输入 → 解除拉黑
+                g_card_kickts    = 0;
+                bs_log("[card] newer input seen after kick -> unblock %.20s...", card);
+            }
             int throttled = (last_fail[0] && !strcmp(card, last_fail) && now - last_try < 60);
             if (!throttled) {
                 last_try = now;
@@ -4221,6 +4271,7 @@ static void *bs_cardwatch(void *arg) {
                     snprintf(g_card_cur, sizeof(g_card_cur), "%s", card);
                     last_fail[0] = 0;
                     g_card_kicked[0] = 0;           // ★ v6.23s 激活成功清拉黑
+                    g_card_kickts    = 0;           // ★ v6.23t
                     bs_card_cache_save();
                 } else if (rc > 0) {
                     // 业务失败：记住这张失败卡（节流用）；若与已绑卡相同
@@ -4229,6 +4280,7 @@ static void *bs_cardwatch(void *arg) {
                     if (rc == 7) {
                         // ★ v6.23s：卡在他机手里 → 本地拉黑 + 清缓存封禁
                         snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", card);
+                        g_card_kickts = now;                    // ★ v6.23t 记录被踢时刻
                         bs_log("[card] taken over by another device, "
                                "blocked: %.20s...", card);
                         g_card_cur[0] = 0;
@@ -4258,6 +4310,7 @@ static void *bs_cardwatch(void *arg) {
                 //   以便解冻后自动恢复），接管必须停试防互抢振荡
                 if (rc == 7) {
                     snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", g_card_cur);
+                    g_card_kickts = now;                    // ★ v6.23t 记录被踢时刻
                     bs_log("[card] taken over by another device, "
                            "blocked: %.20s...", g_card_cur);
                     g_card_cur[0] = 0;
