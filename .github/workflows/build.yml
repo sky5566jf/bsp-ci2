@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.23r" || (echo "MISSING v6.23r" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.23s" || (echo "MISSING v6.23r" && exit 1)
           otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
       - uses: actions/upload-artifact@v4
         with:
