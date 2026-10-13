@@ -413,6 +413,16 @@
 //       纯 C AES 表运行期生成（FIPS-197 自检失败即禁用），零 CI 链接改动。
 //       特征串 "keyhunt" / "FOUND ver="。
 //
+// v6.23s ★ 卡密「后输入者得」落地（2026-10-13 用户拍板，配套 bsmod v3.10）：
+//       ① 激活请求（卡变更分支）body 加 "act":"new" —— 卡已被他机绑定时服务端
+//          直接改绑（接管），原持有方下次心跳收 code=7；
+//       ② code=7 处理：清 g_card_cur/expire/lastok + cache_save（bs_card.txt 卡号
+//          清空）+ 本地拉黑该卡（g_card_kicked）——拉黑是防振荡关键：被踢设备
+//          卡源（日志捕获/内存）会自动重灌同一张卡，若不拉黑将以 act=new 抢回
+//          → 与接管方 60s 心跳互踢死循环；拉黑后静默停脚本等真输入（换卡或
+//          重启 App 清拉黑）。心跳 code=7 同样拉黑（本机卡被别机接管场景）。
+//       ③ 激活成功清拉黑。特征串 "taken over" / "act"。
+//
 // v6.23r ★ 修复 net block 快扫路径 bug（2026-10-11 深夜，.71 真卡卡大厅驱动）：
 //       bs_block_init 快扫读的是 DATA_DIR/bs_pull.conf（App 数据目录，不存在）
 //       → fp=NULL → bv 缺省 1 + mode 空 → probe 真卡机例外**从未生效**，
@@ -636,7 +646,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23r"
+#define BS_DYLIB_VER       "v6.23s"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -744,6 +754,7 @@ static volatile int  g_card_blocked   = 0;     // 1=封禁（未激活/过期/�
 static volatile long g_card_expire    = 0;     // 到期 unix ts（0=未知）
 static volatile long g_card_lastok    = 0;     // 最近一次校验成功时间
 static char          g_card_cur[80]   = {0};   // 上次见过的卡密（变更→重新激活）
+static char          g_card_kicked[80]= {0};   // ★ v6.23s 被 code=7 踢掉的卡（本地拉黑，防接管振荡）
 static char          g_card_devid[64] = {0};   // device_id：hw.serial，回退 token
 static char          g_cardval[80]    = {0};   // ★ v6.21：conf cardval= 手动卡密（兜底通道）
 
@@ -4028,16 +4039,24 @@ static void bs_wipe_onion_dict(uintptr_t base) {
 }
 
 /// 返回 0=ok（g_card_expire 已更新）；-1=网络失败；业务码原值返回。
-static long bs_card_login(const char *card) {
+static long bs_card_login(const char *card, int act_new) {
     char url[256];
     snprintf(url, sizeof(url), "http://%s%s", g_card_host, CARD_PATH);
 
-    char body[256];
+    // ★ v6.23s：act=new 仅激活（卡变更）携带 —— 服务端 bsmod v3.10 据此区分
+    //   「真换卡接管」与「心跳」，心跳绝不带 act（防两台互抢振荡）
+    char body[280];
     unsigned long long nonce = (unsigned long long)time(NULL) << 17
                              ^ (unsigned long long)(uintptr_t)&nonce;
-    snprintf(body, sizeof(body),
-             "{\"card\":\"%s\",\"device_id\":\"%s\",\"nonce\":\"%016llx\"}",
-             card, g_card_devid, nonce & 0xFFFFFFFFFFFFFFFFULL);
+    if (act_new)
+        snprintf(body, sizeof(body),
+                 "{\"card\":\"%s\",\"device_id\":\"%s\",\"nonce\":\"%016llx\","
+                 "\"act\":\"new\"}",
+                 card, g_card_devid, nonce & 0xFFFFFFFFFFFFFFFFULL);
+    else
+        snprintf(body, sizeof(body),
+                 "{\"card\":\"%s\",\"device_id\":\"%s\",\"nonce\":\"%016llx\"}",
+                 card, g_card_devid, nonce & 0xFFFFFFFFFFFFFFFFULL);
 
     size_t rn = 0;
     long code = 0;
@@ -4184,19 +4203,39 @@ static void *bs_cardwatch(void *arg) {
         static char last_fail[80] = {0};
         static long last_try      = 0;
         if (have_card && strcmp(card, g_card_cur) != 0) {
+            if (g_card_kicked[0] && strcmp(card, g_card_kicked) == 0) {
+                // ★ v6.23s：被接管卡本地拉黑 —— 自动重试会以 act=new 抢回，
+                //   与接管方 60s 心跳互踢振荡；静默等真输入（换卡或重启 App）
+                static long last_kick_log = 0;
+                if (now - last_kick_log >= 300) {
+                    last_kick_log = now;
+                    bs_log("[card] taken over card %.20s... blacklisted, "
+                           "waiting for new input", card);
+                }
+            } else {
             int throttled = (last_fail[0] && !strcmp(card, last_fail) && now - last_try < 60);
             if (!throttled) {
                 last_try = now;
-                long rc = bs_card_login(card);
+                long rc = bs_card_login(card, 1);   // ★ v6.23s 激活带 act=new
                 if (rc == 0) {
                     snprintf(g_card_cur, sizeof(g_card_cur), "%s", card);
                     last_fail[0] = 0;
+                    g_card_kicked[0] = 0;           // ★ v6.23s 激活成功清拉黑
                     bs_card_cache_save();
                 } else if (rc > 0) {
                     // 业务失败：记住这张失败卡（节流用）；若与已绑卡相同
                     // （可能被解绑/冻结）→ 清缓存封禁
                     snprintf(last_fail, sizeof(last_fail), "%s", card);
-                    if (g_card_cur[0] && strcmp(card, g_card_cur) == 0) {
+                    if (rc == 7) {
+                        // ★ v6.23s：卡在他机手里 → 本地拉黑 + 清缓存封禁
+                        snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", card);
+                        bs_log("[card] taken over by another device, "
+                               "blocked: %.20s...", card);
+                        g_card_cur[0] = 0;
+                        g_card_expire = 0;
+                        g_card_lastok = 0;
+                        bs_card_cache_save();
+                    } else if (g_card_cur[0] && strcmp(card, g_card_cur) == 0) {
                         g_card_cur[0] = 0;
                         g_card_expire = 0;
                         g_card_lastok = 0;
@@ -4204,15 +4243,25 @@ static void *bs_cardwatch(void *arg) {
                     }
                 }
             }
+            }
             last_check = now;
         }
 
         // ---- 心跳：到点重发 login（在线状态 + 到期刷新） ----
         if (have_card && g_card_cur[0] && now - last_check >= g_cardtick) {
-            long rc = bs_card_login(g_card_cur);
+            long rc = bs_card_login(g_card_cur, 0);   // ★ v6.23s 心跳不带 act
             if (rc == 0) {
                 bs_card_cache_save();
             } else if (rc > 0) {
+                // ★ v6.23s：本机卡被其他设备接管（code=7）→ 拉黑+清卡，
+                //   静默停脚本等新输入；与冻结/过期不同（那些保留 g_card_cur
+                //   以便解冻后自动恢复），接管必须停试防互抢振荡
+                if (rc == 7) {
+                    snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", g_card_cur);
+                    bs_log("[card] taken over by another device, "
+                           "blocked: %.20s...", g_card_cur);
+                    g_card_cur[0] = 0;
+                }
                 // 心跳业务失败：卡被冻结/解绑/过期 → 立即封禁
                 g_card_expire = 0;
                 g_card_lastok = 0;
