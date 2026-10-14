@@ -684,7 +684,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23w"
+#define BS_DYLIB_VER       "v6.23x"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3898,6 +3898,10 @@ static int bs_autosvc_pending(char *ver, size_t vsz) {
 - (NSString *)currentTitle;
 - (NSString *)accessibilityLabel;
 - (void)sendActionsForControlEvents:(NSUInteger)events;
+- (id)rootViewController;
+- (BOOL)isKeyWindow;
+- (id)presentedViewController;
+- (NSString *)text;
 @end
 
 @interface BSAutosvcHelper : NSObject
@@ -3946,8 +3950,20 @@ static BSAutosvcHelper *g_as_helper = nil;
     if (!app) return NO;
     NSArray *wins = [(id<BSAutoUI>)app windows];
     if (!wins) return NO;
-    // ★ 诊断：前 2 拍把 UI 树 dump 进日志（类名+button title+accessibilityLabel）
-    if (g_as_tries <= 2) {
+    // ★ 诊断：窗口清单 + rootVC 链（tries 1）；UI 树 dump（tries 1/2/30）
+    if (g_as_tries == 1) {
+        bs_log("[autosvc] windows=%lu", (unsigned long)wins.count);
+        for (id w in wins) {
+            id<BSAutoUI> ww = (id<BSAutoUI>)w;
+            id root = [ww rootViewController];
+            id pres = root ? [(id)root presentedViewController] : nil;
+            bs_log("[autosvc] win key=%d hidden=%d rootVC=%s presented=%s",
+                   [ww isKeyWindow] ? 1 : 0, [ww isHidden] ? 1 : 0,
+                   root ? NSStringFromClass([root class]).UTF8String : "nil",
+                   pres ? NSStringFromClass([pres class]).UTF8String : "nil");
+        }
+    }
+    if (g_as_tries <= 2 || g_as_tries == 30) {
         g_as_dumpln = 0;
         for (id w in wins) [self as_dump:[w subviews] depth:0];
         bs_log("[autosvc] UI dump done (tries=%d, lines=%d)", g_as_tries, g_as_dumpln);
@@ -3958,18 +3974,27 @@ static BSAutosvcHelper *g_as_helper = nil;
     return NO;
 }
 
-// 递归打印视图树（cap 80 行防日志爆）
+// 递归打印视图树（cap 100 行防日志爆）
 - (void)as_dump:(id)views depth:(int)d {
-    if (d > 6 || !views || g_as_dumpln > 80) return;
-    id btnCls = NSClassFromString(@"UIButton");
+    if (d > 7 || !views || g_as_dumpln > 100) return;
+    id btnCls  = NSClassFromString(@"UIButton");
+    id lblCls  = NSClassFromString(@"UILabel");
+    id swCls   = NSClassFromString(@"UISwitch");
     for (id<BSAutoUI> v in views) {
         if (!v) continue;
-        if (g_as_dumpln > 80) return;
+        if (g_as_dumpln > 100) return;
         NSString *cls = NSStringFromClass([v class]);
         NSMutableString *info = [NSMutableString stringWithFormat:@"d%d %@", d, cls];
         if (btnCls && [v isKindOfClass:btnCls]) {
             NSString *t = [v currentTitle];
             if (t.length) [info appendFormat:@" title=%@", t];
+        }
+        if (lblCls && [v isKindOfClass:lblCls]) {
+            NSString *t = [v text];
+            if (t.length) [info appendFormat:@" text=%@", t];
+        }
+        if (swCls && [v isKindOfClass:swCls]) {
+            [info appendString:@" <SWITCH>"];
         }
         NSString *lb = [v accessibilityLabel];
         if (lb.length) [info appendFormat:@" label=%@", lb];
@@ -3981,7 +4006,7 @@ static BSAutosvcHelper *g_as_helper = nil;
 
 - (void)as_tick:(id)timer {
     g_as_tries++;
-    if (g_as_tries > 20) {
+    if (g_as_tries > 60) {
         bs_log("[autosvc] give up after %d tries (button not found; marker kept, retry next app start)",
                g_as_tries);
         [timer invalidate];
@@ -4583,7 +4608,7 @@ static void *bs_bootstrap(void *arg) {
         if (bs_proc_is_app()) {
             char asv[64];
             if (bs_autosvc_pending(asv, sizeof(asv))) {
-                bs_log("[autosvc] pending marker (ver=%.24s) -> auto-tap start-service (max 20 tries)",
+                bs_log("[autosvc] pending marker (ver=%.24s) -> auto-tap start-service (max 60 tries)",
                        asv);
                 [BSAutosvcHelper as_kickoff];
             } else {
