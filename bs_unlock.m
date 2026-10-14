@@ -264,7 +264,7 @@
 //               拒绝 crash-resume（**不抹 beta.so/不清模块文件**——可逆，
 //               续卡后自动恢复）；恢复时打 [card] re-authorized
 //       conf 新键：cardcheck=（缺省 1）、cardgrace=（小时，缺省 72）、
-//             cardtick=（秒，缺省 300）、cardkey=、cardhost=（缺省内置）
+//             cardtick=（秒，缺省 120）、cardkey=、cardhost=（缺省内置）
 //       日志：[card] 前缀。
 //       业务码对照（CardVault v2）：0 ok / 1 不存在 / 2 冻结 / 3 过期 /
 //             4 次数用完 / 5 绑定其他设备 / 401 应用未授权。
@@ -422,6 +422,19 @@
 //          → 与接管方 60s 心跳互踢死循环；拉黑后静默停脚本等真输入（换卡或
 //          重启 App 清拉黑）。心跳 code=7 同样拉黑（本机卡被别机接管场景）。
 //       ③ 激活成功清拉黑。特征串 "taken over" / "act"。
+//
+// v6.23u ★ crash-resume 签名放宽 + 扩扫 sjz.log + cardtick 300→120（2026-10-14）：
+//       背景（用户报「部分机器跑着跑着停，中控显示 string"UNKONW = 0 IPHONE_8P = 1
+//             ANDROID = 2 function.."]:1: attempt to call local func (a nil value)"）：
+//             即 v6.17 处理过的 wait_call_func 4~5h 热更新崩溃，但部分机器仍漏拉。
+//       三个缺口：
+//             ① 签名只匹配带引号格式 `local 'func'` —— 中控显示为无引号 `local func`，
+//               不同机型 lua/日志格式差异会漏匹配 → 双格式都收；
+//             ② 只扫 agent.log —— 错误也可能落 sjz.log（脚本层日志）→ 两文件都做
+//               增量扫描（基线各自独立，命中任一即走恢复判定）；
+//             ③ 老版本 dylib（v6.17 之前）根本没有 crash-resume → 出 v1.51 deb
+//               统一升级内嵌 v6.23u。
+//       另：cardtick 缺省 300→120（v6.20 注释同改），code=7 被踢感知最长 5 分钟→2 分钟。
 //
 // v6.23t ★ 拉黑落盘 + 真输入判定（2026-10-13，堵重启抢回窗口）：
 //       问题：v6.23s 的 g_card_kicked 只在内存 —— 被踢机重启后拉黑丢失，而
@@ -656,7 +669,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23t"
+#define BS_DYLIB_VER       "v6.23u"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -678,7 +691,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     blockvps=1                         ← ★ v6.19 屏蔽厂商 vps.beibeiplay.com/43.154.19.236（0 关；仅 unlock 生效）
 //     cardcheck=1                        ← ★ v6.20 自有卡密系统（0 关；缺省开，仅 unlock 起卡密线程）
 //     cardgrace=72                       ← ★ v6.20 网络失败宽限小时数
-//     cardtick=300                       ← ★ v6.20 login 心跳间隔秒
+//     cardtick=120                       ← ★ v6.23u login 心跳间隔秒（原 300）
 //     sohost=192.69.0.24                 ← ★ v6.9 局域网中继（仅 beta.so 下载走它；空=直连云端）
 //     soport=27391                       ← ★ v6.9 中继端口（sohost 为空时忽略）
 //   存在则覆盖上面编译期默认值 → 换端口/开关不必重新编译 dylib。
@@ -759,7 +772,7 @@ static char          g_card_host[64]  = CARD_HOST_DEF;
 static char          g_card_key[80]   = CARD_KEY_DEF;
 static int           g_cardcheck      = 1;     // 缺省开（probe 模式整体 early-return 不受影响）
 static int           g_cardgrace      = 1;     // 网络失败宽限（小时；v6.23g 72→1，用户拍板）
-static int           g_cardtick       = 300;   // 心跳间隔（秒）
+static int           g_cardtick       = 120;   // 心跳间隔（秒）★ v6.23u 300→120（code=7 被踢感知缩到 2 分钟）
 static volatile int  g_card_blocked   = 0;     // 1=封禁（未激活/过期/冻结/绑他机/宽限耗尽）
 static volatile long g_card_expire    = 0;     // 到期 unix ts（0=未知）
 static volatile long g_card_lastok    = 0;     // 最近一次校验成功时间
@@ -3460,7 +3473,7 @@ static void *bs_watchdog(void *arg) {
     int rl_wait  = 0;
 
     // ★ v6.17：func-nil 崩溃自动恢复（agent.log 增量扫描）
-    long   cr_size = -1;    // agent.log 上次尺寸（-1 = 尚未初始化，首轮只记基线）
+    long   cr_size[2] = {-1, -1}; // ★ v6.23u [0]=agent.log [1]=sjz.log 上次尺寸（-1=首轮只记基线）
     time_t cr_last = 0;     // 上次自动恢复时刻（冷却用）
 
     for (;;) {
@@ -3557,56 +3570,71 @@ static void *bs_watchdog(void *arg) {
         }
         last_run = run;
 
-        // --- ★ v6.17：func-nil 崩溃自动恢复 ---
+        // --- ★ v6.17：func-nil 崩溃自动恢复（★ v6.23u 签名放宽 + 扩扫 sjz.log）---
         // 厂商胶水 wait_call_func 的 4~5h 模块自刷新有缺陷：重载拿回 nil 函数 →
         // `run script error: attempt to call local 'func' (a nil value)` → 自动停脚本。
-        // 每轮对 agent.log 做增量扫描：新增字节命中签名、脚本已停稳、心跳授权中、
-        // 不在 reload 状态机里、过了冷却 → 发 OPER_START 拉起（等价中控再点一次运行）。
+        // 每轮对 agent.log / sjz.log 各做增量扫描：新增字节命中签名（带/不带引号两种
+        // 格式都收）、脚本已停稳、心跳授权中、不在 reload 状态机里、过了冷却 →
+        // 发 OPER_START 拉起（等价中控再点一次运行）。
         // 中控点停 / killswitch / 心跳失联等路径不含该签名，自然不会误拉。
         {
-            struct stat ags;
-            if (stat(DATA_DIR "/log/agent.log", &ags) == 0) {
-                long sz = (long)ags.st_size;
-                if (cr_size < 0 || sz < cr_size) {
-                    // 首轮只记基线；日志被截断/轮转时重置基线且本轮不扫描（防旧签名误触发）
-                    cr_size = sz;
-                } else if (sz > cr_size) {
-                    long add = sz - cr_size;
-                    if (add > 262144) add = 262144;   // 异常暴增只看尾部 256K
-                    long off = sz - add;
-                    char *buf = (char *)malloc((size_t)add + 1);
-                    if (buf) {
-                        int fd = open(DATA_DIR "/log/agent.log", O_RDONLY);
-                        if (fd >= 0) {
-                            lseek(fd, off, SEEK_SET);
-                            ssize_t gn = read(fd, buf, (size_t)add);
-                            close(fd);
-                            if (gn > 0) {
-                                buf[gn] = 0;
-                                if (strstr(buf, "attempt to call local 'func' (a nil value)")) {
-                                    time_t nowt = time(NULL);
-                                    if (!g_reload_busy && saw_run && run == 0 && st == 0 &&
-                                        g_hb_ok && !g_card_blocked &&
-                                        (nowt - cr_last) >= CR_COOLDOWN) {
-                                        bs_log("[cr] func-nil crash detected -> auto OPER_START (hb ok, last resume %ds ago)",
-                                               cr_last ? (int)(nowt - cr_last) : -1);
-                                        ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-                                        cr_last = nowt;
-                                    } else {
-                                        bs_log("[cr] func-nil signature seen but skip (busy=%d saw_run=%d run=%u st=%p hb=%d cd=%d)",
-                                               g_reload_busy, saw_run, (unsigned)run,
-                                               (void *)st, g_hb_ok,
-                                               cr_last ? (int)(nowt - cr_last) : -1);
+            const char *cr_paths[2] = { DATA_DIR "/log/agent.log",
+                                        DATA_DIR "/log/sjz.log" };
+            int cr_hit = 0, cr_src = -1;
+            int cri;
+            for (cri = 0; cri < 2; cri++) {
+                struct stat ags;
+                if (stat(cr_paths[cri], &ags) == 0) {
+                    long sz = (long)ags.st_size;
+                    if (cr_size[cri] < 0 || sz < cr_size[cri]) {
+                        // 首轮只记基线；日志被截断/轮转时重置基线且本轮不扫描（防旧签名误触发）
+                        cr_size[cri] = sz;
+                    } else if (sz > cr_size[cri]) {
+                        long add = sz - cr_size[cri];
+                        if (add > 262144) add = 262144;   // 异常暴增只看尾部 256K
+                        long off = sz - add;
+                        char *buf = (char *)malloc((size_t)add + 1);
+                        if (buf) {
+                            int fd = open(cr_paths[cri], O_RDONLY);
+                            if (fd >= 0) {
+                                lseek(fd, off, SEEK_SET);
+                                ssize_t gn = read(fd, buf, (size_t)add);
+                                close(fd);
+                                if (gn > 0) {
+                                    buf[gn] = 0;
+                                    if (strstr(buf, "attempt to call local 'func' (a nil value)") ||
+                                        strstr(buf, "attempt to call local func (a nil value)")) {
+                                        cr_hit = 1;
+                                        cr_src = cri;
                                     }
                                 }
                             }
+                            free(buf);
                         }
-                        free(buf);
                     }
-                    cr_size = sz;
+                    cr_size[cri] = sz;
+                } else {
+                    cr_size[cri] = -1;   // 文件暂时读不到（轮转瞬间），下轮重置基线
                 }
-            } else {
-                cr_size = -1;   // 文件暂时读不到（轮转瞬间），下轮重置基线
+                if (cr_hit) break;
+            }
+            if (cr_hit) {
+                time_t nowt = time(NULL);
+                if (!g_reload_busy && saw_run && run == 0 && st == 0 &&
+                    g_hb_ok && !g_card_blocked &&
+                    (nowt - cr_last) >= CR_COOLDOWN) {
+                    bs_log("[cr] func-nil crash detected (%s) -> auto OPER_START (hb ok, last resume %ds ago)",
+                           cr_src == 0 ? "agent.log" : "sjz.log",
+                           cr_last ? (int)(nowt - cr_last) : -1);
+                    ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
+                    cr_last = nowt;
+                } else {
+                    bs_log("[cr] func-nil signature seen (%s) but skip (busy=%d saw_run=%d run=%u st=%p hb=%d cd=%d)",
+                           cr_src == 0 ? "agent.log" : "sjz.log",
+                           g_reload_busy, saw_run, (unsigned)run,
+                           (void *)st, g_hb_ok,
+                           cr_last ? (int)(nowt - cr_last) : -1);
+                }
             }
         }
 
