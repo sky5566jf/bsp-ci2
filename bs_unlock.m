@@ -684,7 +684,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23v"
+#define BS_DYLIB_VER       "v6.23w"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3906,9 +3906,11 @@ static int bs_autosvc_pending(char *ver, size_t vsz) {
 - (void)as_tick:(id)timer;
 - (BOOL)as_tryTap;
 - (BOOL)as_scanViews:(id)views;
+- (void)as_dump:(id)views depth:(int)d;
 @end
 
 static int             g_as_tries  = 0;
+static int             g_as_dumpln = 0;
 static BSAutosvcHelper *g_as_helper = nil;
 
 @implementation BSAutosvcHelper
@@ -3944,10 +3946,37 @@ static BSAutosvcHelper *g_as_helper = nil;
     if (!app) return NO;
     NSArray *wins = [(id<BSAutoUI>)app windows];
     if (!wins) return NO;
+    // ★ 诊断：前 2 拍把 UI 树 dump 进日志（类名+button title+accessibilityLabel）
+    if (g_as_tries <= 2) {
+        g_as_dumpln = 0;
+        for (id w in wins) [self as_dump:[w subviews] depth:0];
+        bs_log("[autosvc] UI dump done (tries=%d, lines=%d)", g_as_tries, g_as_dumpln);
+    }
     for (id w in wins) {
         if ([self as_scanViews:[w subviews]]) return YES;
     }
     return NO;
+}
+
+// 递归打印视图树（cap 80 行防日志爆）
+- (void)as_dump:(id)views depth:(int)d {
+    if (d > 6 || !views || g_as_dumpln > 80) return;
+    id btnCls = NSClassFromString(@"UIButton");
+    for (id<BSAutoUI> v in views) {
+        if (!v) continue;
+        if (g_as_dumpln > 80) return;
+        NSString *cls = NSStringFromClass([v class]);
+        NSMutableString *info = [NSMutableString stringWithFormat:@"d%d %@", d, cls];
+        if (btnCls && [v isKindOfClass:btnCls]) {
+            NSString *t = [v currentTitle];
+            if (t.length) [info appendFormat:@" title=%@", t];
+        }
+        NSString *lb = [v accessibilityLabel];
+        if (lb.length) [info appendFormat:@" label=%@", lb];
+        g_as_dumpln++;
+        bs_log("[autosvc][dump] %s", [info UTF8String]);
+        [self as_dump:[v subviews] depth:d + 1];
+    }
 }
 
 - (void)as_tick:(id)timer {
