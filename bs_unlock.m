@@ -684,7 +684,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23x"
+#define BS_DYLIB_VER       "v6.23y"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3902,6 +3902,8 @@ static int bs_autosvc_pending(char *ver, size_t vsz) {
 - (BOOL)isKeyWindow;
 - (id)presentedViewController;
 - (NSString *)text;
+- (BOOL)isOn;
+- (void)setOn:(BOOL)on animated:(BOOL)animated;
 @end
 
 @interface BSAutosvcHelper : NSObject
@@ -3919,10 +3921,43 @@ static BSAutosvcHelper *g_as_helper = nil;
 
 @implementation BSAutosvcHelper
 
-// 递归扫 UIWindow 树，找 title/accessibilityLabel 含「启动服务」的 UIButton，命中即模拟点击
+// 递归扫 UIWindow 树。命中规则（.47 UI dump 实锤：启动服务 = UILabel+UISwitch 开关）：
+//   ① 首选 —— 同容器内存在 text 含「启动服务」的 UILabel 且存在 UISwitch → 拨开关：
+//      setOn:YES + sendActionsForControlEvents:UIControlEventValueChanged(4096)，
+//      走 App 自己的启动链路（会话协商齐全）；已 ON 则只消费标记不动开关。
+//   ② 兜底 —— UIButton title/accessibilityLabel 含「启动服务」→ 模拟 TouchUpInside。
 - (BOOL)as_scanViews:(id)views {
     if (!views) return NO;
     id btnCls = NSClassFromString(@"UIButton");
+    id lblCls = NSClassFromString(@"UILabel");
+    id swCls  = NSClassFromString(@"UISwitch");
+
+    // ① UISwitch 开关路径
+    if (swCls && lblCls) {
+        BOOL hasLabel = NO;
+        id<BSAutoUI> sw = nil;
+        for (id<BSAutoUI> v in views) {
+            if (!v || [v isHidden]) continue;
+            if ([v isKindOfClass:lblCls]) {
+                NSString *t = [v text];
+                if (t && [t rangeOfString:@"启动服务"].location != NSNotFound) hasLabel = YES;
+            } else if (!sw && [v isKindOfClass:swCls]) {
+                sw = v;
+            }
+        }
+        if (hasLabel && sw) {
+            if ([sw isOn]) {
+                bs_log("[autosvc] start-service switch already ON -> consume marker (no-op)");
+            } else {
+                [(id)sw setOn:YES animated:NO];
+                [(id)sw sendActionsForControlEvents:(NSUInteger)4096]; // UIControlEventValueChanged
+                bs_log("[autosvc] start-service switch -> set ON + valueChanged sent");
+            }
+            return YES;
+        }
+    }
+
+    // ② UIButton 兜底
     for (id<BSAutoUI> v in views) {
         if (!v) continue;
         if (btnCls && [v isKindOfClass:btnCls]) {
