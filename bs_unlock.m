@@ -423,6 +423,21 @@
 //          重启 App 清拉黑）。心跳 code=7 同样拉黑（本机卡被别机接管场景）。
 //       ③ 激活成功清拉黑。特征串 "taken over" / "act"。
 //
+// v6.23v ★ App 进程首启自动点「启动服务」（2026-10-14）：
+//       需求（用户）：装完新 bspath 后模拟人工「打开 App → 点启动服务」，每次新版本只执行一次。
+//       前提：filter plist 扩为 Agent+App 两个 Executable（原只注 Agent，App 进程 dylib 不加载）。
+//       机制：
+//             ① postinst 装 dylib 后写标记 $DATA/.autosvc_pending（内容=版本号），再冷启动 App；
+//             ② App 进程内 bs_bootstrap 顶部判进程名（_NSGetExecutablePath）= App →
+//               若标记存在 → performSelectorOnMainThread 起 NSTimer（2s 一拍，最多 20 拍）；
+//             ③ 每拍递归扫 UIWindow 树找 title/accessibilityLabel 含「启动服务」的 UIButton，
+//               命中即 sendActionsForControlEvents:UIControlEventTouchUpInside（等价真人手点，
+//               走 App 自己的启动链路，会话协商天然齐全 —— v1.49 nohup 直拉 recv rep key failed 的根）；
+//             ④ 点击成功 → 标记改名 .autosvc_done_<ts> → 本次安装生命周期内不再执行；
+//               20 拍没找到（UI 慢/文案变了）→ 留标记，下次开 App 再试，最坏退化为手点。
+//       App 进程内其余全跳过：bs_block_init 不装（constructor 判进程）、bs_find_base/注入/
+//       心跳/pull 均不跑（Agent 专属），bs_log 打 [autosvc] 前缀进同一日志。
+//
 // v6.23u ★ crash-resume 签名放宽 + 扩扫 sjz.log + cardtick 300→120（2026-10-14）：
 //       背景（用户报「部分机器跑着跑着停，中控显示 string"UNKONW = 0 IPHONE_8P = 1
 //             ANDROID = 2 function.."]:1: attempt to call local func (a nil value)"）：
@@ -669,7 +684,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23u"
+#define BS_DYLIB_VER       "v6.23v"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3842,8 +3857,144 @@ BS_INTERPOSE(bs_hook_getaddrinfo, getaddrinfo);
 /// ★ v6.19：constructor 立即起的安装线程 —— 赶在 Agent 首次外联之前。
 ///   不等 bootstrap 的 2s sleep：自己快扫 conf 的 mode=/blockvps=（毫秒级纯 C）。
 ///   probe（真卡机）永不装钩子 —— 卡密心跳必须活着。
+// ══════════ ★ v6.23v App 进程：安装后首启自动点「启动服务」 ══════════
+// 只在 App 本体进程跑（filter 扩到 App 后 ElleKit 会把本 dylib 也注入 App）。
+
+// 判当前进程是不是 App 本体（可执行名 = BetaScreenTYMDESUJCX8T；Agent 名多一个 "Agent"）
+static int bs_proc_is_app(void) {
+    char path[1024];
+    uint32_t sz = sizeof(path);
+    if (_NSGetExecutablePath(path, &sz) != 0) return 0;
+    const char *bn = strrchr(path, '/');
+    bn = bn ? bn + 1 : path;
+    return strcmp(bn, "BetaScreenTYMDESUJCX8T") == 0;
+}
+
+// 「装后自动点服务」标记：postinst 写（内容=deb 版本号），点成功后改名消费
+static int bs_autosvc_pending(char *ver, size_t vsz) {
+    char path[300];
+    snprintf(path, sizeof(path), DATA_DIR "/.autosvc_pending");
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    if (ver && vsz) {
+        ver[0] = 0;
+        if (fgets(ver, (int)vsz, f)) {
+            size_t n = strlen(ver);
+            while (n && (ver[n-1] == '\n' || ver[n-1] == '\r' || ver[n-1] == ' ')) ver[--n] = 0;
+        }
+    }
+    fclose(f);
+    return 1;
+}
+
+// UI 属性协议 —— 只声明用到的选择器，保证 objc_msgSend 的返回值寄存器约定正确
+// （CGFloat/double 走 v 寄存器，裸 id 消息会读错寄存器，必须经协议声明）
+@protocol BSAutoUI <NSObject>
+@optional
+- (NSArray *)windows;
+- (NSArray *)subviews;
+- (BOOL)isHidden;
+- (CGFloat)alpha;
+- (NSString *)currentTitle;
+- (NSString *)accessibilityLabel;
+- (void)sendActionsForControlEvents:(NSUInteger)events;
+@end
+
+@interface BSAutosvcHelper : NSObject
++ (void)as_kickoff;
+- (void)as_setup;
+- (void)as_tick:(id)timer;
+- (BOOL)as_tryTap;
+- (BOOL)as_scanViews:(id)views;
+@end
+
+static int             g_as_tries  = 0;
+static BSAutosvcHelper *g_as_helper = nil;
+
+@implementation BSAutosvcHelper
+
+// 递归扫 UIWindow 树，找 title/accessibilityLabel 含「启动服务」的 UIButton，命中即模拟点击
+- (BOOL)as_scanViews:(id)views {
+    if (!views) return NO;
+    id btnCls = NSClassFromString(@"UIButton");
+    for (id<BSAutoUI> v in views) {
+        if (!v) continue;
+        if (btnCls && [v isKindOfClass:btnCls]) {
+            if ([v isHidden]) continue;
+            if ([v alpha] < 0.05) continue;
+            NSString *t  = [v currentTitle];
+            NSString *lb = [v accessibilityLabel];
+            BOOL hit = NO;
+            if (t  && [t  rangeOfString:@"启动服务"].location != NSNotFound) hit = YES;
+            if (!hit && lb && [lb rangeOfString:@"启动服务"].location != NSNotFound) hit = YES;
+            if (!hit) continue;
+            bs_log("[autosvc] button found -> tap (title=%s)", t ? [t UTF8String] : "?");
+            [v sendActionsForControlEvents:(NSUInteger)64];   // UIControlEventTouchUpInside
+            return YES;
+        }
+        if ([self as_scanViews:[v subviews]]) return YES;
+    }
+    return NO;
+}
+
+- (BOOL)as_tryTap {
+    id appCls = NSClassFromString(@"UIApplication");
+    if (!appCls) return NO;
+    id app = [(id)appCls sharedApplication];
+    if (!app) return NO;
+    NSArray *wins = [(id<BSAutoUI>)app windows];
+    if (!wins) return NO;
+    for (id w in wins) {
+        if ([self as_scanViews:[w subviews]]) return YES;
+    }
+    return NO;
+}
+
+- (void)as_tick:(id)timer {
+    g_as_tries++;
+    if (g_as_tries > 20) {
+        bs_log("[autosvc] give up after %d tries (button not found; marker kept, retry next app start)",
+               g_as_tries);
+        [timer invalidate];
+        return;
+    }
+    if ([self as_tryTap]) {
+        char pend[300], done[340];
+        snprintf(pend, sizeof(pend), DATA_DIR "/.autosvc_pending");
+        snprintf(done, sizeof(done), DATA_DIR "/.autosvc_done_%ld", (long)time(NULL));
+        if (rename(pend, done) == 0)
+            bs_log("[autosvc] tapped OK -> marker consumed, service should be starting");
+        else
+            bs_log("[autosvc] tapped but rename failed (errno=%d)", errno);
+        [timer invalidate];
+        return;
+    }
+    // 未命中：repeats=YES 自动下一拍
+}
+
+- (void)as_setup {
+    NSTimer *t = [NSTimer timerWithTimeInterval:2.0
+                                         target:self
+                                       selector:@selector(as_tick:)
+                                       userInfo:nil
+                                        repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+}
+
++ (void)as_kickoff {
+    BSAutosvcHelper *h = [[BSAutosvcHelper alloc] init];
+    g_as_helper = h;   // 常驻引用（timer 也 retain target）
+    [h performSelectorOnMainThread:@selector(as_setup) withObject:nil waitUntilDone:NO];
+}
+
+@end
+// ══════════════════════════════════════════════════════════════════════
+
 static void *bs_block_init(void *arg) {
     (void)arg;
+    // ★ v6.23v：App 进程不装 net block —— 只在 Agent 进程屏蔽厂商服务器。
+    //   App 的中控连接（server2 34878）与厂商心跳路径不明的，宁可不动。
+    if (bs_proc_is_app()) return NULL;
     char mode[24] = {0};
     int bv = 1;
     // ★ v6.23r 修复：快扫原来读 DATA_DIR/bs_pull.conf（App 数据目录，通常不存在），
@@ -4398,6 +4549,20 @@ static void *bs_bootstrap(void *arg) {
     sleep(2);
 
     @autoreleasepool {
+        // ★★★ v6.23v：App 进程分支 —— filter 扩到 App 后这里才会跑。
+        //     只做「装后自动点启动服务」，其余 Agent 专属逻辑全部跳过。
+        if (bs_proc_is_app()) {
+            char asv[64];
+            if (bs_autosvc_pending(asv, sizeof(asv))) {
+                bs_log("[autosvc] pending marker (ver=%.24s) -> auto-tap start-service (max 20 tries)",
+                       asv);
+                [BSAutosvcHelper as_kickoff];
+            } else {
+                bs_log("[autosvc] no marker, App process idle (dylib loaded OK)");
+            }
+            return NULL;
+        }
+
         g_base = bs_find_base();
         if (!g_base) {
             bs_log("agent image not found (count=%u)", _dyld_image_count());
