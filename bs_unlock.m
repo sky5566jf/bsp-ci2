@@ -603,7 +603,6 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 
 // ★ v6.17：func-nil 崩溃自动恢复（crash-resume）
 #define CR_COOLDOWN     300     // 两次自动恢复最小间隔（秒）
-#define BS_SILENT_TIMEOUT 1200  // ★ v6.23z sjz.log 静默判定（秒）：脚本层 20min 无任何输出=卡死/停摆
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
 //   弱网实证（2026-09-28，111.172.x 两台）：共用 6s/8s 超时 → 每次下载 8s 被掐、
@@ -685,7 +684,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.23z"
+#define BS_DYLIB_VER       "v6.24a"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3683,28 +3682,6 @@ static void *bs_watchdog(void *arg) {
                            (void *)st, g_hb_ok,
                            cr_last ? (int)(nowt - cr_last) : -1);
                 }
-            }
-        }
-
-        // --- ★ v6.23z：脚本静默看门狗 —— 兜住 [cr] 接不住的场景 ---
-        // [cr] 触发要求 run==0 && st==0（厂商报错后停稳态）。但实测存在
-        // 「run 标志仍是 1、脚本实际已卡死/空转」的中间态（此时中控手动
-        // 重新下发运行脚本能救活，等价 OPER_START 在 run=1 时也可用）。
-        // sjz.log 是脚本层唯一持续输出日志（项目判生死惯例），hb 授权正常、
-        // 脚本曾运行过、非 reload 状态机时，其 mtime 静默超 20min =>
-        // 强制 OPER_START（=中控重新下发运行）。冷却复用 CR_COOLDOWN。
-        {
-            struct stat sjs;
-            time_t nowt2 = time(NULL);
-            if (saw_run && !g_reload_busy && g_hb_ok && !g_card_blocked &&
-                stat(DATA_DIR "/log/sjz.log", &sjs) == 0 && sjs.st_size > 0 &&
-                (nowt2 - (time_t)sjs.st_mtime) >= BS_SILENT_TIMEOUT &&
-                (nowt2 - cr_last) >= CR_COOLDOWN) {
-                bs_log("[wd] script silent %ds (sjz.log stale) -> force OPER_START (hb ok, last resume %ds ago)",
-                       (int)(nowt2 - (time_t)sjs.st_mtime),
-                       cr_last ? (int)(nowt2 - cr_last) : -1);
-                ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-                cr_last = nowt2;
             }
         }
 
