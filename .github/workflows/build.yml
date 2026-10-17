@@ -24,11 +24,13 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.24b" || (echo "MISSING v6.24b" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.24c" || (echo "MISSING v6.24c" && exit 1)
           strings bs_unlock.dylib | grep -q "kicked=" || (echo "MISSING kicked field" && exit 1)
           strings bs_unlock.dylib | grep -q "newer input seen after kick" || (echo "MISSING unblock path" && exit 1)
           strings bs_unlock.dylib | grep -q "\[cr\] retry #" || (echo "MISSING crash retry" && exit 1)
           strings bs_unlock.dylib | grep -q "recovery OK, script running again" || (echo "MISSING recovery-ok" && exit 1)
+          strings bs_unlock.dylib | grep -q "can not find version key" || (echo "MISSING loadfail sig" && exit 1)
+          strings bs_unlock.dylib | grep -q "prewarm done" || (echo "MISSING key prewarm" && exit 1)
           otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
       - uses: actions/upload-artifact@v4
         with:

@@ -609,6 +609,12 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 
 // ★ v6.17：func-nil 崩溃自动恢复（crash-resume）
 #define CR_COOLDOWN     300     // 两次自动恢复最小间隔（秒）
+// ★ v6.24c：加载期失败也纳入自愈 —— 签名扩到 `can not find version key` /
+//   `load snail module failed`（10-17 .115 装 v1.56 后冷启：「加载运行库出错」）。
+//   该类失败发生在「中控上线 4s 就补发 run、而 dylib 还没铺完全部段版本键」的
+//   窗口内（实测键 17:45:19.7 才齐，加载 17:45:18 已失败），键齐后重试必成。
+//   同时把 init 阶段改成「同步预铺全部版本键」（见 bootstrap 1a-2），把窗口压到 ~1s。
+//   闸门对 loadfail 不要求 saw_run（run 可能已回落而 saw_run 尚未置位）。
 // ★ v6.24b：崩溃恢复「重试状态机」—— v6.24a 只救一次：OPER_START 后脚本若二次
 //   崩溃（厂商 bb_common 仍为 nil），后续不再产生新的 "run script error:" 行 →
 //   cr_hit 不再命中 → 永久躺平（10-17 .115 实锤停摆 53min）。
@@ -697,7 +703,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24b"
+#define BS_DYLIB_VER       "v6.24c"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3639,6 +3645,7 @@ static void *bs_watchdog(void *arg) {
             const char *cr_paths[2] = { DATA_DIR "/log/agent.log",
                                         DATA_DIR "/log/sjz.log" };
             int cr_hit = 0, cr_src = -1;
+            int cr_loadfail = 0;   // ★ v6.24c：本次命中是否属「加载期失败」类
             int cri;
             for (cri = 0; cri < 2; cri++) {
                 struct stat ags;
@@ -3671,6 +3678,17 @@ static void *bs_watchdog(void *arg) {
                                         cr_hit = 1;
                                         cr_src = cri;
                                     }
+                                    // ★ v6.24c：加载期失败 —— 缺版本密钥 / snail 模块加载失败。
+                                    //   实测（10-17 .115）：beta.so 有 9 个段版本，dylib 启动
+                                    //   先只铺到 2 把，中控 4s 后下发 run → 18s 加载失败；
+                                    //   其余 7 把 19.7s 才补齐。这类失败**键补齐后重试必成**，
+                                    //   因此同样视为停摆信号并交给重试状态机（不再干等人点）。
+                                    if (strstr(buf, "can not find version key") ||
+                                        strstr(buf, "load snail module failed")) {
+                                        cr_hit = 1;
+                                        cr_src = cri;
+                                        cr_loadfail = 1;
+                                    }
                                 }
                             }
                             free(buf);
@@ -3684,9 +3702,13 @@ static void *bs_watchdog(void *arg) {
             }
             if (cr_hit) {
                 time_t nowt = time(NULL);
-                if (!g_reload_busy && saw_run && run == 0 && st == 0 &&
-                    g_hb_ok && !g_card_blocked &&
-                    (nowt - cr_last) >= CR_COOLDOWN) {
+                // ★ v6.24c：加载失败类签名不要求 saw_run —— 这种失败发生在
+                //   「中控已下发 run、脚本刚进 begin load script 就挂」的瞬间，
+                //   run 可能已回落 0 而 saw_run 还没来得及置位，用老闸门会漏判。
+                int gate_ok = (!g_reload_busy && (saw_run || cr_loadfail) &&
+                               run == 0 && st == 0 && g_hb_ok && !g_card_blocked &&
+                               (nowt - cr_last) >= CR_COOLDOWN);
+                if (gate_ok) {
                     bs_log("[cr] script-error crash detected (%s) -> auto OPER_START (hb ok, last resume %ds ago)",
                            cr_src == 0 ? "agent.log" : "sjz.log",
                            cr_last ? (int)(nowt - cr_last) : -1);
@@ -3696,11 +3718,21 @@ static void *bs_watchdog(void *arg) {
                     cr_retry   = 0;
                     cr_next    = nowt + CR_RETRY_BASE;
                 } else {
-                    bs_log("[cr] script-error signature seen (%s) but skip (busy=%d saw_run=%d run=%u st=%p hb=%d cd=%d)",
+                    bs_log("[cr] script-error signature seen (%s) but skip (busy=%d saw_run=%d run=%u st=%p hb=%d cd=%d%s)",
                            cr_src == 0 ? "agent.log" : "sjz.log",
                            g_reload_busy, saw_run, (unsigned)run,
                            (void *)st, g_hb_ok,
-                           cr_last ? (int)(nowt - cr_last) : -1);
+                           cr_last ? (int)(nowt - cr_last) : -1,
+                           cr_loadfail ? " loadfail" : "");
+                    // ★ v6.24c：加载失败类签名不许丢弃 —— 签名行只会出现一次，
+                    //   丢弃就等于永久放弃。这里挂 pending，交给下面的重试状态机
+                    //   在条件恢复（st 归零 / 键补齐）后接着拉；若脚本其实已跑起来，
+                    //   pending 会以 recovery OK 自行解除，不产生副作用。
+                    if (cr_loadfail && !g_reload_busy && !g_card_blocked && g_hb_ok) {
+                        cr_pending = 1;
+                        if (cr_next <= nowt) cr_next = nowt + CR_RETRY_BASE;
+                        bs_log("[cr] loadfail -> pending, state machine will retry");
+                    }
                 }
             }
         }
@@ -4764,6 +4796,25 @@ static void *bs_bootstrap(void *arg) {
         // 1a) ★ v6.15：beta.so 是多记录容器 —— 记录1（脚本载荷）的 ver 恒为 020909，
         //     只注文件头版本（记录0 元数据版本）会让载荷记录无键 → 「加载运行库出错」。
         bs_ensure_payload_key(g_base);
+
+        // 1a-2) ★ v6.24c：**同步预铺「全部段版本」密钥**。
+        //   实测（10-17 .115 装 v1.56 后冷启）：中控在设备上线约 4s 就补发
+        //   `run script msg`，而 verwatch 首拍要等 3s、逐版本 HTTP 再各约 80ms，
+        //   于是 17:45:18 加载时只铺到 2 把（030100 base + 020909 payload），
+        //   其余 7 把 17:45:19.7 才到 → `can not find version key!!`
+        //   → `load snail module failed` → 中控该行显示「加载运行库出错」。
+        //   在 init 阶段一次性铺完，把「键就绪」窗口从 ~6s 压到 ~1s，
+        //   赶在中控下发 run 之前把键备齐。
+        {
+            int pv = bs_refresh_so_vers();
+            for (int pi = 0; pi < pv; pi++) {
+                char pvh[8];
+                snprintf(pvh, sizeof(pvh), "%02x%02x%02x",
+                         g_ek_vers[pi][0], g_ek_vers[pi][1], g_ek_vers[pi][2]);
+                bs_ensure_extra_key(g_base, pvh, 1);   // bypass_throttle：首铺必取
+            }
+            if (pv > 0) bs_log("[mh] prewarm done, %d ver(s) ensured", pv);
+        }
 
         // 1b) ★ v6.5：起版本哨兵 —— 3s 轮询 beta.so 版本，跃迁即补密钥
         pthread_t tv;
