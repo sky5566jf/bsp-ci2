@@ -208,6 +208,12 @@
 //             ④ 日志轮转（size 变小）只重置基线不扫描，避免旧签名误触发。
 //       不自动拉起的情形（自然排除）：中控主动点停 / killswitch（403 拒绝）/ 心跳失联
 //             —— 这些路径的 agent.log 都不含 func-nil 签名。
+//       ★ v6.24b 补漏（2026-10-17 .115 实锤）：v6.24a 只在「新增字节命中签名」时
+//             动作，OPER_START 后脚本若二次崩溃（bb_common 仍 nil）不再产生新签名
+//             → 永久躺平（16:16 崩，停到 17:09+ 未恢复）。改为「崩溃检出 → pending
+//             状态机 → 60s 起递增至 600s 封顶无限重试」，直到 run=1 或条件不满足。
+//             因为只在真实崩溃签名命中时置位，休眠静默不会误触发（不复活 v6.23z
+//             的静默看门狗）。特征串 "[cr] retry #" / "[cr] recovery OK"。
 //
 // v6.18 ★★★★★ 多版本键注入 + 跟版键闸门（2026-10-01，3.0.5 实战驱动）：
 //       症状（.45 实测）：beta.so 030001→030005 跟版后，每次 run script 都
@@ -603,6 +609,13 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 
 // ★ v6.17：func-nil 崩溃自动恢复（crash-resume）
 #define CR_COOLDOWN     300     // 两次自动恢复最小间隔（秒）
+// ★ v6.24b：崩溃恢复「重试状态机」—— v6.24a 只救一次：OPER_START 后脚本若二次
+//   崩溃（厂商 bb_common 仍为 nil），后续不再产生新的 "run script error:" 行 →
+//   cr_hit 不再命中 → 永久躺平（10-17 .115 实锤停摆 53min）。
+//   改为「崩溃检出 → pending → 递增间隔无限重试」，只在真实崩溃签名命中时置位
+//   （不碰 sjz.log 静默，避免休眠误判 —— 即 v6.23z 静默看门狗被否的原因）。
+#define CR_RETRY_BASE   60      // 首次重试间隔（秒），之后按重试次数线性递增
+#define CR_RETRY_CAP    600     // 重试间隔上限（秒）—— 到顶后固定 10min 一次，永不放弃
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
 //   弱网实证（2026-09-28，111.172.x 两台）：共用 6s/8s 超时 → 每次下载 8s 被掐、
@@ -684,7 +697,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24a"
+#define BS_DYLIB_VER       "v6.24b"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3516,6 +3529,10 @@ static void *bs_watchdog(void *arg) {
     // ★ v6.17：func-nil 崩溃自动恢复（agent.log 增量扫描）
     long   cr_size[2] = {-1, -1}; // ★ v6.23u [0]=agent.log [1]=sjz.log 上次尺寸（-1=首轮只记基线）
     time_t cr_last = 0;     // 上次自动恢复时刻（冷却用）
+    // ★ v6.24b：崩溃恢复重试状态机
+    int    cr_pending = 0;  // 1 = 崩溃已检出、正等脚本跑起来
+    int    cr_retry   = 0;  // 已累计重试次数（间隔递增 + 日志节流）
+    time_t cr_next    = 0;  // 下次允许重试的时刻
 
     for (;;) {
         sleep(WD_TICK_SECS);
@@ -3674,7 +3691,10 @@ static void *bs_watchdog(void *arg) {
                            cr_src == 0 ? "agent.log" : "sjz.log",
                            cr_last ? (int)(nowt - cr_last) : -1);
                     ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-                    cr_last = nowt;
+                    cr_last    = nowt;
+                    cr_pending = 1;                        // ★ v6.24b 进入重试状态机
+                    cr_retry   = 0;
+                    cr_next    = nowt + CR_RETRY_BASE;
                 } else {
                     bs_log("[cr] script-error signature seen (%s) but skip (busy=%d saw_run=%d run=%u st=%p hb=%d cd=%d)",
                            cr_src == 0 ? "agent.log" : "sjz.log",
@@ -3682,6 +3702,37 @@ static void *bs_watchdog(void *arg) {
                            (void *)st, g_hb_ok,
                            cr_last ? (int)(nowt - cr_last) : -1);
                 }
+            }
+        }
+
+        // --- ★ v6.24b：崩溃恢复重试状态机（不依赖新日志行）---
+        //   v6.24a 的 [cr] 只在 agent.log/sjz.log「新增字节」里命中签名时才动作；
+        //   OPER_START 后脚本若二次崩溃（bb_common 仍为 nil），不会再产生新签名
+        //   → cr_hit 永不再命中 → 永久停摆（10-17 .115：16:16 崩，停到 17:09+）。
+        //   这里改为：崩溃一旦检出就挂起 pending，每轮复查「脚本是否跑起来」；
+        //   没起来就按 60s→120s→…→600s 递增间隔反复 OPER_START，直到 run=1，
+        //   或条件不满足（卡封禁 / 心跳失联 / 正在 reload）时暂停但不清 pending。
+        //   只在真实崩溃签名命中时置位，故「用户主动停脚本」不会被误拉起。
+        if (cr_pending) {
+            time_t nowt2 = time(NULL);
+            if (run) {
+                bs_log("[cr] recovery OK, script running again (retries=%d)", cr_retry);
+                cr_pending = 0;
+                cr_retry   = 0;
+            } else if (g_reload_busy) {
+                /* reload 状态机接管，本状态机让位 */
+            } else if (st != 0) {
+                /* 脚本正在加载（state 非零）→ 等它跑起来 */
+            } else if (!g_hb_ok || g_card_blocked) {
+                /* 心跳失联 / 卡被封禁 → 暂停重试但不放弃，等条件恢复 */
+            } else if (nowt2 >= cr_next) {
+                long gap = (long)CR_RETRY_BASE * (cr_retry + 1);
+                if (gap > CR_RETRY_CAP) gap = CR_RETRY_CAP;
+                cr_retry++;
+                cr_next = nowt2 + (time_t)gap;
+                bs_log("[cr] retry #%d -> OPER_START (st=0 run=0, next try in %lds)",
+                       cr_retry, gap);
+                ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
             }
         }
 
