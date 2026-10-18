@@ -550,6 +550,9 @@
 #include <ctype.h>
 #include <errno.h>       // ★ v6.3：bs_read_beta_ver 的 errno 诊断
 #include <sys/mman.h>    // ★ v6.23：mprotect（运行时中和厂商 valid_time setter）
+#include <spawn.h>       // ★ v6.24d：冷启 App / uiopen 用 posix_spawn（rootless 无 /bin/sh，system() 不可用）
+#include <signal.h>      // ★ v6.24d：posix_spawnattr sigmask
+extern char **environ;   // ★ v6.24d：posix_spawn envp
 #include <mach/mach.h>   // ★ v6.23b：mach_task_self + vm_allocate/vm_remap/vm_deallocate
 // ★ v6.23q：iOS SDK 不提供 <mach/mach_vm.h>（头里直接 #error），但符号在
 //   libsystem_kernel 里齐全 —— 手动 extern 声明即可（keyhunt 扫内存用）。
@@ -620,8 +623,21 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //   cr_hit 不再命中 → 永久躺平（10-17 .115 实锤停摆 53min）。
 //   改为「崩溃检出 → pending → 递增间隔无限重试」，只在真实崩溃签名命中时置位
 //   （不碰 sjz.log 静默，避免休眠误判 —— 即 v6.23z 静默看门狗被否的原因）。
-#define CR_RETRY_BASE   60      // 首次重试间隔（秒），之后按重试次数线性递增
+// ★ v6.24d：全链路自动闭环 —— 补齐 10-18 .216 实锤故障链的三段缺口：
+//   ① func-nil 瞬时竞态 → 快退避（首拉 15s，OPER_START 幂等 + run/st/hb 三闸防误拉）；
+//   ② 持久化形态 = App「启动服务」会话死（agent.log 尾部 recv rep key failed 循环）
+//      → 连续 CR_ESC_RETRIES 次 retry 失败后升级冷启 App：确保 .autosvc_pending
+//      marker（App 内 dylib 加载期检查并自动拨「启动服务」）→ killall → uiopen，
+//      CR_ESC_MIN 限速防冷启循环；
+//   ③ 脚本活但游戏被顶到后台（sjz 尾部 game is not front app + sjz 停摆）→
+//      [fg] 看门狗 uiopen 游戏拉回前台，FG_MIN 限速。
+#define CR_RETRY_BASE   15      // ★ v6.24d：首次重试间隔 60→15（之后线性递增，见下）
 #define CR_RETRY_CAP    600     // 重试间隔上限（秒）—— 到顶后固定 10min 一次，永不放弃
+#define CR_ESC_RETRIES  2       // ★ v6.24d：连续失败达到该 retry 次数后才考虑会话死升级
+#define CR_ESC_MIN      1800    // ★ v6.24d：冷启 App 限速（秒）
+#define FG_STALE_SECS   180     // ★ v6.24d：sjz.log 停摆判定（秒）
+#define FG_MIN          600     // ★ v6.24d：[fg] uiopen 游戏限速（秒）
+#define FG_GAME_BID     "com.tencent.tmgp.dfm"   // ★ v6.24d：三角洲行动（DeltaForceClient.app）
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
 //   弱网实证（2026-09-28，111.172.x 两台）：共用 6s/8s 超时 → 每次下载 8s 被掐、
@@ -703,7 +719,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24c"
+#define BS_DYLIB_VER       "v6.24d"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3514,6 +3530,66 @@ static int bs_inject_modules(uintptr_t base) {
 }
 
 // ---------------------------------------------------------------- 看门狗
+// ★ v6.24d：读文件尾部并统计 needle 出现次数（近因签名判定；只读，不挑格式）
+static int bs_tail_count(const char *path, long want, const char *needle) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return 0; }
+    long off = sb.st_size > want ? sb.st_size - want : 0;
+    long add = sb.st_size - off;
+    char *buf = (char *)malloc((size_t)add + 1);
+    if (!buf) { close(fd); return 0; }
+    lseek(fd, off, SEEK_SET);
+    ssize_t gn = read(fd, buf, (size_t)add);
+    close(fd);
+    if (gn <= 0) { free(buf); return 0; }
+    buf[gn] = 0;
+    int cnt = 0;
+    const char *p = buf;
+    while ((p = strstr(p, needle)) != NULL) { cnt++; p++; }
+    free(buf);
+    return cnt;
+}
+
+// ★ v6.24d：posix_spawn 薄封装 —— rootless 设备没有 /bin/sh，system() 必挂，
+//   必须 posix_spawn + 显式绝对路径；sigdefault 全置 + mask 清空（继承标准语义）。
+static void bs_spawnv(const char *path, char *const argv[]) {
+    pid_t pid = -1;
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t all, none;
+    sigfillset(&all);
+    sigemptyset(&none);
+    posix_spawnattr_setsigdefault(&attr, &all);
+    posix_spawnattr_setsigmask(&attr, &none);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
+    int rc = posix_spawn(&pid, path, NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    bs_log("[v624d] spawn %s rc=%d", path, rc);
+}
+
+// ★ v6.24d：冷启 App 重建「启动服务」会话（与 deb postinst / autosvc marker 同源机制）。
+//   marker 检查发生在 App 进程 dylib 加载期，所以这里只保证 marker 在场 + 冷启；
+//   App 起来后由它自己拨「启动服务」（v1.52 既有链路），Agent 会话随之重建。
+static void bs_cold_restart_app(void) {
+    char mp[300];
+    snprintf(mp, sizeof(mp), "%s/.autosvc_pending", DATA_DIR);
+    struct stat sb;
+    if (stat(mp, &sb) != 0) {                 // marker 不在场才补写（内容=版本串）
+        FILE *f = fopen(mp, "w");
+        if (f) { fputs(BS_DYLIB_VER, f); fclose(f); }
+    }
+    char *ka[] = { (char *)"/usr/bin/killall", (char *)"-9",
+                   (char *)"BetaScreenTYMDESUJCX8T", NULL };
+    bs_spawnv("/usr/bin/killall", ka);
+    sleep(2);
+    char *uo[] = { (char *)"/usr/bin/uiopen", (char *)"--bundleid",
+                   (char *)"com.app.BetaScreenTYMDESUJCX8T", NULL };
+    bs_spawnv("/usr/bin/uiopen", uo);
+    bs_log("[cr] cold restart App issued (marker ensured + killall + uiopen)");
+}
+
 static void *bs_watchdog(void *arg) {
     uintptr_t base = (uintptr_t)arg;
     volatile uint64_t *stp  = (volatile uint64_t *)(base + OFF_STATE);
@@ -3539,6 +3615,8 @@ static void *bs_watchdog(void *arg) {
     int    cr_pending = 0;  // 1 = 崩溃已检出、正等脚本跑起来
     int    cr_retry   = 0;  // 已累计重试次数（间隔递增 + 日志节流）
     time_t cr_next    = 0;  // 下次允许重试的时刻
+    time_t cr_esc_last = 0; // ★ v6.24d：上次冷启 App 时刻（升级限速）
+    time_t fg_last     = 0; // ★ v6.24d：上次 [fg] uiopen 游戏时刻（限速）
 
     for (;;) {
         sleep(WD_TICK_SECS);
@@ -3762,9 +3840,47 @@ static void *bs_watchdog(void *arg) {
                 if (gap > CR_RETRY_CAP) gap = CR_RETRY_CAP;
                 cr_retry++;
                 cr_next = nowt2 + (time_t)gap;
+                // ★ v6.24d：连续 CR_ESC_RETRIES 次 retry 失败 + agent.log 尾部
+                //   recv rep key failed 密集出现 = App 服务会话死（持久化形态，
+                //   10-18 .216 实锤：OPER_START 拉起即炸循环）→ 升级冷启 App
+                //   重建会话；下一轮 retry 走新会话即可成。CR_ESC_MIN 限速。
+                if (cr_retry >= CR_ESC_RETRIES
+                    && (cr_esc_last == 0 || nowt2 - cr_esc_last >= CR_ESC_MIN)
+                    && bs_tail_count(DATA_DIR "/log/agent.log", 2048,
+                                     "recv rep key failed") >= 2) {
+                    cr_esc_last = nowt2;
+                    bs_log("[cr] retry #%d failed + session flapping -> escalate cold restart App",
+                           cr_retry);
+                    bs_cold_restart_app();
+                }
                 bs_log("[cr] retry #%d -> OPER_START (st=0 run=0, next try in %lds)",
                        cr_retry, gap);
                 ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
+            }
+        }
+
+        // --- ★ v6.24d：[fg] 游戏前台看门狗 ---
+        //   脚本活着（run=1）但游戏被顶到后台：sjz.log 停摆 ≥ FG_STALE_SECS
+        //   且尾部最后留下的是 "game is not front app"（10-18 .216 实锤断流形态）。
+        //   双条件缺一不可 —— 只看 sjz 停摆就是 v6.23z 被否的静默看门狗（休眠误判），
+        //   必须同时命中前台签名才动作。uiopen 游戏拉回前台，FG_MIN 限速。
+        //   probe 模式（真卡机）零动作。
+        if (g_mode == MODE_UNLOCK && run && saw_run) {
+            time_t nowt3 = time(NULL);
+            if (nowt3 - fg_last >= FG_MIN) {
+                char sp[300];
+                snprintf(sp, sizeof(sp), "%s/log/sjz.log", DATA_DIR);
+                struct stat sb2;
+                if (stat(sp, &sb2) == 0
+                    && nowt3 - (time_t)sb2.st_mtime >= FG_STALE_SECS
+                    && bs_tail_count(sp, 1024, "game is not front app") > 0) {
+                    fg_last = nowt3;
+                    bs_log("[fg] sjz stale %ds + game-not-front signature -> uiopen %s",
+                           (int)(nowt3 - (time_t)sb2.st_mtime), FG_GAME_BID);
+                    char *uo[] = { (char *)"/usr/bin/uiopen", (char *)"--bundleid",
+                                   (char *)FG_GAME_BID, NULL };
+                    bs_spawnv("/usr/bin/uiopen", uo);
+                }
             }
         }
 
