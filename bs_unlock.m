@@ -639,6 +639,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define FG_MIN          600     // ★ v6.24d：[fg] uiopen 游戏限速（秒）
 #define CR_STALL_SCAN   60      // ★ v6.24e：停摆兜底扫描周期（秒）
 #define CR_STALL_FRESH  3600    // ★ v6.24e：run-error 距今多久内仍值得自动拉（秒）
+#define CR_IDLE_SECS    600     // ★ v6.24i：脚本空闲多久后兜底拉起（秒）
 #define FG_GAME_BID     "com.tencent.tmgp.dfm"   // ★ v6.24d：三角洲行动（DeltaForceClient.app）
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
@@ -721,7 +722,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24h"
+#define BS_DYLIB_VER       "v6.24i"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3554,6 +3555,31 @@ static long bs_cr_mark_age(void) {          // -1 = 无 marker
     return a < 0 ? 0 : a;
 }
 
+// ★ v6.24i：判断「最后一条事件是中控显式停脚本」——用于避免空闲兜底与人工停脚本打架。
+//   中控停脚本会在 agent.log 留 "begin process stop script msg!"；若它出现在最后一次
+//   "begin run script" 之后，说明是人工停的，不许自动拉。
+static int bs_last_stop_is_user(const char *path, long want) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return 0; }
+    long off = sb.st_size > want ? sb.st_size - want : 0;
+    long add = sb.st_size - off;
+    char *buf = (char *)malloc((size_t)add + 1);
+    if (!buf) { close(fd); return 0; }
+    lseek(fd, off, SEEK_SET);
+    ssize_t gn = read(fd, buf, (size_t)add);
+    close(fd);
+    if (gn <= 0) { free(buf); return 0; }
+    buf[gn] = 0;
+    char *lr = NULL, *ls = NULL, *q = buf;
+    while ((q = strstr(q, "begin run script")) != NULL) { lr = q; ++q; }
+    q = buf;
+    while ((q = strstr(q, "begin process stop script msg")) != NULL) { ls = q; ++q; }
+    free(buf);
+    return (ls && (!lr || ls > lr)) ? 1 : 0;
+}
+
 // ★ v6.24e：最近一次 run 尝试是否以 run script error 收场 —— 返回「距该次 run 的秒数」，
 //   无此类失败返回 -1。
 //   判据：tail 内最后一次 "begin run script" 之后出现过 "run script error"（= 真的跑过
@@ -3912,9 +3938,19 @@ static void *bs_watchdog(void *arg) {
                 long mage = bs_cr_mark_age();
                 if (mage > 86400) { bs_cr_mark_clear(); mage = -1; }   // 过期证据不作数
                 int stalled = (mage >= 0) || (rage >= 0 && rage <= CR_STALL_FRESH);
-                if (!cr_pending && st == 0 && g_hb_ok && stalled) {
-                    bs_log("[cr] stall confirmed (mark=%lds rage=%ld st=%p run=%u) -> OPER_START now",
-                           mage, rage, (void *)st, (unsigned)run);
+                // ★ v6.24i：空闲兜底 —— App 一重启 marker 就没了（恢复时清 / 日志轮转），
+                //   中控的在线补发又常常被会话抖动吞掉 → 脚本静默停摆没人管（10-19 08:19
+                //   装完 deb 后实锤）。只要脚本确实没跑（st==0 && run==0）且 sjz 停摆
+                //   超过 CR_IDLE_SECS，且最后一条事件不是「中控显式停脚本」，就自动拉。
+                long sjz_age = -1;
+                char sp[300];
+                snprintf(sp, sizeof(sp), "%s/log/sjz.log", DATA_DIR);
+                struct stat ssb;
+                if (stat(sp, &ssb) == 0) sjz_age = (long)(nowt4 - (time_t)ssb.st_mtime);
+                int idle = (sjz_age >= CR_IDLE_SECS && !bs_last_stop_is_user(ap, 65536));
+                if (!cr_pending && st == 0 && run == 0 && g_hb_ok && (stalled || idle)) {
+                    bs_log("[cr] stall confirmed (mark=%lds rage=%lds idle=%d sjz=%lds st=%p) -> OPER_START now",
+                           mage, rage, idle, sjz_age, (void *)st);
                     ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
                     cr_last    = nowt4;
                     cr_retry   = 0;
@@ -3925,8 +3961,8 @@ static void *bs_watchdog(void *arg) {
                     static time_t stlog = 0;
                     if (nowt4 - stlog >= 300) {
                         stlog = nowt4;
-                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld pending=%d",
-                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, cr_pending);
+                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d",
+                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending);
                     }
                 }
             }
