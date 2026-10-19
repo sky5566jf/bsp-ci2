@@ -382,6 +382,15 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24l ★ 闸门判据收紧（同日，.216 装 1.64 后 15 分钟实测驱动）：
+//       ① `begin process operate script msg` 撤出停止判据 —— 它是中控「操作消息」的
+//          统一入口（点运行同样走它），拿它判停止一旦厂商改用它下发运行就会反锁。
+//          改只认 `agent stop script` / `begin process stop script msg`。
+//       ② marker 写入加「sjz 新鲜度 ≤300s」前提 —— App 冷启时厂商 run 标志残留为 1、
+//          初始化后掉 0 也会构成 1->0 假信号，老写法会误落闸门 → 装完包静默躺平。
+//       实测（21:01 .216）：装 1.64 后 `[cr] stall scan ... us=1` —— 闸门按「用户 20:53
+//       确实点过停止」正确生效，脚本没有被兜底拉起（这正是要的行为）。
+//
 // v6.24k ★★★ 「中控停脚本又被自动拉起」根治（2026-10-19，.216 实锤，deb ≥1.60）：
 //       现象：中控点「停止」→ 20:53:00 agent stop script → 20:53:29 dylib 自己发
 //             OPER_START → 20:53:36 用户再点停止。停止事件被反复对抗。
@@ -768,7 +777,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24k"
+#define BS_DYLIB_VER       "v6.24l"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3609,6 +3618,15 @@ static long bs_cr_mark_age(void) {          // -1 = 无 marker
 //   直到再次看到 run==1（= 中控下发了「运行」）。
 //   ★ 优先级：崩溃证据 > 用户停止。若同一拍扫到 run-error 签名，清 marker 走恢复。
 #define US_MARK DATA_DIR "/.bs_userstop"
+#define US_STOP_FRESH 300   // ★ v6.24l：run 1->0 时 sjz 需在该秒数内还有写入才算「真的在跑」
+
+// ★ v6.24l：文件 mtime 距今秒数（-1 = 文件不存在）
+static long bs_file_age(const char *path) {
+    struct stat sb;
+    if (stat(path, &sb) != 0) return -1;
+    long a = (long)(time(NULL) - (time_t)sb.st_mtime);
+    return a < 0 ? 0 : a;
+}
 
 static void bs_us_mark_write(const char *why) {
     FILE *f = fopen(US_MARK, "w");
@@ -3646,17 +3664,14 @@ static int bs_last_stop_is_user(const char *path, long want) {
     buf[gn] = 0;
     char *lr = NULL, *ls = NULL, *q = buf;
     while ((q = strstr(q, "begin run script")) != NULL) { lr = q; ++q; }
-    // ★ v6.24k：三串都算停止事件 —— operate 是中控消息入口（实测唯一真实存在的），
-    //   agent stop script / begin stop script 是厂商落下的执行痕迹，任一条都够。
+    // ★ v6.24l：只用**精确的停止痕迹**。`begin process operate script msg` 虽然实测
+    //   4 次全是停止，但它是中控「操作消息」的统一入口（运行同样走它），语义不可靠，
+    //   一旦厂商改用它下发运行就会把「刚点运行」误判成「刚点停止」→ 闸门反锁。
+    //   `agent stop script` 是厂商真正执行停止时必打的一行，最精确。
     q = buf;
-    while ((q = strstr(q, "begin process operate script msg")) != NULL) { ls = q; ++q; }
+    while ((q = strstr(q, "agent stop script")) != NULL) { ls = q; ++q; }
     q = buf;
     while ((q = strstr(q, "begin process stop script msg")) != NULL) {
-        if (!ls || q > ls) ls = q;
-        ++q;
-    }
-    q = buf;
-    while ((q = strstr(q, "agent stop script")) != NULL) {
         if (!ls || q > ls) ls = q;
         ++q;
     }
@@ -3886,11 +3901,21 @@ static void *bs_watchdog(void *arg) {
         //   禁止后续一切自动 OPER_START。若扫到崩溃签名，下面会撤销该闸门（崩溃优先）。
         //   排除：reload 状态机自己停的、卡封禁下发的 STOP。
         if (!g_reload_busy && !g_card_blocked && last_run == 1 && run == 0 && !us_latched) {
-            bs_us_mark_write("run 1->0");
-            us_latched = 1;
-            bs_cr_mark_clear();          // 用户停了，旧的崩溃证据一并作废
-            bs_log("[us] script stop observed (run 1->0, st=%p) -> auto-start gated until run=1",
-                   (void *)st);
+            // ★ v6.24l：必须确认「刚才真的在跑」才认定是用户停止。
+            //   App 冷启时厂商 run 标志会残留为 1、初始化后掉 0（10-19 08:07 .216 实锤），
+            //   那一下也构成 1->0，但 sjz.log 早已停摆 → 不是用户停止，不许落闸门（否则
+            //   装完包/重启 App 后兜底永远不拉起，设备静默躺平）。
+            long sa = bs_file_age(DATA_DIR "/log/sjz.log");
+            if (sa >= 0 && sa <= US_STOP_FRESH) {
+                bs_us_mark_write("run 1->0");
+                us_latched = 1;
+                bs_cr_mark_clear();          // 用户停了，旧的崩溃证据一并作废
+                bs_log("[us] script stop observed (run 1->0, sjz=%lds st=%p) -> auto-start gated until run=1",
+                       sa, (void *)st);
+            } else {
+                bs_log("[us] run 1->0 but sjz=%lds (>%ds) -> not a user stop, no gate",
+                       sa, US_STOP_FRESH);
+            }
         }
         // ★ v6.7：重启期间(g_reload_busy)不抹——脚本是我们自己停的，
         //   模块必须留给重启后的新版脚本用（否则 wait_call_func 拿不到模块会卡死）。
