@@ -721,7 +721,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24f"
+#define BS_DYLIB_VER       "v6.24g"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3874,31 +3874,33 @@ static void *bs_watchdog(void *arg) {
         //   冷启 App 后 dylib 换了新进程，07:55 的 run-error 行再也没被读到时即如此）。
         //   这里每 CR_STALL_SCAN 秒复核 agent.log 尾部：最近一次 begin run script
         //   之后是 run script error（= run 真跑过又炸了，且其后没有成功的 run），
-        //   且当前 run=0/st=0、心跳正常、非卡封禁、非 reload → 立刻 OPER_START。
-        //   用户主动停脚本不会留下 error 行，故不会误拉。
-        if (g_mode == MODE_UNLOCK && !cr_pending && run == 0
-            && g_hb_ok && !g_card_blocked && !g_reload_busy) {
+        //   判据用 **st==0**（脚本容器不存在）而不是 run==0 —— 10-19 08:07 .216 实测：
+        //   App 冷启后厂商 run 标志仍滞留为 1（日志里 run=1 但 agent 早已 stop script、
+        //   sjz 停摆 12 分钟），拿 run==0 当闸门会把这种情况永久挡住。st!=0 时脚本容器
+        //   确实活着，绝不搅局；用户主动停脚本又不会留下 run-error 行，故不会误拉。
+        if (g_mode == MODE_UNLOCK && !g_card_blocked && !g_reload_busy) {
             time_t nowt4 = time(NULL);
             if (nowt4 - cr_stall_last >= CR_STALL_SCAN) {
                 cr_stall_last = nowt4;
                 char ap[300];
                 snprintf(ap, sizeof(ap), "%s/log/agent.log", DATA_DIR);
                 long rage = bs_last_run_failed_age(ap, 65536);
-                if (st == 0 && rage >= 0 && rage <= CR_STALL_FRESH) {
-                    bs_log("[cr] stalled run-error in agent tail (%lds ago, st=%p) -> OPER_START now",
-                           rage, (void *)st);
+                if (!cr_pending && st == 0 && g_hb_ok
+                    && rage >= 0 && rage <= CR_STALL_FRESH) {
+                    bs_log("[cr] stalled run-error in agent tail (%lds ago, st=%p run=%u) -> OPER_START now",
+                           rage, (void *)st, (unsigned)run);
                     ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
                     cr_last    = nowt4;
                     cr_retry   = 0;
                     cr_pending = 1;
                     cr_next    = nowt4 + CR_RETRY_BASE;
-                } else if (st != 0) {
-                    // 脚本容器活着（st != 0）= 正在加载/运行，别搅局；留痕便于排查
+                } else {
+                    // 每 5 分钟一条诊断快照（不动作），便于下次远程定位卡点
                     static time_t stlog = 0;
                     if (nowt4 - stlog >= 300) {
                         stlog = nowt4;
-                        bs_log("[cr] stall scan idle (st=%p run=%u rage=%ld hb=%d)",
-                               (void *)st, (unsigned)run, rage, g_hb_ok);
+                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld pending=%d",
+                               (unsigned)run, (void *)st, g_hb_ok, rage, cr_pending);
                     }
                 }
             }
