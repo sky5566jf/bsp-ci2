@@ -721,7 +721,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24g"
+#define BS_DYLIB_VER       "v6.24h"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3533,6 +3533,27 @@ static int bs_inject_modules(uintptr_t base) {
 
 // ---------------------------------------------------------------- 看门狗
 // ★ v6.24d：读文件尾部并统计 needle 出现次数（近因签名判定；只读，不挑格式）
+// ★ v6.24h：崩溃证据落盘 marker —— agent.log 在 App 重启时会被轮转清空
+//   （10-19 08:10 .216 实测 31MB → 6.4KB），所以任何「扫日志找崩溃证据」的自愈
+//   都活不过一次重启：v6.24f/g 的 rage 判定因此恒为 -1。改为崩溃一命中就写
+//   持久 marker，脚本跑起来时删除；marker 存在 + st==0 + run==0 = 确认停摆。
+//   用户主动停脚本不会命中崩溃签名，故无 marker、不会被误拉。
+#define CR_MARK DATA_DIR "/.bs_cr_pending"
+
+static void bs_cr_mark_write(const char *src) {
+    FILE *f = fopen(CR_MARK, "w");
+    if (!f) return;
+    fprintf(f, "ts=%ld src=%s\n", (long)time(NULL), src ? src : "?");
+    fclose(f);
+}
+static void bs_cr_mark_clear(void) { unlink(CR_MARK); }
+static long bs_cr_mark_age(void) {          // -1 = 无 marker
+    struct stat sb;
+    if (stat(CR_MARK, &sb) != 0) return -1;
+    long a = (long)(time(NULL) - (time_t)sb.st_mtime);
+    return a < 0 ? 0 : a;
+}
+
 // ★ v6.24e：最近一次 run 尝试是否以 run script error 收场 —— 返回「距该次 run 的秒数」，
 //   无此类失败返回 -1。
 //   判据：tail 内最后一次 "begin run script" 之后出现过 "run script error"（= 真的跑过
@@ -3825,6 +3846,8 @@ static void *bs_watchdog(void *arg) {
             }
             if (cr_hit) {
                 time_t nowt = time(NULL);
+                // ★ v6.24h：先把证据落盘（App 重启会清空 agent.log，marker 不会）
+                if (run == 0) bs_cr_mark_write(cr_src == 0 ? "agent" : "sjz");
                 // ★ v6.24c：加载失败类签名不要求 saw_run —— 这种失败发生在
                 //   「中控已下发 run、脚本刚进 begin load script 就挂」的瞬间，
                 //   run 可能已回落 0 而 saw_run 还没来得及置位，用老闸门会漏判。
@@ -3880,15 +3903,18 @@ static void *bs_watchdog(void *arg) {
         //   确实活着，绝不搅局；用户主动停脚本又不会留下 run-error 行，故不会误拉。
         if (g_mode == MODE_UNLOCK && !g_card_blocked && !g_reload_busy) {
             time_t nowt4 = time(NULL);
+            if (run) bs_cr_mark_clear();      // 跑起来了 = 已恢复，顺手清证据
             if (nowt4 - cr_stall_last >= CR_STALL_SCAN) {
                 cr_stall_last = nowt4;
                 char ap[300];
                 snprintf(ap, sizeof(ap), "%s/log/agent.log", DATA_DIR);
                 long rage = bs_last_run_failed_age(ap, 65536);
-                if (!cr_pending && st == 0 && g_hb_ok
-                    && rage >= 0 && rage <= CR_STALL_FRESH) {
-                    bs_log("[cr] stalled run-error in agent tail (%lds ago, st=%p run=%u) -> OPER_START now",
-                           rage, (void *)st, (unsigned)run);
+                long mage = bs_cr_mark_age();
+                if (mage > 86400) { bs_cr_mark_clear(); mage = -1; }   // 过期证据不作数
+                int stalled = (mage >= 0) || (rage >= 0 && rage <= CR_STALL_FRESH);
+                if (!cr_pending && st == 0 && g_hb_ok && stalled) {
+                    bs_log("[cr] stall confirmed (mark=%lds rage=%ld st=%p run=%u) -> OPER_START now",
+                           mage, rage, (void *)st, (unsigned)run);
                     ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
                     cr_last    = nowt4;
                     cr_retry   = 0;
@@ -3899,8 +3925,8 @@ static void *bs_watchdog(void *arg) {
                     static time_t stlog = 0;
                     if (nowt4 - stlog >= 300) {
                         stlog = nowt4;
-                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld pending=%d",
-                               (unsigned)run, (void *)st, g_hb_ok, rage, cr_pending);
+                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld pending=%d",
+                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, cr_pending);
                     }
                 }
             }
@@ -3918,6 +3944,7 @@ static void *bs_watchdog(void *arg) {
             time_t nowt2 = time(NULL);
             if (run) {
                 bs_log("[cr] recovery OK, script running again (retries=%d)", cr_retry);
+                bs_cr_mark_clear();                 // ★ v6.24h：恢复即清证据
                 cr_pending = 0;
                 cr_retry   = 0;
             } else if (g_reload_busy) {
