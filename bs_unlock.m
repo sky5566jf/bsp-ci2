@@ -638,7 +638,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define FG_STALE_SECS   180     // ★ v6.24d：sjz.log 停摆判定（秒）
 #define FG_MIN          600     // ★ v6.24d：[fg] uiopen 游戏限速（秒）
 #define CR_STALL_SCAN   60      // ★ v6.24e：停摆兜底扫描周期（秒）
-#define CR_STALL_FRESH  900     // ★ v6.24e：agent.log 尾部 run-error 的有效期（秒）
+#define CR_STALL_FRESH  3600    // ★ v6.24e：run-error 距今多久内仍值得自动拉（秒）
 #define FG_GAME_BID     "com.tencent.tmgp.dfm"   // ★ v6.24d：三角洲行动（DeltaForceClient.app）
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
@@ -721,7 +721,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24e"
+#define BS_DYLIB_VER       "v6.24f"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3533,31 +3533,46 @@ static int bs_inject_modules(uintptr_t base) {
 
 // ---------------------------------------------------------------- 看门狗
 // ★ v6.24d：读文件尾部并统计 needle 出现次数（近因签名判定；只读，不挑格式）
-// ★ v6.24e：最近一次 run 尝试是否以 run script error 收场。
-//   判据：tail 内最后一次 "begin run script" 之后出现过 "run script error"，且其后
-//   没有新的 "begin run script"（有 = 后来跑成了）。用来在 **dylib 进程重启后**
-//   恢复判断 —— 重启会把 cr_size 基线重置，旧签名行再也扫不到，只靠增量扫描会
-//   永久漏判（10-19 07:57 .216 冷启后即为此种静默停摆）。
-static int bs_last_run_failed(const char *path, long want) {
+// ★ v6.24e：最近一次 run 尝试是否以 run script error 收场 —— 返回「距该次 run 的秒数」，
+//   无此类失败返回 -1。
+//   判据：tail 内最后一次 "begin run script" 之后出现过 "run script error"（= 真的跑过
+//   又炸了，且其后没有新的 run）。窗口必须放大（agent.log 的 server2 重连循环每 20s
+//   就写 3 行，4KB 窗口几分钟就被挤满 —— 10-19 08:03 .216 首版实测漏判）。
+//   同时用行首 "[YYYY/MM/DD HH:MM:SS]" 解析时刻，供调用方做过期判断。
+static long bs_last_run_failed_age(const char *path, long want) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
     struct stat sb;
-    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return 0; }
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return -1; }
     long off = sb.st_size > want ? sb.st_size - want : 0;
     long add = sb.st_size - off;
     char *buf = (char *)malloc((size_t)add + 1);
-    if (!buf) { close(fd); return 0; }
+    if (!buf) { close(fd); return -1; }
     lseek(fd, off, SEEK_SET);
     ssize_t gn = read(fd, buf, (size_t)add);
     close(fd);
-    if (gn <= 0) { free(buf); return 0; }
+    if (gn <= 0) { free(buf); return -1; }
     buf[gn] = 0;
-    int failed = 0;
+    long age = -1;
     char *last = NULL, *q = buf;
     while ((q = strstr(q, "begin run script")) != NULL) { last = q; ++q; }
-    if (last && strstr(last, "run script error")) failed = 1;
+    if (last && strstr(last, "run script error")) {
+        char *ls = last;
+        while (ls > buf && ls[-1] != '\n') --ls;
+        if (*ls == '[') {
+            struct tm tmv;
+            memset(&tmv, 0, sizeof(tmv));
+            tmv.tm_isdst = -1;
+            if (strptime(ls + 1, "%Y/%m/%d %H:%M:%S", &tmv) != NULL) {
+                time_t tt = mktime(&tmv);
+                time_t nw = time(NULL);
+                if (tt > 0) { age = (long)(nw - tt); if (age < 0) age = -1; }
+            }
+        }
+        if (age < 0) age = 0;   // 时间戳解析失败时按「刚刚」处理（宁可救不误弃）
+    }
     free(buf);
-    return failed;
+    return age;
 }
 
 static int bs_tail_count(const char *path, long want, const char *needle) {
@@ -3861,24 +3876,30 @@ static void *bs_watchdog(void *arg) {
         //   之后是 run script error（= run 真跑过又炸了，且其后没有成功的 run），
         //   且当前 run=0/st=0、心跳正常、非卡封禁、非 reload → 立刻 OPER_START。
         //   用户主动停脚本不会留下 error 行，故不会误拉。
-        if (g_mode == MODE_UNLOCK && !cr_pending && run == 0 && st == 0
+        if (g_mode == MODE_UNLOCK && !cr_pending && run == 0
             && g_hb_ok && !g_card_blocked && !g_reload_busy) {
             time_t nowt4 = time(NULL);
             if (nowt4 - cr_stall_last >= CR_STALL_SCAN) {
                 cr_stall_last = nowt4;
                 char ap[300];
-                struct stat abs_;
                 snprintf(ap, sizeof(ap), "%s/log/agent.log", DATA_DIR);
-                if (stat(ap, &abs_) == 0
-                    && (nowt4 - (time_t)abs_.st_mtime) <= CR_STALL_FRESH
-                    && bs_last_run_failed(ap, 4096)) {
-                    bs_log("[cr] stalled run-error in agent tail (mtime %ds ago) -> OPER_START now",
-                           (int)(nowt4 - (time_t)abs_.st_mtime));
+                long rage = bs_last_run_failed_age(ap, 65536);
+                if (st == 0 && rage >= 0 && rage <= CR_STALL_FRESH) {
+                    bs_log("[cr] stalled run-error in agent tail (%lds ago, st=%p) -> OPER_START now",
+                           rage, (void *)st);
                     ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
                     cr_last    = nowt4;
                     cr_retry   = 0;
                     cr_pending = 1;
                     cr_next    = nowt4 + CR_RETRY_BASE;
+                } else if (st != 0) {
+                    // 脚本容器活着（st != 0）= 正在加载/运行，别搅局；留痕便于排查
+                    static time_t stlog = 0;
+                    if (nowt4 - stlog >= 300) {
+                        stlog = nowt4;
+                        bs_log("[cr] stall scan idle (st=%p run=%u rage=%ld hb=%d)",
+                               (void *)st, (unsigned)run, rage, g_hb_ok);
+                    }
                 }
             }
         }
