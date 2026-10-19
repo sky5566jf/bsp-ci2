@@ -637,6 +637,8 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define CR_ESC_MIN      1800    // ★ v6.24d：冷启 App 限速（秒）
 #define FG_STALE_SECS   180     // ★ v6.24d：sjz.log 停摆判定（秒）
 #define FG_MIN          600     // ★ v6.24d：[fg] uiopen 游戏限速（秒）
+#define CR_STALL_SCAN   60      // ★ v6.24e：停摆兜底扫描周期（秒）
+#define CR_STALL_FRESH  900     // ★ v6.24e：agent.log 尾部 run-error 的有效期（秒）
 #define FG_GAME_BID     "com.tencent.tmgp.dfm"   // ★ v6.24d：三角洲行动（DeltaForceClient.app）
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
@@ -719,7 +721,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24d"
+#define BS_DYLIB_VER       "v6.24e"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3531,6 +3533,33 @@ static int bs_inject_modules(uintptr_t base) {
 
 // ---------------------------------------------------------------- 看门狗
 // ★ v6.24d：读文件尾部并统计 needle 出现次数（近因签名判定；只读，不挑格式）
+// ★ v6.24e：最近一次 run 尝试是否以 run script error 收场。
+//   判据：tail 内最后一次 "begin run script" 之后出现过 "run script error"，且其后
+//   没有新的 "begin run script"（有 = 后来跑成了）。用来在 **dylib 进程重启后**
+//   恢复判断 —— 重启会把 cr_size 基线重置，旧签名行再也扫不到，只靠增量扫描会
+//   永久漏判（10-19 07:57 .216 冷启后即为此种静默停摆）。
+static int bs_last_run_failed(const char *path, long want) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return 0; }
+    long off = sb.st_size > want ? sb.st_size - want : 0;
+    long add = sb.st_size - off;
+    char *buf = (char *)malloc((size_t)add + 1);
+    if (!buf) { close(fd); return 0; }
+    lseek(fd, off, SEEK_SET);
+    ssize_t gn = read(fd, buf, (size_t)add);
+    close(fd);
+    if (gn <= 0) { free(buf); return 0; }
+    buf[gn] = 0;
+    int failed = 0;
+    char *last = NULL, *q = buf;
+    while ((q = strstr(q, "begin run script")) != NULL) { last = q; ++q; }
+    if (last && strstr(last, "run script error")) failed = 1;
+    free(buf);
+    return failed;
+}
+
 static int bs_tail_count(const char *path, long want, const char *needle) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -3617,6 +3646,7 @@ static void *bs_watchdog(void *arg) {
     time_t cr_next    = 0;  // 下次允许重试的时刻
     time_t cr_esc_last = 0; // ★ v6.24d：上次冷启 App 时刻（升级限速）
     time_t fg_last     = 0; // ★ v6.24d：上次 [fg] uiopen 游戏时刻（限速）
+    time_t cr_stall_last = 0; // ★ v6.24e：上次停摆兜底扫描时刻
 
     for (;;) {
         sleep(WD_TICK_SECS);
@@ -3783,7 +3813,14 @@ static void *bs_watchdog(void *arg) {
                 // ★ v6.24c：加载失败类签名不要求 saw_run —— 这种失败发生在
                 //   「中控已下发 run、脚本刚进 begin load script 就挂」的瞬间，
                 //   run 可能已回落 0 而 saw_run 还没来得及置位，用老闸门会漏判。
-                int gate_ok = (!g_reload_busy && (saw_run || cr_loadfail) &&
+                // ★ v6.24e：agent.log 里的 run-error 签名是 **agent 亲笔** —— 它证明
+                //   「中控已下发 run、脚本真的跑过、并且立刻挂了」。崩溃快于 1s 时看门狗
+                //   那一拍根本看不到 run=1，saw_run 永远是 0（10-19 07:55 .216 实锤：
+                //   07:55:39 begin run script → 07:55:40 run script error →
+                //   stop script，saw_run=0）→ 老闸门把整件事丢掉，连 retry #1 都不发，
+                //   设备从此永久停摆等人点。故 agent 源签名豁免 saw_run。
+                int cr_proven = (cr_src == 0);
+                int gate_ok = (!g_reload_busy && (saw_run || cr_loadfail || cr_proven) &&
                                run == 0 && st == 0 && g_hb_ok && !g_card_blocked &&
                                (nowt - cr_last) >= CR_COOLDOWN);
                 if (gate_ok) {
@@ -3801,16 +3838,47 @@ static void *bs_watchdog(void *arg) {
                            g_reload_busy, saw_run, (unsigned)run,
                            (void *)st, g_hb_ok,
                            cr_last ? (int)(nowt - cr_last) : -1,
-                           cr_loadfail ? " loadfail" : "");
+                           cr_loadfail ? " loadfail" : (cr_proven ? " run-error" : ""));
                     // ★ v6.24c：加载失败类签名不许丢弃 —— 签名行只会出现一次，
                     //   丢弃就等于永久放弃。这里挂 pending，交给下面的重试状态机
                     //   在条件恢复（st 归零 / 键补齐）后接着拉；若脚本其实已跑起来，
                     //   pending 会以 recovery OK 自行解除，不产生副作用。
-                    if (cr_loadfail && !g_reload_busy && !g_card_blocked && g_hb_ok) {
+                    if ((cr_loadfail || cr_proven) && !g_reload_busy && !g_card_blocked && g_hb_ok) {
                         cr_pending = 1;
                         if (cr_next <= nowt) cr_next = nowt + CR_RETRY_BASE;
-                        bs_log("[cr] loadfail -> pending, state machine will retry");
+                        bs_log("[cr] %s -> pending, state machine will retry",
+                               cr_loadfail ? "loadfail" : "run-error");
                     }
+                }
+            }
+        }
+
+        // --- ★ v6.24e：停摆兜底扫描（不依赖日志增量）---
+        //   cr_pending 只在「本轮扫到新签名行」时置位；而 dylib 进程一旦重启，
+        //   cr_size 基线重置 → 崩溃签名永远扫不到 → 静默停摆（10-19 07:57 .216：
+        //   冷启 App 后 dylib 换了新进程，07:55 的 run-error 行再也没被读到时即如此）。
+        //   这里每 CR_STALL_SCAN 秒复核 agent.log 尾部：最近一次 begin run script
+        //   之后是 run script error（= run 真跑过又炸了，且其后没有成功的 run），
+        //   且当前 run=0/st=0、心跳正常、非卡封禁、非 reload → 立刻 OPER_START。
+        //   用户主动停脚本不会留下 error 行，故不会误拉。
+        if (g_mode == MODE_UNLOCK && !cr_pending && run == 0 && st == 0
+            && g_hb_ok && !g_card_blocked && !g_reload_busy) {
+            time_t nowt4 = time(NULL);
+            if (nowt4 - cr_stall_last >= CR_STALL_SCAN) {
+                cr_stall_last = nowt4;
+                char ap[300];
+                struct stat abs_;
+                snprintf(ap, sizeof(ap), "%s/log/agent.log", DATA_DIR);
+                if (stat(ap, &abs_) == 0
+                    && (nowt4 - (time_t)abs_.st_mtime) <= CR_STALL_FRESH
+                    && bs_last_run_failed(ap, 4096)) {
+                    bs_log("[cr] stalled run-error in agent tail (mtime %ds ago) -> OPER_START now",
+                           (int)(nowt4 - (time_t)abs_.st_mtime));
+                    ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
+                    cr_last    = nowt4;
+                    cr_retry   = 0;
+                    cr_pending = 1;
+                    cr_next    = nowt4 + CR_RETRY_BASE;
                 }
             }
         }

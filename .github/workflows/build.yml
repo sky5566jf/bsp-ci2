@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.24d" || (echo "MISSING v6.24d" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.24e" || (echo "MISSING v6.24e" && exit 1)
           strings bs_unlock.dylib | grep -q "kicked=" || (echo "MISSING kicked field" && exit 1)
           strings bs_unlock.dylib | grep -q "newer input seen after kick" || (echo "MISSING unblock path" && exit 1)
           strings bs_unlock.dylib | grep -q "\[cr\] retry #" || (echo "MISSING crash retry" && exit 1)
