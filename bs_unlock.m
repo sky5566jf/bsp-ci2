@@ -382,6 +382,29 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24j ★★ 「装完不代启」三处盲区（2026-10-19，.98 装 probe 包实锤）：
+//       现象：.98 装 v1.60-probe 后 App 确实冷启了，但日志**一条 [autosvc] 都没有**，
+//             服务没被点起来（.216 那种「[autosvc] no marker / tapped OK」也没有）。
+//       根因（三条都成立，缺一即失效）：
+//             ① **dylib 不重新 load**：dyld 共享缓存已映射的同路径 dylib，装完覆盖文件后
+//                新进程仍用旧缓存映射 → +load/constructor **根本不跑**，所以连日志都没有；
+//                原本靠「装包→killall App→uiopen」触发重新映射，但若 App 启动太快 / 系统
+//                把它留在后台，就不成立。
+//             ② **UI 未就绪**：os_kickoff 立刻起 2s 拍定时器，冷启时 UIWindow 可能还没建，
+//                命中判定永远拿 nil；60 拍（2min）耗尽后放弃，标记留着等下次 —— 但下次
+//                又是同一时序，容易永远点不到。
+//             ③ **只在进程启动那一刻看标记**：装包时 App 已在后台（未被 kill 或被杀后
+//                被系统恢复），再切回前台也不会重查标记。
+//       修法（都在 App 进程内，probe/unlock 通用）：
+//             (a) bootstrap 里先**轮询等 UI 就绪**（最多 60s，1.5s 一拍）再 kickoff；
+//             (b) 订阅 `UIApplicationDidBecomeActiveNotification` —— 每次激活都重查
+//                 `.autosvc_pending`，有就再 kickoff（消费后自动 no-op）；后台线程注册，
+//                 不碰冷启动期 dyld/ObjC；
+//             (c) as_tick 每拍先查标记是否还在（被别的 kickoff 消费则收尾），
+//                 g_as_busy 防重复 kickoff 起两套定时器。
+//       配套（本轮已做）：probe 包 postinst **补写** `.autosvc_pending`（原来只有 unlock
+//       写）；装包后务必 killall App + uiopen 冷启一次，否则 ① 无法绕过。
+//
 // v6.23n ★★ 脏容器自愈（2026-10-05，外网机 nm=1005「加载运行库出错」实锤驱动）：
 //       厂商通道会给 App 拉到捆了**无键远古段**的变体容器（12 段 7 无键，
 //       md5 57076b29），App 加载运行库解密失败 →「加载运行库出错」。
@@ -722,7 +745,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24i"
+#define BS_DYLIB_VER       "v6.24j"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -4296,12 +4319,14 @@ static int bs_autosvc_pending(char *ver, size_t vsz) {
 - (void)as_setup;
 - (void)as_tick:(id)timer;
 - (BOOL)as_tryTap;
+- (void)as_active:(id)note;
 - (BOOL)as_scanViews:(id)views;
 - (void)as_dump:(id)views depth:(int)d;
 @end
 
 static int             g_as_tries  = 0;
 static int             g_as_dumpln = 0;
+static int             g_as_busy   = 0;   // ★ v6.24j：点击流程进行中，避免重复 kickoff
 static BSAutosvcHelper *g_as_helper = nil;
 
 @implementation BSAutosvcHelper
@@ -4425,10 +4450,19 @@ static BSAutosvcHelper *g_as_helper = nil;
 }
 
 - (void)as_tick:(id)timer {
+    // ★ v6.24j：标记可能已被别的 kickoff 消费（App 多次激活）→ 收尾
+    char cur[64];
+    if (!bs_autosvc_pending(cur, sizeof(cur))) {
+        bs_log("[autosvc] marker gone -> stop tapping");
+        g_as_busy = 0;
+        [timer invalidate];
+        return;
+    }
     g_as_tries++;
     if (g_as_tries > 60) {
         bs_log("[autosvc] give up after %d tries (button not found; marker kept, retry next app start)",
                g_as_tries);
+        g_as_busy = 0;
         [timer invalidate];
         return;
     }
@@ -4440,13 +4474,29 @@ static BSAutosvcHelper *g_as_helper = nil;
             bs_log("[autosvc] tapped OK -> marker consumed, service should be starting");
         else
             bs_log("[autosvc] tapped but rename failed (errno=%d)", errno);
+        g_as_busy = 0;
         [timer invalidate];
         return;
     }
     // 未命中：repeats=YES 自动下一拍
 }
 
+// ★ v6.24j：App 每次「进入前台」都重新尝试 —— 装包后 App 若已在后台，
+//   冷启/切前台这一下才会把「启动服务」开关点下去。
+- (void)as_active:(id)note {
+    char cur[64];
+    if (!bs_autosvc_pending(cur, sizeof(cur))) return;
+    if (g_as_busy) {
+        bs_log("[autosvc] did-become-active, tap already in progress (tries=%d)", g_as_tries);
+        return;
+    }
+    bs_log("[autosvc] did-become-active with pending marker -> kickoff again");
+    [self as_setup];
+}
+
 - (void)as_setup {
+    g_as_busy = 1;
+    g_as_tries = 0;
     NSTimer *t = [NSTimer timerWithTimeInterval:2.0
                                          target:self
                                        selector:@selector(as_tick:)
@@ -4458,6 +4508,17 @@ static BSAutosvcHelper *g_as_helper = nil;
 + (void)as_kickoff {
     BSAutosvcHelper *h = [[BSAutosvcHelper alloc] init];
     g_as_helper = h;   // 常驻引用（timer 也 retain target）
+    // ★ v6.24j：激活通知在后台线程注册（不碰 dyld/ObjC 冷启动期），
+    //   收到后 onMainThread 起定时器 —— 覆盖「装包时 App 已在后台」的场景。
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        @autoreleasepool {
+            [[NSNotificationCenter defaultCenter]
+                addObserver:g_as_helper
+                   selector:@selector(as_active:)
+                       name:@"UIApplicationDidBecomeActiveNotification"
+                     object:nil];
+        }
+    });
     [h performSelectorOnMainThread:@selector(as_setup) withObject:nil waitUntilDone:NO];
 }
 
@@ -5028,8 +5089,28 @@ static void *bs_bootstrap(void *arg) {
         if (bs_proc_is_app()) {
             char asv[64];
             if (bs_autosvc_pending(asv, sizeof(asv))) {
-                bs_log("[autosvc] pending marker (ver=%.24s) -> auto-tap start-service (max 60 tries)",
+                // ★ v6.24j：App 刚冷启（或从后台回到前台）时 UIWindow 还没建，
+                //   as_tryTap 立即拿到 nil → 早期版本因「装了 dylib、App 也在跑」被
+                //   dyld 共享缓存命中而不重新 load，as_kickoff 从不执行（.98 装 probe 包
+                //   后续装不代启的实证）。这里改成：
+                //     ① 先等 UI 就绪（最多 60s / 40 拍）再起点击定时器；
+                //     ② 订阅 UIApplicationDidBecomeActiveNotification —— App 每次激活
+                //        都重新 kickoff（.autosvc_pending 被消费后自然 no-op）。
+                bs_log("[autosvc] pending marker (ver=%.24s) -> wait for UI then auto-tap start-service",
                        asv);
+                for (int wi = 0; wi < 40; wi++) {
+                    id appCls = NSClassFromString(@"UIApplication");
+                    id app = appCls ? [(id)appCls sharedApplication] : nil;
+                    if (app) {
+                        NSArray *ws = [(id<BSAutoUI>)app windows];
+                        if (ws && ws.count > 0) {
+                            bs_log("[autosvc] UI ready after %.1fs (windows=%lu)",
+                                   wi * 1.5, (unsigned long)ws.count);
+                            break;
+                        }
+                    }
+                    usleep(1500 * 1000);
+                }
                 [BSAutosvcHelper as_kickoff];
             } else {
                 bs_log("[autosvc] no marker, App process idle (dylib loaded OK)");
