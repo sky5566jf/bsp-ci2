@@ -382,6 +382,29 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24k ★★★ 「中控停脚本又被自动拉起」根治（2026-10-19，.216 实锤，deb ≥1.60）：
+//       现象：中控点「停止」→ 20:53:00 agent stop script → 20:53:29 dylib 自己发
+//             OPER_START → 20:53:36 用户再点停止。停止事件被反复对抗。
+//       根因（两条叠加，缺一不成立）：
+//             ① `bs_last_stop_is_user` 判据串写错：写的是
+//                "begin process stop script msg"，而厂商真实日志是
+//                "begin process operate script msg!"。设备实查：错误串 0 次、
+//                正确串 4 次 → 该函数**恒返回 0**，用户停止永远识别不出来。
+//             ② 判据只作用于 idle 分支，`stalled` 分支（marker / run-error 证据）
+//                完全不看用户停止；且窗口只有 64KB，agent.log 每 20s 写 3 行，
+//                半小时后停止痕迹早被挤出窗口。
+//             → 于是 idle 兜底（CR_IDLE_SECS=600）在停止后第一拍扫描就直接拉起。
+//       修法：
+//             (a) 新增**落盘闸门** `.bs_userstop`：观测到 run 1->0（非 reload、
+//                 非卡封禁）立即写；App 重启 / 日志轮转都不影响。
+//             (b) 闸门存在期间禁止**一切**自动拉起：idle 兜底、stalled 兜底、
+//                 崩溃重试状态机、so_sync 自动 reload。[fg] 本就要 run=1，天然不触发。
+//             (c) 解除只有一个条件：再次看到 run==1（= 中控真的下发了「运行」）。
+//             (d) 优先级：崩溃证据 > 用户停止。扫到 run-error / loadfail 签名时
+//                 撤销闸门走恢复（那是「中控下发的 run 执行后崩了」，不是人工停）。
+//             (e) 停止判据串修正为 operate/stop/agent-stop 三种，窗口 64K→256K。
+//       配套：给 `[cr] stall scan` 诊断行加 us= 字段，现场一眼看出是否被闸门挡住。
+//
 // v6.24j ★★ 「装完不代启」三处盲区（2026-10-19，.98 装 probe 包实锤）：
 //       现象：.98 装 v1.60-probe 后 App 确实冷启了，但日志**一条 [autosvc] 都没有**，
 //             服务没被点起来（.216 那种「[autosvc] no marker / tapped OK」也没有）。
@@ -745,7 +768,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24j"
+#define BS_DYLIB_VER       "v6.24k"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3578,9 +3601,35 @@ static long bs_cr_mark_age(void) {          // -1 = 无 marker
     return a < 0 ? 0 : a;
 }
 
+// ★ v6.24k：用户主动停脚本的「落盘闸门」——v6.24i 只在 agent.log 尾部找字符串，
+//   而 App 一重启 agent.log 就被轮转（31MB→6.4KB 实测），闸门随即失效；
+//   且下面 bs_last_stop_is_user 用的串跟厂商真实日志对不上（见其注释）。
+//   这里改为：只要观测到 run 1->0（且不是 reload / 卡封禁 / 崩溃签名），
+//   就写一个持久 marker；marker 存在期间**禁止一切自动 OPER_START**，
+//   直到再次看到 run==1（= 中控下发了「运行」）。
+//   ★ 优先级：崩溃证据 > 用户停止。若同一拍扫到 run-error 签名，清 marker 走恢复。
+#define US_MARK DATA_DIR "/.bs_userstop"
+
+static void bs_us_mark_write(const char *why) {
+    FILE *f = fopen(US_MARK, "w");
+    if (!f) return;
+    fprintf(f, "ts=%ld why=%s\n", (long)time(NULL), why ? why : "?");
+    fclose(f);
+}
+static void bs_us_mark_clear(void) { unlink(US_MARK); }
+static int bs_us_mark_exists(void) {
+    struct stat sb;
+    if (stat(US_MARK, &sb) != 0) return 0;
+    // 7 天后自动失效（防极端情况下永久躺平：比如用户停脚本后中控再没下发过运行）
+    if ((long)(time(NULL) - (time_t)sb.st_mtime) > 7 * 86400) { unlink(US_MARK); return 0; }
+    return 1;
+}
+
 // ★ v6.24i：判断「最后一条事件是中控显式停脚本」——用于避免空闲兜底与人工停脚本打架。
-//   中控停脚本会在 agent.log 留 "begin process stop script msg!"；若它出现在最后一次
-//   "begin run script" 之后，说明是人工停的，不许自动拉。
+//   中控停脚本会在 agent.log 留 "begin process operate script msg!"（★ v6.24k：
+//   原写 "begin process stop script msg" 是错的 —— 设备实查该串 0 次、
+//   operate 串 4 次，导致本函数恒返回 0，空闲兜底因此把用户停掉的脚本又拉起来）。
+//   若停止标志出现在最后一次 "begin run script" 之后，说明是人工停的，不许自动拉。
 static int bs_last_stop_is_user(const char *path, long want) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
@@ -3597,8 +3646,20 @@ static int bs_last_stop_is_user(const char *path, long want) {
     buf[gn] = 0;
     char *lr = NULL, *ls = NULL, *q = buf;
     while ((q = strstr(q, "begin run script")) != NULL) { lr = q; ++q; }
+    // ★ v6.24k：三串都算停止事件 —— operate 是中控消息入口（实测唯一真实存在的），
+    //   agent stop script / begin stop script 是厂商落下的执行痕迹，任一条都够。
     q = buf;
-    while ((q = strstr(q, "begin process stop script msg")) != NULL) { ls = q; ++q; }
+    while ((q = strstr(q, "begin process operate script msg")) != NULL) { ls = q; ++q; }
+    q = buf;
+    while ((q = strstr(q, "begin process stop script msg")) != NULL) {
+        if (!ls || q > ls) ls = q;
+        ++q;
+    }
+    q = buf;
+    while ((q = strstr(q, "agent stop script")) != NULL) {
+        if (!ls || q > ls) ls = q;
+        ++q;
+    }
     free(buf);
     return (ls && (!lr || ls > lr)) ? 1 : 0;
 }
@@ -3732,6 +3793,7 @@ static void *bs_watchdog(void *arg) {
     time_t cr_esc_last = 0; // ★ v6.24d：上次冷启 App 时刻（升级限速）
     time_t fg_last     = 0; // ★ v6.24d：上次 [fg] uiopen 游戏时刻（限速）
     time_t cr_stall_last = 0; // ★ v6.24e：上次停摆兜底扫描时刻
+    int    us_latched = 0;    // ★ v6.24k：用户停止闸门在本进程内的缓存（配合 .bs_userstop）
 
     for (;;) {
         sleep(WD_TICK_SECS);
@@ -3739,9 +3801,26 @@ static void *bs_watchdog(void *arg) {
         uint64_t st  = *stp;
         uint8_t  run = *runp;
 
+        // ★ v6.24k：用户停止闸门同步 —— run==1（中控下发「运行」）即解除。
+        //   放在最前面：本拍后续所有自动拉起分支统一读 us_latched。
+        if (run) {
+            if (bs_us_mark_exists()) {
+                bs_us_mark_clear();
+                bs_log("[us] run=1 -> user-stop gate cleared");
+            }
+            us_latched = 0;
+        } else {
+            us_latched = bs_us_mark_exists();
+        }
+
         // ---- ★ v6.7：落盘后自动重启状态机（最高优先；期间屏蔽抹模块与僵死自愈）----
         //   为什么放在 watchdog：so_sync / verwatch 都是裸 pthread，不能碰产品内部函数；
         //   watchdog 已在安全地调 _set_user_script_operate（见下面僵死自愈），走同一路径最稳。
+        //   ★ v6.24k：用户主动停了脚本 → 绝不自动 reload 拉起，直接丢弃本次跟版请求。
+        if (g_need_reload && rl_phase == RL_IDLE && us_latched) {
+            g_need_reload = 0;
+            bs_log("[rl] auto-reload skipped (user stopped script, .bs_userstop present)");
+        }
         if (g_need_reload && rl_phase == RL_IDLE) {
             g_need_reload = 0;
             g_reload_busy = 1;
@@ -3803,6 +3882,16 @@ static void *bs_watchdog(void *arg) {
         //     「不管脚本是被谁停的（中控点停 / 崩了 / 心跳杀的），都会清」。
         //     run 从 1 掉到 0 才触发；从未跑过（saw_run=0）不触发，避免启动即清空。
         if (run) { saw_run = 1; }
+        // ★ v6.24k：run 1->0 = 脚本被停。默认按「用户主动停」处理，落盘闸门（.bs_userstop），
+        //   禁止后续一切自动 OPER_START。若扫到崩溃签名，下面会撤销该闸门（崩溃优先）。
+        //   排除：reload 状态机自己停的、卡封禁下发的 STOP。
+        if (!g_reload_busy && !g_card_blocked && last_run == 1 && run == 0 && !us_latched) {
+            bs_us_mark_write("run 1->0");
+            us_latched = 1;
+            bs_cr_mark_clear();          // 用户停了，旧的崩溃证据一并作废
+            bs_log("[us] script stop observed (run 1->0, st=%p) -> auto-start gated until run=1",
+                   (void *)st);
+        }
         // ★ v6.7：重启期间(g_reload_busy)不抹——脚本是我们自己停的，
         //   模块必须留给重启后的新版脚本用（否则 wait_call_func 拿不到模块会卡死）。
         if (!g_reload_busy && saw_run && last_run == 1 && run == 0 && st != 0) {
@@ -3895,6 +3984,14 @@ static void *bs_watchdog(void *arg) {
             }
             if (cr_hit) {
                 time_t nowt = time(NULL);
+                // ★ v6.24k：崩溃证据优先于用户停止 —— 命中 run-error / loadfail 说明
+                //   「中控下发的 run 真的执行了并失败」，不是人工停。撤销 .bs_userstop，
+                //   否则 run 1->0 那一拍写的闸门会把本状态机整体挡死。
+                if (us_latched) {
+                    bs_us_mark_clear();
+                    us_latched = 0;
+                    bs_log("[us] crash signature overrides user-stop gate -> resume recovery");
+                }
                 // ★ v6.24h：先把证据落盘（App 重启会清空 agent.log，marker 不会）
                 if (run == 0) bs_cr_mark_write(cr_src == 0 ? "agent" : "sjz");
                 // ★ v6.24c：加载失败类签名不要求 saw_run —— 这种失败发生在
@@ -3970,8 +4067,14 @@ static void *bs_watchdog(void *arg) {
                 snprintf(sp, sizeof(sp), "%s/log/sjz.log", DATA_DIR);
                 struct stat ssb;
                 if (stat(sp, &ssb) == 0) sjz_age = (long)(nowt4 - (time_t)ssb.st_mtime);
-                int idle = (sjz_age >= CR_IDLE_SECS && !bs_last_stop_is_user(ap, 65536));
-                if (!cr_pending && st == 0 && run == 0 && g_hb_ok && (stalled || idle)) {
+                // ★ v6.24k：用户停止闸门 —— 会话内缓存（us_latched，来自 run 1->0）或
+                //   agent.log 里的显式停止痕迹，任一成立就不许拉。窗口 64K→256K：
+                //   agent.log 的 server2 重连循环每 20s 写 3 行，64K 只够覆盖几分钟，
+                //   用户停脚本半小时后再扫描时停止痕迹早被挤出去了（10-19 20:53 实锤：
+                //   停止后 29s 被 idle 兜底拉起，因为 judge 串写错 + 窗口太窄）。
+                int us_stop = us_latched || bs_last_stop_is_user(ap, 262144);
+                int idle = (sjz_age >= CR_IDLE_SECS);
+                if (!us_stop && !cr_pending && st == 0 && run == 0 && g_hb_ok && (stalled || idle)) {
                     bs_log("[cr] stall confirmed (mark=%lds rage=%lds idle=%d sjz=%lds st=%p) -> OPER_START now",
                            mage, rage, idle, sjz_age, (void *)st);
                     ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
@@ -3980,12 +4083,17 @@ static void *bs_watchdog(void *arg) {
                     cr_pending = 1;
                     cr_next    = nowt4 + CR_RETRY_BASE;
                 } else {
+                    if (us_stop) {
+                        // 用户停的：把残留崩溃证据也作废，避免下次扫描又据此拉起
+                        if (mage >= 0) bs_cr_mark_clear();
+                        mage = -1;
+                    }
                     // 每 5 分钟一条诊断快照（不动作），便于下次远程定位卡点
                     static time_t stlog = 0;
                     if (nowt4 - stlog >= 300) {
                         stlog = nowt4;
-                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d",
-                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending);
+                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d us=%d",
+                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending, us_stop);
                     }
                 }
             }
@@ -4001,7 +4109,15 @@ static void *bs_watchdog(void *arg) {
         //   只在真实崩溃签名命中时置位，故「用户主动停脚本」不会被误拉起。
         if (cr_pending) {
             time_t nowt2 = time(NULL);
-            if (run) {
+            // ★ v6.24k：用户主动停脚本 = 最高优先，直接放弃本状态机（不做任何重试）。
+            //   崩溃恢复只在「有崩溃证据」时置 pending，所以能走到这里的 us 只可能来自
+            //   「崩溃恢复过程中用户手动点了停止」——此时必须立刻停手。
+            if (us_latched && !run) {
+                bs_log("[cr] user stopped script -> drop pending recovery (retries=%d)", cr_retry);
+                cr_pending = 0;
+                cr_retry   = 0;
+                bs_cr_mark_clear();
+            } else if (run) {
                 bs_log("[cr] recovery OK, script running again (retries=%d)", cr_retry);
                 bs_cr_mark_clear();                 // ★ v6.24h：恢复即清证据
                 cr_pending = 0;
