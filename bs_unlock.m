@@ -826,7 +826,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24r"
+#define BS_DYLIB_VER       "v6.24s"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -855,6 +855,9 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define PULL_CONF "/var/mobile/Media/bs_pull.conf"
 
 static void bs_log(const char *fmt, ...);
+// ★ v6.24s：s2 下发要用它抠 /hb 应答里的 "s2"（真身在 so_sync 段，此处前置声明）
+static int  bs_json_pick_str(const unsigned char *j, size_t n, const char *key,
+                             char *out, size_t outsz);
 
 static int    g_port  = PULL_PORT_DEF;
 static int    g_tick  = PULL_TICK_SECS;
@@ -957,6 +960,75 @@ static char          g_stat_ip[64]  = {0};   // 改道目标（点分十进制�
 static uint32_t      g_stat_ip_net  = 0;     // 目标（网络字节序；0=关闭）
 static uint32_t      g_stat_vp_net  = 0;     // 厂商统计 IP（网络字节序）
 static volatile long g_stat_n_redir = 0;     // 改道计数
+
+// ★★★ v6.24s：server2 地址云端可配（不写死 agent.dat）
+//
+//   背景：Agent 连中控的链路是 server1(本机) → server2(厂商 7891) → server3(中控)，
+//   server2 通不了就永远走不到 server3。而 server2 地址来自代理进程的 agent.dat
+//   缓存（4B IPv4）或 DNS 解析 vps.beibeiplay.com——两个都不受我们控制：
+//     · agent.dat 缺失 → 走 DNS → 被 blockvps 拦死（188 台卡在这）
+//     · agent.dat 有值但指向的厂商 IP 在部分网络不可达（5 台卡在这）
+//     · agent.dat 指向 60.204.159.47 → 每 15~20s 直连厂商（238 台）
+//
+//   解法：中控 /hb 应答带 "s2":"<ip>[:port]" → 本进程记住 → 在 connect 层改道，
+//   不写任何文件（代理进程自己也会写 agent.dat，写文件必然打架），不用重启：
+//     · connect(60.204.159.47:7891) / connect(43.154.19.236:7891) → 改到 s2
+//     · getaddrinfo(vps.beibeiplay.com) → 直接把域名换成 s2 的数字 IP 交给系统
+//       （缺 agent.dat 的设备也能拿到一个能连的地址，不再 dns look up failed）
+//
+//   取值优先级：/hb 下发（每拍覆盖，可远程随时改） > conf `s2=`（离线兜底）
+//   语义："ip" / "ip:port" = 改道；"off"/"" = 不改道；"vendor" = 显式放行厂商
+//   应答里没有 s2 字段 = 保持现值（兼容老中控）
+#define S2_DEF_PORT 7891
+static char          g_s2_ip[64]    = {0};
+static uint32_t      g_s2_net       = 0;
+static int           g_s2_port      = S2_DEF_PORT;
+static volatile long g_s2_n         = 0;     // 改道/伪DNS 计数（共用，日志节流用）
+static char          g_s2_src[12]   = "none"; // conf / hb
+
+/// 应用一条 s2 配置。v 可以是 "ip"、"ip:port"、"off"、""、"vendor"。
+///   ★ 只在值变化时打 applied 日志，避免每拍心跳刷屏。
+static void bs_s2_apply(const char *v, const char *src) {
+    char ip[64];
+    int  port = S2_DEF_PORT;
+    if (!v || !v[0] || !strcmp(v, "off")) {
+        if (g_s2_net) bs_log("[s2] cleared (was %s:%d) src=%s", g_s2_ip, g_s2_port, src);
+        else if (!strcmp(src, "hb")) bs_log("[s2] cleared (already off) src=hb");
+        g_s2_net = 0; g_s2_ip[0] = 0;
+        snprintf(g_s2_src, sizeof(g_s2_src), "%s", src);
+        return;
+    }
+    if (!strcmp(v, "vendor")) {           // 显式放行厂商（等同 blockvps=0 的网段行为）
+        if (g_s2_net) bs_log("[s2] cleared (vendor passthrough) src=%s", src);
+        g_s2_net = 0; g_s2_ip[0] = 0;
+        snprintf(g_s2_src, sizeof(g_s2_src), "%s", src);
+        return;
+    }
+    const char *c = strchr(v, ':');
+    if (c) {
+        size_t l = (size_t)(c - v);
+        if (l >= sizeof(ip)) l = sizeof(ip) - 1;
+        memcpy(ip, v, l); ip[l] = 0;
+        int p = atoi(c + 1);
+        if (p > 0 && p < 65536) port = p;
+    } else {
+        strncpy(ip, v, sizeof(ip) - 1);
+        ip[sizeof(ip) - 1] = 0;
+    }
+    uint32_t net = inet_addr(ip);
+    if (net == INADDR_NONE || net == 0) {
+        bs_log("[s2] bad value '%s' src=%s (kept %s)", v, src,
+               g_s2_net ? g_s2_ip : "(off)");
+        return;
+    }
+    int changed = (net != g_s2_net) || (port != g_s2_port);
+    g_s2_net  = net;
+    g_s2_port = port;
+    strncpy(g_s2_ip, ip, sizeof(g_s2_ip) - 1);
+    g_s2_ip[sizeof(g_s2_ip) - 1] = 0;
+    snprintf(g_s2_src, sizeof(g_s2_src), "%s", src);
+    if (changed) bs_log("[s2] applied %s:%d src=%s", g_s2_ip, g_s2_port, src);
+}
 
 // ★ v6.6：主动跟版（conf sosync= / sotick=）
 static int           g_so_sync = 1;
@@ -1106,6 +1178,8 @@ static void bs_load_conf(void) {
             // ★ v6.19：厂商服务器（vps.beibeiplay.com / 43.154.19.236）进程内屏蔽开关
             //   （缺省开；仅 unlock 模式生效，probe 真卡机永不装钩子）
             g_block_vps = atoi(v) ? 1 : 0;
+            // ★ v6.24s：hook 已装（可能在 blockvps=0 时为 s2 装过）→ 同步闸门
+            if (g_blk_installed) g_blk_active = g_block_vps;
         }
         else if (!strcmp(k, "cardcheck")) {
             // ★ v6.20：自有卡密系统开关（缺省开；仅 unlock 模式起 cardwatch）
@@ -1138,6 +1212,11 @@ static void bs_load_conf(void) {
                     g_stat_ip_net = n;
                 }
             }
+        }
+        else if (!strcmp(k, "s2")) {
+            // ★ v6.24s：server2 改道目标（离线兜底）。格式 ip[:port] / off / vendor。
+            //   优先级低于 /hb 下发：心跳每拍会覆盖本值（含 off 清空）。
+            bs_s2_apply(v, "conf");
         }
         else if (!strcmp(k, "cardval")) {
             // ★ v6.21：手动卡密（兜底通道）——getter/日志捕获均无卡时用它激活
@@ -1945,6 +2024,13 @@ static int bs_hb_ping(uintptr_t base) {
                 bs_log("[hb] explicit deny -> immediate kill");
                 free(buf);
                 return -1;
+            }
+            // ★ v6.24s：授权有效时取 s2（server2 改道目标）。字段缺失 = 保持现值
+            //   （兼容老中控）；字段存在（含空串/off）= 覆盖，故中控删规则能远程回退。
+            if (verdict) {
+                char s2[80];
+                if (bs_json_pick_str((const unsigned char *)s, n, "s2", s2, sizeof(s2)))
+                    bs_s2_apply(s2, "hb");
             }
         }
         free(buf);
@@ -4342,6 +4428,35 @@ static int bs_hook_connect(int fd, const struct sockaddr *addr, socklen_t len) {
                 }
                 // ①② 均无有效目标 → 原样放行（历史行为，落厂商）
             }
+            // ★ v6.24s：server2（授权 7891）改道 —— 中控下发了 s2 就改，没下发就原样放行。
+            //   放在 stat 分支同一段（g_blk_active 闸门之前）：probe 模式同样生效。
+            else if (port == S2_DEF_PORT && g_s2_net &&
+                     g_s2_net != a.sin_addr.s_addr) {
+                a.sin_addr.s_addr = g_s2_net;
+                a.sin_port        = htons((uint16_t)g_s2_port);
+                long n = ++g_s2_n;
+                if (n <= 5 || n % 60 == 1)
+                    bs_log("[s2] connect " STAT_VENDOR_IP ":%d -> %s:%d (%s) (#%ld)",
+                           port, g_s2_ip, g_s2_port, g_s2_src, n);
+                return g_orig_connect(fd, (struct sockaddr *)&a, sizeof(a));
+            }
+        }
+    }
+    // ★ v6.24s：43.154.19.236:7891（旧厂商地址，业务端口已不可用）在 s2 有效时
+    //   同样改道。放在 g_blk_active 闸门之前 —— blockvps=0 时也能救回来。
+    if (addr && addr->sa_family == AF_INET) {
+        struct sockaddr_in a;
+        memcpy(&a, addr, sizeof(a));
+        if (a.sin_addr.s_addr == g_vps_ip_net &&
+            (int)ntohs(a.sin_port) == S2_DEF_PORT &&
+            g_s2_net && g_s2_net != a.sin_addr.s_addr) {
+            a.sin_addr.s_addr = g_s2_net;
+            a.sin_port        = htons((uint16_t)g_s2_port);
+            long n = ++g_s2_n;
+            if (n <= 5 || n % 60 == 1)
+                bs_log("[s2] connect " VPS_IP_STR ":%d -> %s:%d (%s) (#%ld)",
+                       S2_DEF_PORT, g_s2_ip, g_s2_port, g_s2_src, n);
+            return g_orig_connect(fd, (struct sockaddr *)&a, sizeof(a));
         }
     }
     if (!g_blk_active)
@@ -4362,10 +4477,18 @@ static int bs_hook_connect(int fd, const struct sockaddr *addr, socklen_t len) {
 }
 
 /// getaddrinfo 替身：解析 vps.beibeiplay.com → EAI_NONAME（TCP/UDP 全掐在源头）。
+///   ★ v6.24s：若中控下发了 s2，则把域名换成 s2 的数字 IP 再交给系统解析 ——
+///   既不查外网 DNS、也不放行厂商域名，还让「缺 agent.dat」的设备拿到可连地址。
 static int bs_hook_getaddrinfo(const char *node, const char *service,
                                const struct addrinfo *hints, struct addrinfo **res) {
     if (!bs_orig_fn("getaddrinfo", (void **)&g_orig_getaddrinfo))
         return EAI_SYSTEM;
+    if (node && !strcmp(node, VPS_DOMAIN) && g_s2_net) {
+        long n = ++g_s2_n;
+        if (n <= 5 || n % 60 == 1)
+            bs_log("[s2] dns " VPS_DOMAIN " -> %s (%s) (#%ld)", g_s2_ip, g_s2_src, n);
+        return g_orig_getaddrinfo(g_s2_ip, service ? service : "7891", hints, res);
+    }
     if (!g_blk_active)
         return g_orig_getaddrinfo(node, service, hints, res);
     if (node && !strcmp(node, VPS_DOMAIN)) {
@@ -4386,10 +4509,12 @@ static void bs_install_net_block(void) {
     };
     int rc = rebind_symbols(rbs, 2);
     g_blk_installed = 1;
-    g_blk_active = 1;   // ★ v6.21：interpose 在装载时已生效，此处只开闸门
-    bs_log("[blk] net block installed rc=%d fish=%d/%d interpose=on (" VPS_DOMAIN
-           " / " VPS_IP_STR ", unlock only)",
-           rc, g_orig_connect ? 1 : 0, g_orig_getaddrinfo ? 1 : 0);
+    // ★ v6.21：interpose 在装载时已生效，此处只开闸门
+    // ★ v6.24s：闸门跟随 blockvps —— 0 时 hook 仍在（s2 改道用），只是不拦域名/旧 IP
+    g_blk_active = g_block_vps ? 1 : 0;
+    bs_log("[blk] net block installed rc=%d fish=%d/%d interpose=on active=%d ("
+           VPS_DOMAIN " / " VPS_IP_STR ", unlock only)",
+           rc, g_orig_connect ? 1 : 0, g_orig_getaddrinfo ? 1 : 0, g_blk_active);
 }
 
 // ★ v6.21：dyld interpose —— fishhook 只能重绑**调用方镜像**的 GOT，实测
@@ -4704,14 +4829,14 @@ static void *bs_block_init(void *arg) {
         }
         fclose(fp);
     }
-    if (!bv) {
-        bs_log("[blk] blockvps=0 -> net block skipped");
-        return NULL;
-    }
     if (!strcmp(mode, "probe")) {
         bs_log("[blk] probe mode (real card) -> no block");
         return NULL;
     }
+    // ★ v6.24s：blockvps=0 也要装 hook —— s2（server2 改道）走的是同一对 hook，
+    //   不装就彻底没有改道能力。拦不拦由 g_blk_active 单独决定，两者解耦。
+    g_block_vps = bv ? 1 : 0;
+    if (!bv) bs_log("[blk] blockvps=0 -> hooks installed, BLOCK DISABLED (s2 redirect still on)");
     bs_install_net_block();
     return NULL;
 }
