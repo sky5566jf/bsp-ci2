@@ -827,7 +827,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25f"
+#define BS_DYLIB_VER       "v6.25g"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1124,6 +1124,7 @@ static volatile int  g_off_fail_run = 0;  // 连续协议级异常次数（★v6
 static volatile int  g_off_stall    = 0;  // 1 = 当前处于告警态
 static int           g_offstall     = 5;  // conf offstall= 阈值（2..60）
 static long          g_off_last_bad = 0;  // 最近一次异常时间戳
+static int           g_off_hb_stall_logged = 0;  // ★v6.25g：心跳首次带出 stall 只记一条
 
 /// 严格判断 32 位 hex（设备码格式）
 static int off_is_hex32(const char *s) {
@@ -1573,9 +1574,28 @@ static void bs_off_query(char *out, size_t n) {
     if (cur + 28 < n)
         snprintf(out + cur, n - cur, "&of=%s&ofn=%d",
                  stall ? "stall" : "ok", ofn);
+    // ★ v6.25g：心跳侧第一次真的把 stall 带出去时记一条 —— 现场只要看到这行，
+    //   就说明「哨兵 → 云端」这一段是通的，不用再去翻云端设备表。
+    if (stall && !g_off_hb_stall_logged) {
+        g_off_hb_stall_logged = 1;
+        bs_log("[off] hb carries of=stall ofn=%d (stub side already alarmed)", ofn);
+    }
 }
 
-// 生成 "&nm=<设备名>&md=<型号>&ov=<系统版本>[&pc=<中控IP>][&of=..]"；全空时只留 &of
+/// ★ v6.25g：现算一份完整 query = g_qbuf（启动时拼好的 key+设备信息）+ 当前哨兵状态。
+///   修的是 v6.25d~f 的真 bug：g_qbuf 只在 bs_load_conf 里拼**一次**，此后
+///   bs_hb_ping / bs_pull_modules 直接拿它拼 URL —— 于是 &of=&ofn= 被冻在
+///   进程启动那一刻的值（恒为 ok/0）。实测（2026-10-21 .216）：桩日志已打
+///   `★ STALL 2 consecutive protocol errors`、共享状态文件已是 `stall 7`，
+///   心跳却连着三拍报 `of=ok&ofn=0`，设备表永不标红。
+///   所以哨兵字段必须**每次心跳重新取**，不能进 g_qbuf 缓存。
+static void bs_q_live(char *out, size_t n) {
+    snprintf(out, n, "%s", g_qbuf);
+    bs_off_query(out, n);
+}
+
+// 生成 "&nm=<设备名>&md=<型号>&ov=<系统版本>[&pc=<中控IP>]"；全空返回空串
+//   ★ v6.25g：&of=&ofn= 不在这里拼 —— 改由 bs_q_live() 每次现算（不然会冻结）。
 static void bs_devinfo_query(char *out, size_t n) {
     char hn[128], mach[64], osv[32], pc[64];
     char hn_e[384], mach_e[200], osv_e[100], pc_e[200];
@@ -1585,7 +1605,6 @@ static void bs_devinfo_query(char *out, size_t n) {
     bs_pc_ip_of_plist(pc, sizeof(pc));
     if (!hn[0] && !mach[0] && !osv[0] && !pc[0]) {
         out[0] = 0;
-        bs_off_query(out, n);
         return;
     }
     bs_urlenc(hn, hn_e, sizeof(hn_e));
@@ -1604,7 +1623,7 @@ static void bs_devinfo_query(char *out, size_t n) {
         if (cur + strlen(pc_e) + 8 < n)
             snprintf(out + cur, n - cur, "&pc=%s", pc_e);
     }
-    bs_off_query(out, n);   // ★ v6.25d：协议变更哨兵
+    // ★ v6.25g：这里**不再**追加 &of=&ofn= —— 见 bs_q_live() 的注释。
 }
 
 static void bs_load_conf(void) {
@@ -2489,7 +2508,9 @@ static int bs_hb_ping(uintptr_t base) {
         }
 
         char url[768];   // ★ v6.10 g_qbuf 现含设备信息，512 不够
-        const char *q = (g_token[0] != 0) ? g_qbuf : "";
+        char qb[512];    // ★ v6.25g：每拍现算，&of=&ofn= 不跟着进程启动冻结
+        const char *q = "";
+        if (g_token[0] != 0) { bs_q_live(qb, sizeof(qb)); q = qb; }
         snprintf(url, sizeof(url), "http://%s:%d%s%s", ip, g_port, HB_PATH, q);
         bs_log("[hb] ping %s", url);
 
@@ -4156,7 +4177,9 @@ static int bs_pull_modules(uintptr_t base) {
 
         // --- 2) URL 拼接（纯 C）
         char url[768];   // ★ v6.10 g_qbuf 现含设备信息，512 不够
-        const char *q = (g_token[0] != 0) ? g_qbuf : "";
+        char qb[512];    // ★ v6.25g：同 /hb，现算
+        const char *q = "";
+        if (g_token[0] != 0) { bs_q_live(qb, sizeof(qb)); q = qb; }
         snprintf(url, sizeof(url), "http://%s:%d/manifest.json%s", ip, g_port, q);
         bs_log("[pull] step3 mfURL=%s", url);
 
