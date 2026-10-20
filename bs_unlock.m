@@ -827,7 +827,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25g"
+#define BS_DYLIB_VER       "v6.25h"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1313,39 +1313,58 @@ static int off_recover_key(const uint8_t *ct, size_t ctlen, const uint8_t m[32],
 #define OFF_STATE_PATH  DATA_DIR "/.bs_off_state"
 #define OFF_STATE_TTL   900      // 秒。心跳 60s 一次，15 分钟没更新说明那个进程没了
 
+/// 读共享状态。返回 1 = 文件里的 stall 有效（未过期）。
+///   ofn       连击数（可为 NULL）
+///   first_bad 首次进入告警的时间戳（可为 NULL）。老格式没有第 4 字段 → 0
+///   ★ v6.25h：第 4 字段是 v6.25h 新加的。告警期间每轮都会刷文件，若拿"最后一次
+///     写入时间"算恢复耗时，永远只剩一个轮次（15~20s），看不出到底坏了多久。
+static int off_state_read_ex(int *ofn, long *first_bad) {
+    char    buf[96];
+    int     fd = open(OFF_STATE_PATH, O_RDONLY);
+    ssize_t n;
+    long    ts = 0, fb = 0;
+    char    word[16];
+    int     v = 0;
+    if (ofn) *ofn = 0;
+    if (first_bad) *first_bad = 0;
+    if (fd < 0) return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    if (sscanf(buf, "%ld %15s %d %ld", &ts, word, &v, &fb) < 2) return 0;
+    if (v < 0) v = 0;
+    if (ofn) *ofn = v;
+    if (first_bad) *first_bad = (fb > 0) ? fb : ts;
+    if (time(NULL) - ts > OFF_STATE_TTL) return 0;   // 陈旧 → 当没发生
+    return strcmp(word, "stall") == 0;
+}
+
+static int off_state_read(int *ofn) { return off_state_read_ex(ofn, NULL); }
+
 static void off_state_write(int stall, int ofn) {
-    char    buf[80];
-    int     n  = snprintf(buf, sizeof(buf), "%ld %s %d\n",
-                          (long)time(NULL), stall ? "stall" : "ok", ofn);
+    char    buf[96];
+    int     n;
     ssize_t w;
-    int     fd = open(OFF_STATE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int     fd;
+    long    now   = (long)time(NULL);
+    long    first = 0;
+    // ★ v6.25h：进入告警时继承「首次异常时间」，否则每轮刷新会把它冲掉。
+    if (stall) {
+        int  old = 0;
+        long fb  = 0;
+        if (off_state_read_ex(&old, &fb) && fb > 0) first = fb;
+        if (first <= 0 || first > now) first = now;
+    }
+    n = snprintf(buf, sizeof(buf), "%ld %s %d %ld\n", now,
+                 stall ? "stall" : "ok", ofn, first);
+    fd = open(OFF_STATE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return;
     if (n > 0 && n < (int)sizeof(buf)) {
         w = write(fd, buf, (size_t)n);
         (void)w;                       // 单行小文件，写失败也无所谓，别让 -Wunused 报警
     }
     close(fd);
-}
-
-/// 读共享状态。返回 1 = 文件里的 stall 有效（未过期）。ofn 取文件值。
-static int off_state_read(int *ofn) {
-    char buf[80];
-    int  fd = open(OFF_STATE_PATH, O_RDONLY);
-    ssize_t n;
-    long ts = 0;
-    char word[16];
-    int  v = 0;
-    *ofn = 0;
-    if (fd < 0) return 0;
-    n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n <= 0) return 0;
-    buf[n] = 0;
-    if (sscanf(buf, "%ld %15s %d", &ts, word, &v) < 2) return 0;
-    if (v < 0) v = 0;
-    *ofn = v;
-    if (time(NULL) - ts > OFF_STATE_TTL) return 0;   // 陈旧 → 当没发生
-    return strcmp(word, "stall") == 0;
 }
 
 /// 桩工作线程：完全按实测的 262 → 38 → 208 → 80 → 16 顺序对答。
@@ -1421,12 +1440,25 @@ static void *off_worker(void *arg) {
             g_off_fail_run = 0;
             // ★ v6.25e：无论是哪个进程走到 accepted，都证明厂商链路没坏 →
             //   无条件清掉共享告警（这是唯一能证伪「协议变了」的硬证据）。
-            off_state_write(0, 0);
-            if (g_off_stall) {
-                g_off_stall = 0;
-                bs_evt("[off] ★ recovered: accepted again after %lds (stub=%ld ok=%ld)",
-                       (long)(time(NULL) - g_off_last_bad),
-                       g_off_n_stub, g_off_n_ok);
+            // ★ v6.25h：**先读再清再判**。告警多半是上一次冷启前那个进程报的，
+            //   本进程 g_off_stall 恒为 0，只看它就变成「状态清了、事件没打」——
+            //   实测（.216）恢复后文件已回 `ok 0`，日志里却一条 ★ recovered 都没有，
+            //   运维事后查不到「什么时候恢复、坏了多久」。
+            {
+                int  f_ofn = 0;
+                long f_fb  = 0;
+                int  was   = off_state_read_ex(&f_ofn, &f_fb) || g_off_stall;
+                int  wasn  = ((int)g_off_fail_run > f_ofn) ? (int)g_off_fail_run : f_ofn;
+                long from  = f_fb > 0 ? f_fb : g_off_last_bad;
+                off_state_write(0, 0);
+                if (was) {
+                    long dur = (from > 0 && time(NULL) >= from)
+                             ? (long)(time(NULL) - from) : -1;
+                    g_off_stall = 0;
+                    bs_evt("[off] ★ recovered: accepted again after %lds "
+                           "(was stall ofn=%d stub=%ld ok=%ld)",
+                           dur, wasn, g_off_n_stub, g_off_n_ok);
+                }
             }
             bs_log("[off] #%d 16 = accepted, vendor chain fully bypassed", round);
             accn = 0; want = 262;
@@ -1579,6 +1611,9 @@ static void bs_off_query(char *out, size_t n) {
     if (stall && !g_off_hb_stall_logged) {
         g_off_hb_stall_logged = 1;
         bs_log("[off] hb carries of=stall ofn=%d (stub side already alarmed)", ofn);
+    } else if (!stall) {
+        // ★ v6.25h：恢复后复位，否则第二次告警时这行日志不再出现（只记首轮）
+        g_off_hb_stall_logged = 0;
     }
 }
 
