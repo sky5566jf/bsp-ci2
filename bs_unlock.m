@@ -827,7 +827,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25h"
+#define BS_DYLIB_VER       "v6.25i"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1125,6 +1125,22 @@ static volatile int  g_off_stall    = 0;  // 1 = 当前处于告警态
 static int           g_offstall     = 5;  // conf offstall= 阈值（2..60）
 static long          g_off_last_bad = 0;  // 最近一次异常时间戳
 static int           g_off_hb_stall_logged = 0;  // ★v6.25g：心跳首次带出 stall 只记一条
+
+// ★★★★ v6.25i：离线出站白名单（默认拒绝）。旧的「只管已知端口」有三个实证漏洞：
+//   ① 只处理 7891 / 7875 / 7880 —— 60.204.159.47 的**其它端口**直接落到
+//      `return g_orig_connect`，真外发；
+//   ② 7875/7880 若 statip 与 app.plist 都没 IP，代码注释明写「原样放行（落厂商）」；
+//   ③ sendto/sendmsg 完全没 hook —— UDP 无连接，connect 层根本拦不到。
+//   现改为：offline=1 时只有白名单能出去（回环 / 我们云端 / 中控），
+//   7891 不分 IP 一律接桩（server2 在协议里只此一个端口，厂商换 IP 也不怕），
+//   其余一律 EHOSTUNREACH。逃生门 conf egress=0 退回旧行为。
+static volatile int  g_off_egress    = 1;   // conf egress=（1=白名单，0=放行）
+static volatile long g_off_n_deny    = 0;   // 被拒的 TCP 出站数
+static volatile long g_off_n_deny_u  = 0;   // 被拒的 UDP 出站数
+static uint32_t      g_off_cloud_net = 0;   // 47.116.161.226（网络序）
+static uint32_t      g_off_pc_net    = 0;   // 中控 IP（网络序，0=未知）
+static long          g_off_pc_ts     = 0;   // 中控 IP 缓存时间戳
+static uint32_t      g_off_so_net    = 0;   // conf sohost 解析结果（beta.so 独立源）
 
 /// 严格判断 32 位 hex（设备码格式）
 static int off_is_hex32(const char *s) {
@@ -1588,6 +1604,74 @@ static void bs_pc_ip_of_plist(char *out, size_t n) {
     free(b);
 }
 
+// ★★★★ v6.25i：离线出站白名单的实现。
+//
+//   设计取舍：为什么用「白名单」而不是「枚举厂商地址」——
+//   厂商地址随时可加（换 IP、加备用域名、换 CDN），枚举永远补不完；
+//   而离线机真正需要的对外通道只有三条：本机 server1（回环）、我们云端、中控。
+//   把这三条列出来，其余默认拒绝，是唯一能结构性保证「零外发」的写法。
+//
+//   代价：中控 IP 变了要 10s 内跟上（缓存 TTL），且 egress=0 留了逃生门。
+
+/// 目的地是否允许从本机出去（仅 offline=1 且 egress=1 时询问）。
+static int      off_egress_ok(uint32_t nip);
+
+/// 中控 IP（网络序，0=未知）。10s 缓存 —— app.plist 是现读文件，
+///   用户中途改中控 IP 也能跟上，但不必每次 connect 都读盘。
+static uint32_t off_allow_pc_net(void) {
+    long     now = (long)time(NULL);
+    char     ip[64];
+    uint32_t n = 0;
+    uint32_t t;
+    if (g_off_pc_net && now - g_off_pc_ts < 10) return g_off_pc_net;
+    ip[0] = 0;
+    bs_pc_ip_of_plist(ip, sizeof(ip));                 // ① app.plist 现读（最权威）
+    if (!ip[0] && g_stat_ip[0]) snprintf(ip, sizeof(ip), "%s", g_stat_ip);  // ② conf statip=
+    if (!ip[0] && g_appip[0])   snprintf(ip, sizeof(ip), "%s", g_appip);    // ③ 加载时缓存
+    if (ip[0]) {
+        t = inet_addr(ip);
+        if (t != INADDR_NONE) n = t;
+    }
+    g_off_pc_net = n;
+    g_off_pc_ts  = now;
+    return n;
+}
+
+/// 日志用的 IP 字符串（4 槽轮转，只用于打日志，非线程安全的取舍可接受）。
+static const char *off_ip_str(uint32_t nip) {
+    static char        slot[4][32];
+    static int         idx = 0;
+    char              *p   = slot[idx++ & 3];
+    struct in_addr     ia;
+    ia.s_addr = nip;
+    if (!inet_ntop(AF_INET, &ia, p, 32)) snprintf(p, 32, "?");
+    return p;
+}
+
+/// 这个目的地能不能出去。允许：回环 / 我们云端 / 中控。其余一律否。
+static int off_egress_ok(uint32_t nip) {
+    uint32_t h;
+    if (!g_off_egress) return 1;                       // 逃生门：全放行
+    if (!nip) return 0;
+    if (!g_off_cloud_net) g_off_cloud_net = inet_addr(BS_HOST_DEF);
+    h = ntohl(nip);
+    if ((h >> 24) == 127) return 1;                    // 回环：厂商 server1 在本地
+    if (g_off_cloud_net && nip == g_off_cloud_net) return 1;   // 我们云端（hb/pull/card）
+    if (g_off_so_net && nip == g_off_so_net) return 1;         // conf sohost（beta.so 独立源）
+    if (nip == off_allow_pc_net()) return 1;           // 中控
+    return 0;
+}
+
+/// 记一次被拒的出口。TCP/UDP 分开计数；前 10 条全打，之后每 60 条采样一条。
+static void off_deny(uint32_t nip, int port, int udp) {
+    long n = udp ? __sync_add_and_fetch(&g_off_n_deny_u, 1)
+                 : __sync_add_and_fetch(&g_off_n_deny, 1);
+    if (n <= 10 || n % 60 == 1) {
+        bs_log("[off] egress %s %s:%d denied (not in allowlist) (#%ld)",
+               udp ? "udp" : "tcp", off_ip_str(nip), port, n);
+    }
+}
+
 // ★ v6.25d：协议变更哨兵状态（&of=ok|stall&ofn=N）。
 //   只在 offline=1 时带出 —— 透传设备根本没有桩，带这个字段会让设备表误判成"正常"。
 static void bs_off_query(char *out, size_t n) {
@@ -1785,10 +1869,21 @@ static void bs_load_conf(void) {
             if (t > 60) t = 60;
             g_offstall = t;
         }
+        else if (!strcmp(k, "egress")) {
+            // ★ v6.25i：离线出站白名单开关。
+            //   1（默认）= 只放行 回环 / 我们云端 / 中控 / sohost，其余一律拒绝；
+            //   0 = 退回旧的「只管 7891/7875/7880」行为（现场逃生门）。
+            g_off_egress = atoi(v) ? 1 : 0;
+        }
         else if (!strcmp(k, "sohost") && v[0]) {
             // ★ v6.9：局域网中继地址（仅 beta.so 下载走它；空/缺省=直连云端）
             strncpy(g_sohost, v, sizeof(g_sohost) - 1);
             g_sohost[sizeof(g_sohost)-1] = 0;
+            // ★ v6.25i：白名单要放行它，否则离线机的 beta.so 下载会被自己拦掉
+            {
+                uint32_t t = inet_addr(g_sohost);
+                if (t != INADDR_NONE) g_off_so_net = t;
+            }
         }
         else if (!strcmp(k, "soport")) {
             // ★ v6.9：中继端口（<=0 时回落 g_port）
@@ -1815,13 +1910,13 @@ static void bs_load_conf(void) {
     // ★ v6.12：缓存 app.plist 的中控 ip —— beta.so 中继地址直接用它（见 so_sync 下载处）
     bs_pc_ip_of_plist(g_appip, sizeof(g_appip));
 
-    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
+    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d egress=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
            BS_DYLIB_VER,
            g_port, g_tick, g_enable, g_mode == MODE_PROBE ? "probe" : "unlock",
            g_token[0] ? "(set)" : "(none)",
            g_qbuf[0] ? g_qbuf : "(none)", g_mod_dir, g_hb_max,
            g_so_sync, g_so_tick, g_offstall, g_autoreload,
-           g_crashresume, g_block_vps,
+           g_crashresume, g_block_vps, g_off_egress,
            g_cardcheck, g_cardgrace, g_cardtick,
            g_card_host, g_cardval[0] ? "(set)" : "(none)",
            g_sohost[0] ? g_sohost : "(none)", g_soport,
@@ -4961,6 +5056,51 @@ static int bs_hook_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     (void)len;
     if (!bs_orig_fn("connect", (void **)&g_orig_connect))
         { errno = ENOSYS; return -1; }
+
+    // ★★★★ v6.25i：offline=1 走一条独立的出站路径，放在所有现有分支之前。
+    //   这样它不受 s2 / blockvps / 端口枚举的影响 —— 顺带堵掉两个已知隐患：
+    //     · 给离线机下发 s2 不再能把流量放出去（旧顺序里改道分支在桩分支之前）；
+    //     · agent.dat 缺失或指向未知 IP 时，7891 照样接桩（厂商看到的仍是「连上了」，
+    //       不会因为连不上而清缓存，不会陷入「越修越坏」的循环）。
+    //   顺序：白名单放行 → 统计端口改道中控 → 7891 接桩 → 其余拒绝。
+    if (g_offline && g_off_egress && addr && addr->sa_family == AF_INET) {
+        struct sockaddr_in a;
+        int      port;
+        uint32_t nip;
+        uint32_t vp;
+        memcpy(&a, addr, sizeof(a));
+        port = (int)ntohs(a.sin_port);
+        nip  = a.sin_addr.s_addr;
+        if (!g_off_vendor_net) g_off_vendor_net = inet_addr(STAT_VENDOR_IP);
+        if (off_egress_ok(nip))
+            return g_orig_connect(fd, addr, len);       // ① 中控 / 云端 / 回环
+        // ② 统计上报（7875 统计 / 7880 照片）：改道到中控，能力保留、零外发。
+        vp = g_stat_vp_net ? g_stat_vp_net : g_off_vendor_net;
+        if (nip == vp && (port == 7875 || port == 7880)) {
+            uint32_t pc = off_allow_pc_net();
+            if (pc) {
+                a.sin_addr.s_addr = pc;
+                bs_log("[off] stat %s:%d -> %s (allowlisted pc)",
+                       off_ip_str(nip), port, off_ip_str(pc));
+                return g_orig_connect(fd, (struct sockaddr *)&a, sizeof(a));
+            }
+            off_deny(nip, port, 0);                     // 没配中控 → 只能拒
+            errno = EHOSTUNREACH;
+            return -1;
+        }
+        // ③ server2：协议里只有 7891 这个端口，不分 IP 一律接桩，一个字节都不出去。
+        if (port == S2_DEF_PORT) {
+            off_start(fd);
+            bs_log("[off] connect %s:%d intercepted -> in-proc stub",
+                   off_ip_str(nip), port);
+            return 0;
+        }
+        // ④ 其余全部拒绝
+        off_deny(nip, port, 0);
+        errno = EHOSTUNREACH;
+        return -1;
+    }
+
     // ★ v6.23l/v6.23m：统计上报改道 —— 只命中厂商统计 IP:7875/7880，其它连接零感知。
     //   目标解析：① conf statip= 优先；② 未配置 → 现读 app.plist 中控 ip
     //   （用户拍板：中控与统计网站都是 app.plist 那台电脑，端口不变）。
@@ -5128,6 +5268,50 @@ static void bs_install_net_block(void) {
            rc, g_orig_connect ? 1 : 0, g_orig_getaddrinfo ? 1 : 0, g_blk_active);
 }
 
+// ★★★★ v6.25i：UDP 出口白名单 —— 旧实现最大的一个洞。
+//   connect 层拦不到无连接的 UDP，而 sendto/sendmsg 的目标直接写在参数里。
+//   实测厂商确有用 7875/7880 做统计上报（.216 日志里 [stat] connect
+//   60.204.159.47:7875 出现 51 次），只要哪天改成 UDP，一个字节都拦不住。
+//   拒绝时返回 len（假装发成功）：返回 -1 会让厂商立刻重试，变成风暴。
+static ssize_t (*g_orig_sendto)(int, const void *, size_t, int,
+                                const struct sockaddr *, socklen_t);
+static ssize_t (*g_orig_sendmsg)(int, const struct msghdr *, int);
+
+static ssize_t bs_hook_sendto(int fd, const void *buf, size_t len, int flags,
+                              const struct sockaddr *to, socklen_t tolen) {
+    if (g_offline && g_off_egress && to && to->sa_family == AF_INET) {
+        struct sockaddr_in a;
+        memcpy(&a, to, sizeof(a));
+        if (!off_egress_ok(a.sin_addr.s_addr)) {
+            off_deny(a.sin_addr.s_addr, (int)ntohs(a.sin_port), 1);
+            return (ssize_t)len;
+        }
+    }
+    if (!bs_orig_fn("sendto", (void **)&g_orig_sendto)) { errno = ENOSYS; return -1; }
+    return g_orig_sendto(fd, buf, len, flags, to, tolen);
+}
+
+static ssize_t bs_hook_sendmsg(int fd, const struct msghdr *msg, int flags) {
+    if (g_offline && g_off_egress && msg && msg->msg_name &&
+        msg->msg_namelen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        const struct sockaddr *to = (const struct sockaddr *)msg->msg_name;
+        if (to->sa_family == AF_INET) {
+            struct sockaddr_in a;
+            size_t tot = 0;
+            size_t i;
+            memcpy(&a, to, sizeof(a));
+            if (!off_egress_ok(a.sin_addr.s_addr)) {
+                off_deny(a.sin_addr.s_addr, (int)ntohs(a.sin_port), 1);
+                for (i = 0; i < (size_t)msg->msg_iovlen; i++)
+                    tot += msg->msg_iov[i].iov_len;
+                return (ssize_t)tot;
+            }
+        }
+    }
+    if (!bs_orig_fn("sendmsg", (void **)&g_orig_sendmsg)) { errno = ENOSYS; return -1; }
+    return g_orig_sendmsg(fd, msg, flags);
+}
+
 // ★ v6.21：dyld interpose —— fishhook 只能重绑**调用方镜像**的 GOT，实测
 //   _bb_run_auth 的 connect 走共享缓存内部调用（[blk] 计数恒 0）拦不住。
 //   __DATA,__interpose 对全进程所有经 dyld 桩的调用点生效（含 CFNetwork），
@@ -5144,6 +5328,9 @@ static void bs_install_net_block(void) {
 
 BS_INTERPOSE(bs_hook_connect, connect);
 BS_INTERPOSE(bs_hook_getaddrinfo, getaddrinfo);
+// ★ v6.25i：UDP 出口白名单（无连接协议，connect 层覆盖不到）
+BS_INTERPOSE(bs_hook_sendto, sendto);
+BS_INTERPOSE(bs_hook_sendmsg, sendmsg);
 // ★ v6.25：真离线。Security.framework 必然存在（Agent 已导入 SecKeyEncrypt），
 //   CI 需加 -framework Security 才能链接到该符号。
 BS_INTERPOSE(bs_hook_seckeyencrypt, SecKeyEncrypt);
