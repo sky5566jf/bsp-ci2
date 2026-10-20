@@ -45,7 +45,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "s2] connect" || (echo "MISSING s2 connect redirect" && exit 1)
           strings bs_unlock.dylib | grep -q "s2] dns" || (echo "MISSING s2 pseudo-dns" && exit 1)
           strings bs_unlock.dylib | grep -q "s2] cleared" || (echo "MISSING s2 clear path" && exit 1)
-          strings bs_unlock.dylib | grep -qx "s2" || (echo "MISSING s2 conf key" && exit 1)
+          strings bs_unlock.dylib | grep -q "vendor passthrough" || (echo "MISSING s2 vendor mode" && exit 1)
           otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
       - uses: actions/upload-artifact@v4
         with:
