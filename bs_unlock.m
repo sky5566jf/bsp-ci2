@@ -3982,9 +3982,10 @@ static void *bs_watchdog(void *arg) {
             long sja = bs_file_age(DATA_DIR "/log/sjz.log");
             int pend = -1;
             char smd5[40] = {0};
+            long ssz = 0;
             if (sja >= 0 && sja <= US_STOP_FRESH
-                && bs_so_state_read(smd5, sizeof(smd5), NULL, &pend, NULL) && pend == 1) {
-                bs_so_state_write(0, smd5, 0);
+                && bs_so_state_read(smd5, sizeof(smd5), &ssz, &pend, NULL) && pend == 1) {
+                bs_so_state_write(0, smd5, ssz);          // 保留 size，别写成 0
                 bs_evt("[so] new so applied (script started, md5=%.8s) -> pend=0", smd5);
             }
         }
