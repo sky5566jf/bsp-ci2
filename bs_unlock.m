@@ -827,7 +827,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25e"
+#define BS_DYLIB_VER       "v6.25f"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1087,6 +1087,18 @@ static int           g_so_tick = SO_SYNC_TICK_SECS;
 //   **既不发 208 也不关闭**，worker 永久阻塞在 recv —— 实测 28 个连接卡死在此，
 //   每轮泄漏一个 socketpair fd + 一个线程。现在给桩 fd 加 OFF_IDLE_TIMEOUT（90s）
 //   接收超时，超时即收尾关闭；超时记为 abort（不计数），只有 proto_bad 才计数。
+//
+// ----------------------------------------------------------------
+// ★ v6.25f：哨兵状态跨进程共享（2026-10-21 真机实测驱动）
+// ----------------------------------------------------------------
+// v6.25e 上真机发现：**装 connect 钩子/跑桩线程的进程 ≠ 发 /hb 的进程**
+//   （厂商客户端在 App 侧进程，心跳在 Agent）。桩里置的 g_off_stall 在 /hb 那侧
+//   永远读到 0 —— 日志里 `[off] ★ STALL 2 consecutive protocol errors` 已经打了，
+//   心跳却仍报 `of=ok&ofn=0`，设备表永远不标红，等于哨兵白做。
+// 修法：状态落一行小文件 DATA_DIR/.bs_off_state（`<epoch> <ok|stall> <ofn>`），
+//   两进程共用；/hb 侧取「更坏」的结论，并带 OFF_STATE_TTL=900s 陈旧保护
+//   （进程没了就别一直红着）。accepted 是**唯一能证伪**「协议变了」的硬证据，
+//   任何进程走到 accepted 都写 ok，跨进程清告警。
 #define OFF_IDLE_TIMEOUT   90      // 桩接收空闲超时（秒）。实测跳间 RTT < 50ms，90s 极宽松
 #define OFF_RESP80_HEX                                                        \
     "500000000300430000000400000107000100000000060002736a7a"                  \
@@ -1290,6 +1302,51 @@ static int off_recover_key(const uint8_t *ct, size_t ctlen, const uint8_t m[32],
     return -1;
 }
 
+/// ★ v6.25e：哨兵状态跨进程共享。
+///   实测（2026-10-21 .216）发现一个致命的架构差异：**装 connect 钩子的进程
+///   和发 /hb 的进程不是同一个**（钩子/桩线程在跑厂商客户端的进程，心跳在 Agent），
+///   于是桩里置的 g_off_stall 在 /hb 那边永远读到 0 —— 日志里 STALL 已经打了，
+///   心跳却仍报 `of=ok&ofn=0`，设备表也就永远不标红。
+///   解决办法：把状态落一行小文件，两个进程共用；/hb 侧任取「更坏」的那个。
+///   格式：`<epoch> <ok|stall> <ofn>\n`。超过 OFF_STATE_TTL 视为陈旧（进程早死了）。
+#define OFF_STATE_PATH  DATA_DIR "/.bs_off_state"
+#define OFF_STATE_TTL   900      // 秒。心跳 60s 一次，15 分钟没更新说明那个进程没了
+
+static void off_state_write(int stall, int ofn) {
+    char    buf[80];
+    int     n  = snprintf(buf, sizeof(buf), "%ld %s %d\n",
+                          (long)time(NULL), stall ? "stall" : "ok", ofn);
+    ssize_t w;
+    int     fd = open(OFF_STATE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    if (n > 0 && n < (int)sizeof(buf)) {
+        w = write(fd, buf, (size_t)n);
+        (void)w;                       // 单行小文件，写失败也无所谓，别让 -Wunused 报警
+    }
+    close(fd);
+}
+
+/// 读共享状态。返回 1 = 文件里的 stall 有效（未过期）。ofn 取文件值。
+static int off_state_read(int *ofn) {
+    char buf[80];
+    int  fd = open(OFF_STATE_PATH, O_RDONLY);
+    ssize_t n;
+    long ts = 0;
+    char word[16];
+    int  v = 0;
+    *ofn = 0;
+    if (fd < 0) return 0;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    if (sscanf(buf, "%ld %15s %d", &ts, word, &v) < 2) return 0;
+    if (v < 0) v = 0;
+    *ofn = v;
+    if (time(NULL) - ts > OFF_STATE_TTL) return 0;   // 陈旧 → 当没发生
+    return strcmp(word, "stall") == 0;
+}
+
 /// 桩工作线程：完全按实测的 262 → 38 → 208 → 80 → 16 顺序对答。
 ///   ★ 跑在 socketpair 的另一个端点上，Agent 的 select/poll 行为与真连接一致。
 static void *off_worker(void *arg) {
@@ -1361,6 +1418,9 @@ static void *off_worker(void *arg) {
             // ★ v6.25d：走到这里 = 授权链路全通，清掉失败连击
             __sync_fetch_and_add(&g_off_n_ok, 1);
             g_off_fail_run = 0;
+            // ★ v6.25e：无论是哪个进程走到 accepted，都证明厂商链路没坏 →
+            //   无条件清掉共享告警（这是唯一能证伪「协议变了」的硬证据）。
+            off_state_write(0, 0);
             if (g_off_stall) {
                 g_off_stall = 0;
                 bs_evt("[off] ★ recovered: accepted again after %lds (stub=%ld ok=%ld)",
@@ -1377,6 +1437,16 @@ static void *off_worker(void *arg) {
     if (proto_bad) {
         int n = __sync_add_and_fetch(&g_off_fail_run, 1);
         g_off_last_bad = (long)time(NULL);
+        // ★ v6.25e：每次协议异常都刷一次共享状态（不只告警那一刻）——
+        //   /hb 在另一个进程，只写一次容易错过；刷最新 ofn 也便于看连击数。
+        //   ★ 必须「保留」文件里仍有效的 stall：本进程只出 1 次异常时不能把
+        //     另一个进程已经报出的告警清掉。
+        {
+            int f_ofn = 0;
+            int f_stall = off_state_read(&f_ofn);
+            off_state_write((n >= g_offstall) || g_off_stall || f_stall,
+                            n > f_ofn ? n : f_ofn);
+        }
         if (n >= g_offstall && !g_off_stall) {
             g_off_stall = 1;
             bs_evt("[off] ★ STALL %d consecutive protocol errors "
@@ -1489,11 +1559,20 @@ static void bs_pc_ip_of_plist(char *out, size_t n) {
 //   只在 offline=1 时带出 —— 透传设备根本没有桩，带这个字段会让设备表误判成"正常"。
 static void bs_off_query(char *out, size_t n) {
     size_t cur;
+    int    f_ofn = 0;
+    int    f_stall;
+    int    stall;
+    int    ofn;
     if (!g_offline) return;
+    // ★ v6.25e：钩子进程 ≠ 心跳进程 → 必须把共享状态文件的结论合并进来，
+    //   否则会出现「日志已 STALL、心跳仍 ok」的假安全（实测踩过）。
+    f_stall = off_state_read(&f_ofn);
+    stall   = g_off_stall || f_stall;
+    ofn     = (int)g_off_fail_run > f_ofn ? (int)g_off_fail_run : f_ofn;
     cur = strlen(out);
     if (cur + 28 < n)
         snprintf(out + cur, n - cur, "&of=%s&ofn=%d",
-                 g_off_stall ? "stall" : "ok", (int)g_off_fail_run);
+                 stall ? "stall" : "ok", ofn);
 }
 
 // 生成 "&nm=<设备名>&md=<型号>&ov=<系统版本>[&pc=<中控IP>][&of=..]"；全空时只留 &of

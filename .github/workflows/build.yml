@@ -24,15 +24,17 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.25e" || (echo "MISSING v6.25e" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.25f" || (echo "MISSING v6.25f" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25b"; then echo "STALE: v6.25b string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25c"; then echo "STALE: v6.25c string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25d"; then echo "STALE: v6.25d string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.25e"; then echo "STALE: v6.25e string still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "consecutive protocol errors" || (echo "MISSING protocol stall alarm" && exit 1)
           strings bs_unlock.dylib | grep -q "stub idle %ds -> close" || (echo "MISSING stub idle timeout" && exit 1)
+          strings bs_unlock.dylib | grep -q ".bs_off_state" || (echo "MISSING cross-process stall state" && exit 1)
           strings bs_unlock.dylib | grep -q "recovered: accepted again after" || (echo "MISSING stall recovery" && exit 1)
           strings bs_unlock.dylib | grep -q "of=%s&ofn=%d" || (echo "MISSING of/ofn hb param" && exit 1)
           if strings bs_unlock.dylib | grep -q "auto-reload: request STOP"; then echo "FORBIDDEN: [rl] auto-reload still present" && exit 1; fi
