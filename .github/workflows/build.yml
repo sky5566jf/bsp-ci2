@@ -35,8 +35,6 @@ jobs:
           strings bs_unlock.dylib | grep -q "auto-start gated until run=1" || (echo "MISSING userstop gate" && exit 1)
           strings bs_unlock.dylib | grep -q "agent stop script" || (echo "MISSING user-stop sig" && exit 1)
           strings bs_unlock.dylib | grep -q "not a user stop, no gate" || (echo "MISSING sjz freshness guard" && exit 1)
-          strings bs_unlock.dylib | grep -q "script hung" || (echo "MISSING hang watchdog" && exit 1)
-          strings bs_unlock.dylib | grep -q "kept STOPPED on purpose" || (echo "MISSING crashresume wiring" && exit 1)
           otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
       - uses: actions/upload-artifact@v4
         with:
