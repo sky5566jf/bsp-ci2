@@ -945,6 +945,8 @@ static char          g_cardval[80]    = {0};   // ★ v6.21：conf cardval= 手�
 // ★ v6.19：厂商服务器进程内屏蔽（仅 unlock 模式安装钩子）
 static volatile int  g_block_vps     = 1;    // conf `blockvps=`（缺省开）
 static volatile int  g_blk_installed = 0;
+// ★ v6.24s：闸门提前声明 —— bs_load_conf 里要按 blockvps 同步它（hook 定义在文件末尾）
+static volatile int  g_blk_active    = 0;
 static volatile long g_blk_n_connect = 0;    // connect 拦截计数
 static volatile long g_blk_n_dns     = 0;    // getaddrinfo 拦截计数
 #define VPS_DOMAIN   "vps.beibeiplay.com"
@@ -4378,7 +4380,7 @@ static int (*g_orig_getaddrinfo)(const char *, const char *,
                                  const struct addrinfo *, struct addrinfo **);
 // ★ v6.21：运行时闸门 —— __interpose 节由 dyld 装载时无条件生效，probe
 //（真卡机）/ blockvps=0 必须全放行，故屏蔽逻辑以 g_blk_active 为准。
-static volatile int g_blk_active = 0;
+//   ★ v6.24s：变量本体已上移到 g_blk_installed 旁（bs_load_conf 要同步它）。
 
 /// 解析真身：fishhook 填过就用；否则 RTLD_NEXT 跳过本镜像取 libsystem 真身。
 /// （不能 RTLD_DEFAULT —— interpose 生效时会解析到替身自身 → 无限递归。）
