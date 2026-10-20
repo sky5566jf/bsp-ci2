@@ -383,11 +383,12 @@
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
 // v6.24p ★★★ 删除一切「自动运行脚本」（2026-10-20，用户指令：除「脚本本来在跑」
-// v6.24q ★★★ 补上 v6.24p 核对发现的唯一遗漏窗口：[rl] reload 的 STOP→START 之间
-//       用户点停止时 1->0 判定被 g_reload_busy 屏蔽、闸门写不进 → st 归零后仍会
-//       START。修法：RL_WAIT_ZERO 每拍 START 前直接查 agent.log 停止痕迹
-//       （agent stop script / begin process stop script msg），查到即 abort 不 START。
-//       reload 自身发的 OPER_STOP 直调产品函数不留痕迹，正常 reload 不受影响。
+// v6.24q ★★★ [rl] so_sync 自动重载整体移除（用户指令：新 so 只落盘，脚本由人工
+//       手动运行时加载）——核对 v6.24p 时发现 reload 的 STOP→START 窗口内用户点停止
+//       会被 g_reload_busy 屏蔽判据而漏检，与其补丁不如干脆删掉整条自动 START 路径。
+//       至此全 dylib OPER_START 归零：任何代码路径都不再运行脚本。so_sync 下载/
+//       校验/修复保留（纯落盘），verwatch 按盘上版本预铺密钥（手动运行即可解新包）；
+//       conf autoreload= 键仍解析但无动作点（同 crashresume 先例）。
 //       与「中控手动下发运行」外，其余一律不得自动运行脚本）：
 //       ① [hg] 假运行看门狗（v6.24m/n）整块删除 —— OPER_STOP→OPER_START 自动重启；
 //       ② [cr] 崩溃签名自动 OPER_START 删除 —— 崩溃只落证据 + 节流日志，原地停住等人点；
@@ -699,13 +700,8 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define WD_TICK_SECS    2
 #define WD_STALE_TICKS  5       // 5 * 2s = 10s 判定僵死
 
-// ★ v6.7：落盘后自动重启的状态机相位与超时上限（tick 单位，WD_TICK_SECS=2s）
-#define RL_IDLE         0
-#define RL_WAIT_ZERO    1       // 已发 STOP，等 g_lua_state 归零
-#define RL_WAIT_RUN     2       // 已发 START，等 _g_bb_script_run 变 1
-#define RL_ZERO_TICKS   8       // 8 * 2s = 16s 内 state 未归零 → 放弃
-#define RL_RUN_TICKS    8       // 8 * 2s = 16s 内脚本未跑起来 → 放弃
-#define RL_KEY_TICKS    30      // ★ v6.8：30 * 2s = 60s 内 verwatch 没把盘上版本的键注入 → 放弃
+// ★ v6.7：落盘后自动重启的状态机相位与超时上限 —— ★ v6.24q 已随 [rl] 整体移除
+//   （新 so 只落盘，脚本手动运行时加载；conf autoreload= 键仍解析但无动作点）
 
 // ★ v6.17：func-nil 崩溃自动恢复（crash-resume）—— ★ v6.24p 已按用户指令移除全部
 //   自动恢复动作，仅保留签名扫描做证据落盘与诊断日志（见下）。
@@ -941,12 +937,7 @@ static int           g_so_tick = SO_SYNC_TICK_SECS;
 static int           g_autoreload   = 1;
 // ★ v6.17：func-nil 崩溃自动恢复（conf crashresume=，默认开）
 static int           g_crashresume  = 1;
-static volatile int  g_need_reload  = 0;   // so_sync 落盘后置位（裸线程置位 → watchdog 执行）
-static volatile int  g_reload_busy  = 0;   // 重启进行中：屏蔽「抹模块」与「僵死自愈」
-// ★ v6.8：本次自动重启要加载的目标版本（6hex）。START 前必须等 verwatch 把
-//   这个版本的密钥注入完（g_mh_ver 对齐），否则脚本拿旧键解新包必死
-//   （09-28 .45 实测：START(19:08:36) 早于键注入(19:08:56) → 解密失败 → abort reload）。
-static volatile char g_rl_ver[8]   = {0};
+// ★ v6.24q：g_need_reload / g_reload_busy / g_rl_ver 已随 [rl] 移除
 
 static void bs_request_inject(uintptr_t base) {
     (void)base;
@@ -3005,25 +2996,12 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
     return so;
 }
 
-/// ★ v6.23n：beta.so 落盘成功后的自动重启决策（原 bs_so_sync_once 内联抽出）。
-///   在跑 → 置位交 watchdog 执行 STOP→等归零→START；没在跑 → 只落盘。
-///   ★ 只置位不直接调产品函数：本函数跑在裸 pthread 上。
+/// ★ v6.23n：beta.so 落盘成功后的处理 —— ★ v6.24q：自动重启彻底移除（用户指令：
+///   新 so 只落盘，脚本下次手动运行时自然加载；verwatch 按盘上版本预铺密钥，
+///   手动运行即可解开新包）。
 static void bs_so_maybe_reload(const char *verhex) {
-    if (!g_autoreload) {
-        bs_log("[so] auto-reload off (autoreload=0) -> disk only");
-    } else if (g_reload_busy) {
-        bs_log("[so] auto-reload skipped: reload already in progress");
-    } else if (!g_base) {
-        bs_log("[so] auto-reload skipped: no base");
-    } else if (*(volatile uint8_t *)(g_base + OFF_RUN)) {
-        g_need_reload = 1;
-        // ★ v6.8：记下目标版本，START 前由 watchdog 等 verwatch 补齐该版本密钥
-        strncpy((char *)g_rl_ver, verhex, sizeof(g_rl_ver) - 1);
-        g_rl_ver[sizeof(g_rl_ver) - 1] = 0;
-        bs_log("[so] auto-reload armed (run=1) -> watchdog will restart script");
-    } else {
-        bs_log("[so] auto-reload skipped: script not running -> disk only");
-    }
+    (void)verhex;
+    bs_log("[so] new so on disk -> loads on next script start (auto-reload removed in v6.24q)");
 }
 
 // ★★★ v6.23n：脏容器自愈（外网机 nm=1005「加载运行库出错」实锤驱动）。
@@ -3800,9 +3778,7 @@ static void *bs_watchdog(void *arg) {
     uint8_t last_run = 0;
     int     saw_run  = 0;
 
-    // ★ v6.7：自动重启状态机（相位 + 超时计数）
-    int rl_phase = RL_IDLE;
-    int rl_wait  = 0;
+    // ★ v6.7：自动重启状态机（相位 + 超时计数）—— ★ v6.24q 已随 [rl] 整体移除
 
     // ★ v6.17：func-nil 崩溃自动恢复（agent.log 增量扫描）—— v6.24p 起仅做证据与日志
     long   cr_size[2] = {-1, -1}; // ★ v6.23u [0]=agent.log [1]=sjz.log 上次尺寸（-1=首轮只记基线）
@@ -3828,89 +3804,8 @@ static void *bs_watchdog(void *arg) {
             us_latched = bs_us_mark_exists();
         }
 
-        // ---- ★ v6.7：落盘后自动重启状态机（最高优先；期间屏蔽抹模块与僵死自愈）----
-        //   为什么放在 watchdog：so_sync / verwatch 都是裸 pthread，不能碰产品内部函数；
-        //   watchdog 已在安全地调 _set_user_script_operate（见下面僵死自愈），走同一路径最稳。
-        //   ★ v6.24k：用户主动停了脚本 → 绝不自动 reload 拉起，直接丢弃本次跟版请求。
-        if (g_need_reload && rl_phase == RL_IDLE && us_latched) {
-            g_need_reload = 0;
-            bs_log("[rl] auto-reload skipped (user stopped script, .bs_userstop present)");
-        }
-        if (g_need_reload && rl_phase == RL_IDLE) {
-            // ★ v6.24p：脚本没在跑就不许 reload 拉起（自动运行仅限「本来在跑」）。
-            //   新 so 留在盘上，下次中控手动点运行自然加载新包。
-            if (!run) {
-                g_need_reload = 0;
-                bs_log("[rl] new so ready but script not running -> skip reload (manual run will load it)");
-            } else {
-            g_need_reload = 0;
-            g_reload_busy = 1;
-            rl_wait = 0;
-            bs_log("[rl] auto-reload: request STOP (state=%p run=%u)", (void *)st, (unsigned)run);
-            ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
-            rl_phase = RL_WAIT_ZERO;
-            }
-        }
-        if (rl_phase == RL_WAIT_ZERO) {
-            if (st == 0) {
-                // ★ v6.24q：reload 窗口内用户可能刚点了停止 —— 1->0 判定被 g_reload_busy
-                //   屏蔽（v6.24p 删除 hg_busy_until 后仍如此），写不了 .bs_userstop，
-                //   us_latched 也不会置位。START 前直接查 agent.log 停止痕迹兜底：
-                //   中控停止必打 `agent stop script` / `begin process stop script msg`，
-                //   而本 reload 自己发的 OPER_STOP 是直调产品函数、不走 agent 消息
-                //   通道，不会留停止痕迹 → 不会误伤正常 reload。
-                char alp[300];
-                snprintf(alp, sizeof(alp), "%s/log/agent.log", DATA_DIR);
-                if (us_latched || bs_last_stop_is_user(alp, 262144)) {
-                    bs_log("[rl] user stop seen during reload -> abort (no START)");
-                    rl_phase = RL_IDLE;
-                    g_reload_busy = 0;
-                    g_rl_ver[0] = 0;
-                }
-                // ★ v6.8：START 前必须确认 verwatch 已把「盘上版本」的密钥注入
-                //   （g_mh_ver == g_rl_ver）。不等的话脚本会拿旧键解新包 → 解密失败
-                //   → 16s 超时白折腾（09-28 .45 实测事故：START 比键注入早了 20s）。
-                //   verwatch tick=3s；云端缺键时它自带 30s 节流，所以给足 60s。
-                else if (g_rl_ver[0] && strcmp(g_mh_ver, (const char *)g_rl_ver) != 0) {
-                    if (++rl_wait >= RL_KEY_TICKS) {
-                        bs_log("[rl] key %s not injected after %ds (have '%s') -> abort reload",
-                               g_rl_ver, RL_KEY_TICKS * WD_TICK_SECS,
-                               g_mh_ver[0] ? g_mh_ver : "(none)");
-                        rl_phase = RL_IDLE;
-                        g_reload_busy = 0;
-                        g_rl_ver[0] = 0;
-                    } else {
-                        bs_log("[rl] state cleared, holding START until key %s injected (have '%s')",
-                               g_rl_ver, g_mh_ver[0] ? g_mh_ver : "(none)");
-                    }
-                } else {
-                    bs_log("[rl] state cleared -> request START");
-                    ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-                    rl_phase = RL_WAIT_RUN;
-                    rl_wait  = 0;
-                    g_rl_ver[0] = 0;
-                }
-            } else if (++rl_wait >= RL_ZERO_TICKS) {
-                bs_log("[rl] state still %p after %ds -> abort reload",
-                       (void *)st, RL_ZERO_TICKS * WD_TICK_SECS);
-                rl_phase = RL_IDLE;
-                g_reload_busy = 0;
-                g_rl_ver[0] = 0;
-            }
-        } else if (rl_phase == RL_WAIT_RUN) {
-            if (run) {
-                bs_log("[rl] script running again -> auto-reload done");
-                rl_phase = RL_IDLE;
-                g_reload_busy = 0;
-                saw_run  = 1;
-                last_run = 1;
-            } else if (++rl_wait >= RL_RUN_TICKS) {
-                bs_log("[rl] script not started after %ds -> abort reload",
-                       RL_RUN_TICKS * WD_TICK_SECS);
-                rl_phase = RL_IDLE;
-                g_reload_busy = 0;
-            }
-        }
+        // ---- ★ v6.24q：落盘后自动重启状态机已整体移除（用户指令：新 so 只落盘，
+        //   脚本下次手动运行时自然加载；verwatch 按盘上版本预铺密钥，手动运行即可解）。
 
         // --- ★ v6：脚本 运行→停止 的那一刻，立刻抹掉本地模块 ---
         //     用户需求 #2：「脚本停止后，顺手把 bs_modules/*.lua 删除」。
@@ -3920,8 +3815,8 @@ static void *bs_watchdog(void *arg) {
         if (run) { saw_run = 1; }
         // ★ v6.24k：run 1->0 = 脚本被停。默认按「用户主动停」处理，落盘闸门（.bs_userstop），
         //   禁止后续一切自动 OPER_START。若扫到崩溃签名，下面会撤销该闸门（崩溃优先）。
-        //   排除：reload 状态机自己停的、卡封禁下发的 STOP。
-        if (!g_reload_busy && !g_card_blocked && last_run == 1 && run == 0 && !us_latched) {
+        //   排除：卡封禁下发的 STOP。（★ v6.24q：原 reload 自停排除条件随 [rl] 移除）
+        if (!g_card_blocked && last_run == 1 && run == 0 && !us_latched) {
             // ★ v6.24l：必须确认「刚才真的在跑」才认定是用户停止。
             //   App 冷启时厂商 run 标志会残留为 1、初始化后掉 0（10-19 08:07 .216 实锤），
             //   那一下也构成 1->0，但 sjz.log 早已停摆 → 不是用户停止，不许落闸门（否则
@@ -3938,9 +3833,8 @@ static void *bs_watchdog(void *arg) {
                        sa, US_STOP_FRESH);
             }
         }
-        // ★ v6.7：重启期间(g_reload_busy)不抹——脚本是我们自己停的，
-        //   模块必须留给重启后的新版脚本用（否则 wait_call_func 拿不到模块会卡死）。
-        if (!g_reload_busy && saw_run && last_run == 1 && run == 0 && st != 0) {
+        // ★ v6.7：脚本停了就抹模块。（★ v6.24q：原 g_reload_busy 排除随 [rl] 移除）
+        if (saw_run && last_run == 1 && run == 0 && st != 0) {
             bs_log("[wd] script stopped (run 1->0) -> wipe modules");
             char dpath[288];
             snprintf(dpath, sizeof(dpath), "%s", g_mod_dir);
@@ -4056,7 +3950,7 @@ static void *bs_watchdog(void *arg) {
         //   App 冷启后厂商 run 标志仍滞留为 1（日志里 run=1 但 agent 早已 stop script、
         //   sjz 停摆 12 分钟），拿 run==0 当闸门会把这种情况永久挡住。st!=0 时脚本容器
         //   确实活着，绝不搅局；用户主动停脚本又不会留下 run-error 行，故不会误拉。
-        if (g_mode == MODE_UNLOCK && !g_card_blocked && !g_reload_busy) {
+        if (g_mode == MODE_UNLOCK && !g_card_blocked) {
             time_t nowt4 = time(NULL);
             if (run) bs_cr_mark_clear();      // 跑起来了 = 已恢复，顺手清证据
             if (nowt4 - cr_stall_last >= CR_STALL_SCAN) {
@@ -4165,9 +4059,7 @@ static void *bs_watchdog(void *arg) {
         }
 
         // --- v3：僵死态自愈 ---
-        // ★ v6.7：重启期间跳过僵死判定——这时的 state/run 变化是我们自己造成的，
-        //   不是产品僵死；不跳过会补发一个 STOP 去干扰重启状态机。
-        if (g_reload_busy) { stale = 0; continue; }
+        // ★ v6.7：重启期间跳过僵死判定 —— ★ v6.24q：原 g_reload_busy 跳过随 [rl] 移除
 
         if (st == 0 || run != 0) {  // 正常态：无 state 或脚本正在跑
             stale = 0;

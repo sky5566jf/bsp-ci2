@@ -25,12 +25,12 @@ jobs:
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
           strings bs_unlock.dylib | grep -q "v6.24q" || (echo "MISSING v6.24q" && exit 1)
-          strings bs_unlock.dylib | grep -q "user stop seen during reload" || (echo "MISSING reload userstop guard" && exit 1)
+          strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
+          if strings bs_unlock.dylib | grep -q "auto-reload: request STOP"; then echo "FORBIDDEN: [rl] auto-reload still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "kicked=" || (echo "MISSING kicked field" && exit 1)
           strings bs_unlock.dylib | grep -q "newer input seen after kick" || (echo "MISSING unblock path" && exit 1)
           strings bs_unlock.dylib | grep -q "kept STOPPED, press Run in center" || (echo "MISSING crash kept-stopped" && exit 1)
           strings bs_unlock.dylib | grep -q "stall scan: run=" || (echo "MISSING stall diag" && exit 1)
-          strings bs_unlock.dylib | grep -q "skip reload (manual run will load it)" || (echo "MISSING rl manual-run guard" && exit 1)
           strings bs_unlock.dylib | grep -q "can not find version key" || (echo "MISSING loadfail sig" && exit 1)
           strings bs_unlock.dylib | grep -q "prewarm done" || (echo "MISSING key prewarm" && exit 1)
           strings bs_unlock.dylib | grep -q "auto-start gated until run=1" || (echo "MISSING userstop gate" && exit 1)
