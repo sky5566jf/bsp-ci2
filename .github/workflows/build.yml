@@ -24,9 +24,11 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.25" || (echo "MISSING v6.25" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.25c" || (echo "MISSING v6.25c" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.25b"; then echo "STALE: v6.25b string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "auto-reload: request STOP"; then echo "FORBIDDEN: [rl] auto-reload still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "kicked=" || (echo "MISSING kicked field" && exit 1)
           strings bs_unlock.dylib | grep -q "newer input seen after kick" || (echo "MISSING unblock path" && exit 1)
@@ -50,6 +52,11 @@ jobs:
           strings bs_unlock.dylib | grep -q "intercepted -> in-proc stub" || (echo "MISSING offline connect intercept" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor chain fully bypassed" || (echo "MISSING offline accepted marker" && exit 1)
           strings bs_unlock.dylib | grep -q "R captured" || (echo "MISSING SecKeyEncrypt R capture" && exit 1)
+          strings bs_unlock.dylib | grep -q "key recovered (R=0x" || (echo "MISSING offline key recovery" && exit 1)
+          strings bs_unlock.dylib | grep -q "no devid, reply with template code" || (echo "MISSING offline devid fallback" && exit 1)
+          strings bs_unlock.dylib | grep -q "devid=%s (src=conf)" || (echo "MISSING offline devid from conf" && exit 1)
+          strings bs_unlock.dylib | grep -q "devid=%s (src=agent.log)" || (echo "MISSING offline devid from agent.log" && exit 1)
+          strings bs_unlock.dylib | grep -q "RESP80 hex len=" || (echo "MISSING RESP80 length guard" && exit 1)
           strings bs_unlock.dylib | grep -q "5000000003004300000004" || (echo "MISSING RESP80 blob" && exit 1)
           otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
       - uses: actions/upload-artifact@v4

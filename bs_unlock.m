@@ -826,7 +826,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25a"
+#define BS_DYLIB_VER       "v6.25c"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1053,14 +1053,77 @@ static int           g_so_tick = SO_SYNC_TICK_SECS;
 //   ★ 默认关闭（offline=0）；只有 conf offline=1 才启用，现网 238 台不受影响。
 #define OFF_RESP80_HEX                                                        \
     "500000000300430000000400000107000100000000060002736a7a"                  \
-    "080003332e312e3023000a34326336393731656162646337326335303665333636656538"\
+    "080003332e312e3023000a34326336393731656162646337326335303665333663656538"\
     "3537363630643607000b7518569f67b5df"
 
-static int      g_offline        = 0;   // conf offline=
+static int      g_offline        = 0;   // conf offline= / hb off=
 static uint32_t g_off_vendor_net = 0;   // 60.204.159.47（网络序）
 static uint8_t  g_off_R[32];            // 设备最近一次 SecKeyEncrypt 的 32B 明文
 static volatile int    g_off_R_ok = 0;
 static volatile long   g_off_n    = 0;  // 握手轮次（日志节流）
+static char     g_off_devid[33];        // 本机 32 hex 设备码（填进 80B 应答）
+
+/// 严格判断 32 位 hex（设备码格式）
+static int off_is_hex32(const char *s) {
+    int i;
+    if (!s) return 0;
+    for (i = 0; i < 32; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return s[32] == 0 || s[32] == '\n' || s[32] == '\r' || s[32] == ' ';
+}
+
+/// ★ v6.25c：取本机设备码，填进 80B 应答的偏移 38..69。
+///   来源优先级：conf token=（deb postinst 从 agent.log 提取后写入，最稳）
+///               → DATA_DIR/log/agent.log 最后一条 `send dev online success:<32hex>`
+///   实测（v6.25a 现网）：Agent 并不校验这段内容（模板里写错的码也照过），
+///   填真实码是为了①日志可核对是哪台机在跑桩 ②万一 Agent/厂商后续加校验不崩。
+///   两者都取不到 → 打日志并沿用模板里的码（宁可码不对，也不能不应答）。
+static void off_load_devid(void) {
+    char buf[512], last[33];
+    FILE *f;
+    if (g_off_devid[0]) return;
+    if (off_is_hex32(g_token)) {
+        memcpy(g_off_devid, g_token, 32);
+        g_off_devid[32] = 0;
+        bs_log("[off] devid=%s (src=conf)", g_off_devid);
+        return;
+    }
+    last[0] = 0;
+    f = fopen(DATA_DIR "/log/agent.log", "r");
+    if (f) {
+        while (fgets(buf, sizeof(buf), f)) {
+            char *p = strstr(buf, "send dev online success:");
+            if (p && off_is_hex32(p + 24)) { memcpy(last, p + 24, 32); last[32] = 0; }
+        }
+        fclose(f);
+    }
+    if (last[0]) {
+        memcpy(g_off_devid, last, 32);
+        g_off_devid[32] = 0;
+        bs_log("[off] devid=%s (src=agent.log)", g_off_devid);
+        return;
+    }
+    bs_log("[off] no devid, reply with template code");
+}
+
+/// ★ v6.25b：真离线开关的唯一写入口（conf 与 /hb 下发共用）。
+///   NULL      = 字段缺失 → 保持现值（兼容老中控，删规则不会误关）
+///   ""/"0"/"off"/"false"/"no" = 关闭；其余非空 = 开启
+///   值未变时不重复打日志（心跳每 60s 一次，避免刷屏）
+static void bs_offline_apply(const char *v, const char *src) {
+    int on;
+    if (!v) return;
+    on = (*v == 0 || !strcmp(v, "0") || !strcmp(v, "off") ||
+          !strcmp(v, "false") || !strcmp(v, "no")) ? 0 : 1;
+    if (on == g_offline) return;
+    g_offline = on;
+    bs_log("[off] offline=%d (%s) src=%s", on,
+           on ? "server2 fully in-process, zero vendor traffic"
+              : "vendor passthrough", src);
+}
 
 /// 走 dlsym 拿 CommonCrypto（Agent 已导入 CCCrypt/CC_MD5，必然已加载 libcommonCrypto）
 static int off_md5(const uint8_t *in, size_t n, uint8_t out[16]) {
@@ -1100,6 +1163,11 @@ static void off_make_m_buf(uint8_t *out) {
 }
 
 /// 80B 明文（厂商应答原文，逐字节实测解密所得）
+///
+/// ★ v6.25c：模板里的设备码只是**占位**，真正应答前一定用本机设备码覆盖
+///   偏移 38..69（32 字节 ASCII-hex）。取不到本机码时才沿用模板值。
+///   尾部 70..79（07 00 0b + 7B）保持实测原值不动 —— 实测证明它不随设备码变化
+///   （v6.25a 带着写错的设备码仍被判 accepted），改它反而有风险。
 static const uint8_t *off_plain80(void) {
     static uint8_t plain[80];
     static int     ok = 0;
@@ -1107,11 +1175,18 @@ static const uint8_t *off_plain80(void) {
     if (ok < 0)  return NULL;
     const char *h = OFF_RESP80_HEX;
     size_t i;
+    if (strlen(h) != 160) {          // 防止改模板行时把长度写错 → 越界读
+        ok = -1;
+        bs_log("[off] RESP80 hex len=%d (want 160)", (int)strlen(h));
+        return NULL;
+    }
     for (i = 0; i < 80; i++) {
         int hi = off_hexval(h[i * 2]), lo = off_hexval(h[i * 2 + 1]);
         if (hi < 0 || lo < 0) { ok = -1; bs_log("[off] bad RESP80 hex"); return NULL; }
         plain[i] = (uint8_t)((hi << 4) | lo);
     }
+    off_load_devid();
+    if (g_off_devid[0]) memcpy(plain + 38, g_off_devid, 32);
     ok = 1;
     return plain;
 }
@@ -1438,13 +1513,8 @@ static void bs_load_conf(void) {
         else if (!strcmp(k, "offline")) {
             // ★ v6.25：真离线开关。1=进程内接管 server2（不连厂商）；0=照常直连。
             //   默认 0，现网设备不受影响；开启后 s2 改道优先（有 s2 仍走 s2）。
-            int on = atoi(v) ? 1 : 0;
-            if (on != g_offline) {
-                g_offline = on;
-                bs_log("[off] offline=%d (%s)", on,
-                       on ? "server2 fully in-process, zero vendor traffic"
-                          : "vendor passthrough");
-            }
+            //   v6.25b：与 /hb 下发共用 bs_offline_apply，心跳可远程覆盖本值。
+            bs_offline_apply(v, "conf");
         }
         else if (!strcmp(k, "cardval")) {
             // ★ v6.21：手动卡密（兜底通道）——getter/日志捕获均无卡时用它激活
@@ -2259,6 +2329,12 @@ static int bs_hb_ping(uintptr_t base) {
                 char s2[80];
                 if (bs_json_pick_str((const unsigned char *)s, n, "s2", s2, sizeof(s2)))
                     bs_s2_apply(s2, "hb");
+                // ★ v6.25b：真离线开关走同一条心跳通道 —— 否则 442 台只能逐台改 conf。
+                //   "off":1/0 即开即关；字段缺失（老中控）= 保持 conf 现值。
+                //   注意：与 s2 独立 —— s2 有效时改道优先，offline 只在无 s2 时接管。
+                char offv[16];
+                if (bs_json_pick_str((const unsigned char *)s, n, "off", offv, sizeof(offv)))
+                    bs_offline_apply(offv, "hb");
             }
         }
         free(buf);
