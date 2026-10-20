@@ -382,6 +382,17 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24m ★★★ 「中控显示运行中、实际脚本不动」根治（2026-10-20，.2080 设备 c42a8474… 实锤）：
+//       现象：设备 run=1、agent 心跳 2min 一拍正常，中控显示脚本在跑，但游戏画面不动 6 小时。
+//       证据：sjz.log 最后一行 02:20:18 `[长弓溪谷] find pickup icon first` 之后再无输出；
+//             sreen.log（截图/投屏通道）从 02:25:51 起只剩 "socket no data recv:1,35"；
+//             agent.log 无 `run script error`，run 标志始终 1。
+//       结论：脚本线程卡在截图/找图调用上无限等待 —— 不是崩溃（[cr] 看不见），
+//             也不是停脚本（run 不为 0，idle 兜底看不见），两套自愈全部失明。
+//       修法：新增 [hg] 假运行看门狗 —— run==1 && st!=0 && sjz 停写 ≥900s 且无用户停止闸门
+//             → OPER_STOP（打断卡死线程）→ 1.5s → OPER_START，并接管 cr_pending 继续重试；
+//             两次之间 1800s 冷却；期间用 hg_busy_until 屏蔽 `run 1->0` 误落用户停止闸门。
+//
 // v6.24l ★ 闸门判据收紧（同日，.216 装 1.64 后 15 分钟实测驱动）：
 //       ① `begin process operate script msg` 撤出停止判据 —— 它是中控「操作消息」的
 //          统一入口（点运行同样走它），拿它判停止一旦厂商改用它下发运行就会反锁。
@@ -695,6 +706,8 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define CR_STALL_SCAN   60      // ★ v6.24e：停摆兜底扫描周期（秒）
 #define CR_STALL_FRESH  3600    // ★ v6.24e：run-error 距今多久内仍值得自动拉（秒）
 #define CR_IDLE_SECS    600     // ★ v6.24i：脚本空闲多久后兜底拉起（秒）
+#define HG_SECS         900     // ★ v6.24m：run=1 但 sjz 停写多久判「假运行」（秒）
+#define HG_COOLDOWN     1800    // ★ v6.24m：两次挂死重启的最小间隔（秒）
 #define FG_GAME_BID     "com.tencent.tmgp.dfm"   // ★ v6.24d：三角洲行动（DeltaForceClient.app）
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
@@ -777,7 +790,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24l"
+#define BS_DYLIB_VER       "v6.24m"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3809,6 +3822,9 @@ static void *bs_watchdog(void *arg) {
     time_t fg_last     = 0; // ★ v6.24d：上次 [fg] uiopen 游戏时刻（限速）
     time_t cr_stall_last = 0; // ★ v6.24e：上次停摆兜底扫描时刻
     int    us_latched = 0;    // ★ v6.24k：用户停止闸门在本进程内的缓存（配合 .bs_userstop）
+    time_t hg_last    = 0;    // ★ v6.24m：上次「假运行」重启时刻（冷却）
+    time_t hg_busy_until = 0; // ★ v6.24m：挂死重启期间屏蔽用户停止闸门写入
+    int    hg_n       = 0;    // ★ v6.24m：累计挂死重启次数（诊断）
 
     for (;;) {
         sleep(WD_TICK_SECS);
@@ -3900,7 +3916,10 @@ static void *bs_watchdog(void *arg) {
         // ★ v6.24k：run 1->0 = 脚本被停。默认按「用户主动停」处理，落盘闸门（.bs_userstop），
         //   禁止后续一切自动 OPER_START。若扫到崩溃签名，下面会撤销该闸门（崩溃优先）。
         //   排除：reload 状态机自己停的、卡封禁下发的 STOP。
-        if (!g_reload_busy && !g_card_blocked && last_run == 1 && run == 0 && !us_latched) {
+        if (!g_reload_busy && !g_card_blocked && last_run == 1 && run == 0 && !us_latched
+            && time(NULL) >= hg_busy_until) {
+            // ★ v6.24m：挂死重启（[hg]）自己发的 OPER_STOP 不是用户停止 —— hg_busy_until
+            //   期间直接跳过本判定，避免 1->0 被误记成用户闸门（否则重启后永远不再自动拉）。
             // ★ v6.24l：必须确认「刚才真的在跑」才认定是用户停止。
             //   App 冷启时厂商 run 标志会残留为 1、初始化后掉 0（10-19 08:07 .216 实锤），
             //   那一下也构成 1->0，但 sjz.log 早已停摆 → 不是用户停止，不许落闸门（否则
@@ -4113,12 +4132,38 @@ static void *bs_watchdog(void *arg) {
                         if (mage >= 0) bs_cr_mark_clear();
                         mage = -1;
                     }
+                    // ★ v6.24m：「假运行」兜底 —— run=1 但脚本线程早已卡死。
+                    //   10-20 02:20 .2080（c42a8474…，deb 1.64 / dylib v6.24l）实锤：
+                    //   agent 心跳正常、run 一直为 1（中控显示「运行中」），但 sjz.log
+                    //   从 02:20:18「[长弓溪谷] find pickup icon first」后再无一行，
+                    //   截图通道 sreen.log 从 02:25:51 起只剩 "socket no data recv"。
+                    //   → 脚本卡在截图/找图上无限等待：既没有 run script error（不是崩溃，
+                    //   [cr] 看不见），也没停脚本（run 还是 1，idle 兜底看不见）。
+                    //   判据：run==1 && st!=0 && sjz 停写 ≥ HG_SECS && 无用户停止闸门
+                    //   → 先 OPER_STOP 打断卡死的线程，再 OPER_START 重建；起不来就交给
+                    //   cr_pending 状态机继续按 15s→…→600s 递增重试。
+                    if (!us_stop && !cr_pending && run == 1 && st != 0 && g_hb_ok
+                        && sjz_age >= HG_SECS
+                        && (hg_last == 0 || nowt4 - hg_last >= HG_COOLDOWN)) {
+                        bs_log("[hg] script hung (run=1 st=%p sjz=%lds) -> OPER_STOP then OPER_START",
+                               (void *)st, sjz_age);
+                        hg_busy_until = nowt4 + 120;
+                        ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
+                        usleep(1500 * 1000);
+                        ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
+                        hg_last    = nowt4;
+                        hg_n++;
+                        cr_last    = nowt4;
+                        cr_retry   = 0;
+                        cr_pending = 1;
+                        cr_next    = nowt4 + CR_RETRY_BASE;
+                    }
                     // 每 5 分钟一条诊断快照（不动作），便于下次远程定位卡点
                     static time_t stlog = 0;
                     if (nowt4 - stlog >= 300) {
                         stlog = nowt4;
-                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d us=%d",
-                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending, us_stop);
+                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d us=%d hg=%d",
+                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending, us_stop, hg_n);
                     }
                 }
             }
