@@ -382,6 +382,22 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24r ★★★ 可观测性补丁（2026-10-20，用户批准）：解决「落盘 ≠ 生效」无法远程判读
+//       + 崩溃现场被高频流水冲掉。三件事，全部只观察、不自动运行脚本（铁律不动）：
+//       ① 独立事件道 bs_evt.log：`[us]` / `[cr]` / `[so]` / `[wd]` 决策级事件双写
+//          （主日志照旧 + 专道追加），并新增 `&src=evt` 上报通道随 puller 每拍回传。
+//          动机：主日志被 `[pull] step1~5`、`recv rep key failed`(14s/次)、
+//          `dns look up failed`(6.6s/次) 淹没，8KB 窗口只剩 6~12 分钟 —— 10-20
+//          三台设备（e9643 / edf7 / a39cb6）崩停现场全在 10 分钟内被冲干净，
+//          远程永远只能看到「停了」，看不到「为什么停」。事件道几十条/天，8KB 可存数周。
+//       ② 运行库生效状态 `.bs_so_state`（md5/size/pend/applied）：落盘新 so 置 pend=1，
+//          watchdog 观察到「run=1 且 sjz 新鲜」时清 pend=0。动机：v6.24q 删掉自动重载后，
+//          换包瞬间正在跑的脚本仍用内存旧 so —— a39cb6 于 17:02 落盘 fix4、17:32 仍崩在
+//          fix3 上，而远程完全看不出「盘上新的、内存旧的」。bootstrap：无状态文件时按
+//          盘上 beta.so 的 md5 建基线（pend=0），保证全网每台都能被读到。
+//       ③ `[cr] stall scan` 追加 `so=<md5前8> pend=<0|1> size=<n>`：一眼分清三种停摆
+//          ——盘上是旧的坏包 / 盘上新包但还没重启脚本 / 新包已生效仍然停。
+//
 // v6.24p ★★★ 删除一切「自动运行脚本」（2026-10-20，用户指令：除「脚本本来在跑」
 // v6.24q ★★★ [rl] so_sync 自动重载整体移除（用户指令：新 so 只落盘，脚本由人工
 //       手动运行时加载）——核对 v6.24p 时发现 reload 的 STOP→START 窗口内用户点停止
@@ -733,6 +749,19 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 // 真实 Media（shell 侧要加 /var/lib/.jbroot/rootfs 前缀才看得到同一个目录）。
 #define BS_LOG_PATH "/var/mobile/Media/bs_unlock.log"
 
+// ★ v6.24r：独立事件日志 —— `[us]` / `[cr]` / `[so]` / `[wd]` 这些「决策级」事件
+//   单独写一份、单独走 &src=evt 上报通道。动机（10-20 三台实锤）：
+//   主日志被 `[pull] step1~5` + `recv rep key failed` 高频淹没，8KB 窗口只剩 6~12 分钟，
+//   崩溃/停止现场 10 分钟内就被冲干净，远程永远只能看到「停了」，看不到「为什么停」。
+//   本文件只记关键事件、增长极慢（几十条/天），8KB 能覆盖数周。
+#define BS_EVT_PATH "/var/mobile/Media/bs_evt.log"
+
+// ★ v6.24r：运行库（beta.so）生效状态 —— 解决「落盘 ≠ 生效」无法远程判读。
+//   格式一行：md5=<32hex> size=<n> disk=<epoch> pend=<0|1> applied=<epoch>
+//   pend=1：新 so 已落盘但脚本还在跑内存里的旧 so（下次手动运行才生效）。
+//   watchdog 观察到 run 0->1 时把 pend 清 0 并写 applied。
+#define BS_SO_STATE_PATH DATA_DIR "/.bs_so_state"
+
 // ---- v5：路线 A（PC 拉取）
 #define PULL_TICK_SECS   300    // 每 5 分钟检查一次更新
 #define PULL_FIRST_DELAY 3      // 启动 3s 后第一次拉（调试期缩短，便于快速观察）
@@ -797,7 +826,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24q"
+#define BS_DYLIB_VER       "v6.24r"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1198,6 +1227,86 @@ static void bs_log(const char *fmt, ...) {
         (void)w;
         close(fd);
     }
+}
+
+/// ★ v6.24r：决策级事件双写 —— 主日志保留原样（现场连着看），同时追加到
+///   bs_evt.log 专道。只给 [us]/[cr]/[so]/[wd] 这类低频关键事件用；
+///   [pull]/[hb]/[devlog] 这些高频流水仍然只走 bs_log，绝不进事件道。
+static void bs_evt(const char *fmt, ...) {
+    char buf[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    bs_log("%s", buf);            // 主日志照旧
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    char line[896];
+    int n = snprintf(line, sizeof(line), "[%ld.%03ld] %s\n",
+                     (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000), buf);
+    if (n <= 0) return;
+    if ((size_t)n > sizeof(line)) n = (int)sizeof(line);
+    int fd = open(BS_EVT_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        ssize_t w = write(fd, line, (size_t)n);
+        (void)w;
+        close(fd);
+    }
+}
+
+// ---------------------------------------------------------------- v6.24r 运行库生效状态
+/// 落盘新 so 时写 pend=1；脚本真正启动（run 0->1）时清 0。
+/// 任意线程可写（原子 rename），watchdog 每 5 分钟读一次诊断，无锁需求。
+static void bs_so_state_write(int pending, const char *md5, long size) {
+    char tmp[320], fin[320];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", BS_SO_STATE_PATH);
+    snprintf(fin, sizeof(fin), "%s", BS_SO_STATE_PATH);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    long now = (long)time(NULL);
+    long applied = 0;
+    // 保留上次 applied（清 pend 时要沿用）
+    {
+        FILE *p = fopen(fin, "r");
+        if (p) {
+            char b[256] = {0};
+            if (fgets(b, sizeof(b), p)) {
+                const char *q = strstr(b, "applied=");
+                if (q) applied = atol(q + 8);
+            }
+            fclose(p);
+        }
+    }
+    if (!pending) applied = now;
+    fprintf(f, "md5=%s size=%ld disk=%ld pend=%d applied=%ld\n",
+            md5 ? md5 : "?", size, now, pending, applied);
+    fclose(f);
+    rename(tmp, fin);
+}
+
+/// 读状态：返回 1=有记录；md5out/size/pend/applied 均可为 NULL
+static int bs_so_state_read(char *md5out, size_t mn, long *size, int *pend, long *applied) {
+    FILE *f = fopen(BS_SO_STATE_PATH, "r");
+    if (!f) return 0;
+    char b[256] = {0};
+    int ok = (fgets(b, sizeof(b), f) != NULL);
+    fclose(f);
+    if (!ok) return 0;
+    if (md5out && mn) {
+        md5out[0] = 0;
+        const char *q = strstr(b, "md5=");
+        if (q) {
+            size_t i = 0;
+            q += 4;
+            while (i + 1 < mn && q[i] && q[i] != ' ' && q[i] != '\n') { md5out[i] = q[i]; i++; }
+            md5out[i] = 0;
+        }
+    }
+    if (size)     { const char *q = strstr(b, "size=");    *size    = q ? atol(q + 5) : -1; }
+    if (pend)     { const char *q = strstr(b, "pend=");    *pend    = q ? atoi(q + 5) : -1; }
+    if (applied)  { const char *q = strstr(b, "applied="); *applied = q ? atol(q + 8) : 0;  }
+    return 1;
 }
 
 static const unsigned char kKey[3] = {0x02, 0x09, 0x09};
@@ -1908,6 +2017,34 @@ static void bs_devlog_upload(void) {
                 }
             }
             fclose(af);
+        }
+    }
+
+    // ★ v6.24r：事件专道（&src=evt）—— bs_evt.log 只记决策级事件，增长极慢，
+    //   8KB 可覆盖数周。主日志被 [pull]/[hb]/rep-key 刷到只剩 6~12 分钟时，
+    //   崩溃/停止/换库的现场仍然完整留在这里。失败完全静默。
+    {
+        static long evt_last = -1;
+        FILE *ef = fopen(BS_EVT_PATH, "rb");
+        if (ef) {
+            fseek(ef, 0, SEEK_END);
+            long esz = ftell(ef);
+            if (esz > 0 && esz != evt_last) {
+                long etail = esz > 8192 ? 8192 : esz;
+                fseek(ef, esz - etail, SEEK_SET);
+                static char ebody[8200];          // static：裸线程栈安全
+                size_t en = fread(ebody, 1, (size_t)etail, ef);
+                if (en > 0) {
+                    char eurl[560];
+                    snprintf(eurl, sizeof(eurl),
+                             "http://%s:%d/devlog?key=%s&src=evt", ip, g_port, g_token);
+                    size_t en2 = 0; long ecode = 0;
+                    unsigned char *eres = bs_http_post_ex(eurl, "text/plain", ebody, en, &en2, &ecode);
+                    if (eres) free(eres);
+                    evt_last = esz;
+                }
+            }
+            fclose(ef);
         }
     }
 }
@@ -2999,9 +3136,39 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
 /// ★ v6.23n：beta.so 落盘成功后的处理 —— ★ v6.24q：自动重启彻底移除（用户指令：
 ///   新 so 只落盘，脚本下次手动运行时自然加载；verwatch 按盘上版本预铺密钥，
 ///   手动运行即可解开新包）。
-static void bs_so_maybe_reload(const char *verhex) {
+/// ★ v6.24r：首次运行/bootstrap —— 状态文件不存在时，用盘上现有 beta.so 的
+///   md5 建基线（pend=0，视为「当前盘上的包就是内存里/下次会加载的包」）。
+///   动机：全网 495 台里绝大多数不会在本次换包后立刻有动作，若状态缺失就一直
+///   显示 so=unknown；补基线后远程能直接读到「这台盘上是 842cabc4 还是 c2ead84e」。
+static void bs_so_state_bootstrap(void) {
+    if (bs_so_state_read(NULL, 0, NULL, NULL, NULL)) return;
+    FILE *f = fopen(DATA_DIR "/beta.so", "rb");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > (8L << 20)) { fclose(f); return; }
+    unsigned char *b = (unsigned char *)malloc((size_t)sz);
+    if (!b) { fclose(f); return; }
+    size_t rn = fread(b, 1, (size_t)sz, f);
+    fclose(f);
+    if (rn == (size_t)sz) {
+        char md5[40] = {0};
+        bs_md5_buf(b, rn, md5, sizeof(md5));
+        bs_so_state_write(0, md5, sz);
+        bs_evt("[so] state bootstrap: on-disk md5=%s size=%ld -> pend=0", md5, sz);
+    }
+    free(b);
+}
+
+static void bs_so_maybe_reload(const char *verhex, const unsigned char *buf, size_t n) {
     (void)verhex;
-    bs_log("[so] new so on disk -> loads on next script start (auto-reload removed in v6.24q)");
+    char md5[40] = {0};
+    if (buf && n) bs_md5_buf(buf, n, md5, sizeof(md5));
+    // ★ v6.24r：落盘即打 pend=1 —— 远程一眼看出「盘上新的、内存旧的」
+    bs_so_state_write(1, md5, (long)n);
+    bs_evt("[so] new so on disk -> pend=1 (loads on next script start; md5=%s size=%lu)",
+           md5, (unsigned long)n);
 }
 
 // ★★★ v6.23n：脏容器自愈（外网机 nm=1005「加载运行库出错」实锤驱动）。
@@ -3085,13 +3252,13 @@ static void bs_so_repair_pull(const char *ip, int port, const char *verhex,
 
     if (bs_write_file_atomic(DATA_DIR "/beta.so", so, sn)) {
         if (want_md5 && want_md5[0])
-            bs_log("[so] ★★ container repaired (md5 verified): clean ver=%s (%lu B) written",
+            bs_evt("[so] ★★ container repaired (md5 verified): clean ver=%s (%lu B) written",
                    verhex, (unsigned long)sn);
         else
-            bs_log("[so] ★★ container repaired: clean ver=%s (%lu B) written",
+            bs_evt("[so] ★★ container repaired: clean ver=%s (%lu B) written",
                    verhex, (unsigned long)sn);
         g_so_repair_last = 0;
-        bs_so_maybe_reload(verhex);
+        bs_so_maybe_reload(verhex, so, sn);
     }
     free(so);
 }
@@ -3120,7 +3287,7 @@ static void bs_so_repair_if_dirty(const char *ip, int port, const char *verhex) 
         return;
     }
 
-    bs_log("[so] ★ dirty container: %d/%d vers keyless (first=%s, cloud 404) -> repair pull ver=%s",
+    bs_evt("[so] ★ dirty container: %d/%d vers keyless (first=%s, cloud 404) -> repair pull ver=%s",
            still, total, first_missing, verhex);
     bs_so_repair_pull(ip, port, verhex, NULL);
 }
@@ -3168,7 +3335,7 @@ static void bs_so_sync_once(void) {
             char lmd5[36] = {0};
             if (bs_md5_file(DATA_DIR "/beta.so", lmd5, sizeof(lmd5)) &&
                 bs_hexieq(lmd5, wmd5) != 0) {
-                bs_log("[so] ★ md5 mismatch: local %s != cloud %s -> repair pull ver=%s",
+                bs_evt("[so] ★ md5 mismatch: local %s != cloud %s -> repair pull ver=%s",
                        lmd5, wmd5, cver);
                 bs_so_repair_pull(ip, g_port, cver, wmd5);
                 return;
@@ -3190,7 +3357,7 @@ static void bs_so_sync_once(void) {
         return;
     }
 
-    bs_log("[so] cloud %s > local %s -> downloading", cver, lver);
+    bs_evt("[so] cloud %s > local %s -> downloading", cver, lver);
     // ★ v6.23n：下载逻辑抽到 bs_dl_beta_relay（中继优先→云端回退→体积校验），
     //   与容器修复共用同一条路；app.plist 现读/sohost 覆盖/长超时都在 helper 里。
     size_t sn = 0;
@@ -3235,9 +3402,9 @@ static void bs_so_sync_once(void) {
     }
 
     if (bs_write_file_atomic(DATA_DIR "/beta.so", so, sn)) {
-        bs_log("[so] ★ beta.so updated %s -> %s (%lu B)", lver, cver, (unsigned long)sn);
+        bs_evt("[so] ★ beta.so updated %s -> %s (%lu B)", lver, cver, (unsigned long)sn);
         // ★ v6.7 在跑→重启 / 没在跑→只落盘；v6.23n 抽到 bs_so_maybe_reload 复用
-        bs_so_maybe_reload(cver);
+        bs_so_maybe_reload(cver, so, sn);
     }
     free(so);
 }
@@ -3245,7 +3412,7 @@ static void bs_so_sync_once(void) {
 /// 跟版线程：首轮延迟 20s（等 App 网络栈就绪），之后每 g_so_tick 秒复查一次。
 static void *bs_so_sync_thread(void *arg) {
     (void)arg;
-    bs_log("[so] sync thread start tick=%ds sosync=%d host=%s:%d",
+    bs_evt("[so] sync thread start tick=%ds sosync=%d host=%s:%d",
            g_so_tick, g_so_sync, g_host, g_port);
     sleep(SO_SYNC_FIRST_DELAY);
     for (;;) {
@@ -3786,6 +3953,9 @@ static void *bs_watchdog(void *arg) {
     time_t cr_stall_last = 0; // ★ v6.24p：上次停摆诊断扫描时刻
     int    us_latched = 0;    // ★ v6.24k：用户停止闸门在本进程内的缓存（配合 .bs_userstop）
 
+    // ★ v6.24r：给运行库状态建基线（一次性，无状态文件时按盘上 beta.so 算 md5）
+    bs_so_state_bootstrap();
+
     for (;;) {
         sleep(WD_TICK_SECS);
 
@@ -3797,11 +3967,26 @@ static void *bs_watchdog(void *arg) {
         if (run) {
             if (bs_us_mark_exists()) {
                 bs_us_mark_clear();
-                bs_log("[us] run=1 -> user-stop gate cleared");
+                bs_evt("[us] run=1 -> user-stop gate cleared");
             }
             us_latched = 0;
         } else {
             us_latched = bs_us_mark_exists();
+        }
+
+        // ★ v6.24r：运行库生效确认 —— run=1 说明脚本真的起来了，此刻加载的
+        //   就是盘上的 beta.so，pend 可以清 0。这是「落盘 ≠ 生效」唯一的收敛点：
+        //   pend=1 期间远程就知道「还得再点一次运行」，不用靠猜。
+        if (run && saw_run) {
+            // 用 sjz.log 新鲜度排除「App 冷启后 run 标志残留为 1」的假运行（10-19 08:07 实锤）
+            long sja = bs_file_age(DATA_DIR "/log/sjz.log");
+            int pend = -1;
+            char smd5[40] = {0};
+            if (sja >= 0 && sja <= US_STOP_FRESH
+                && bs_so_state_read(smd5, sizeof(smd5), NULL, &pend, NULL) && pend == 1) {
+                bs_so_state_write(0, smd5, 0);
+                bs_evt("[so] new so applied (script started, md5=%.8s) -> pend=0", smd5);
+            }
         }
 
         // ---- ★ v6.24q：落盘后自动重启状态机已整体移除（用户指令：新 so 只落盘，
@@ -3826,16 +4011,16 @@ static void *bs_watchdog(void *arg) {
                 bs_us_mark_write("run 1->0");
                 us_latched = 1;
                 bs_cr_mark_clear();          // 用户停了，旧的崩溃证据一并作废
-                bs_log("[us] script stop observed (run 1->0, sjz=%lds st=%p) -> auto-start gated until run=1",
+                bs_evt("[us] script stop observed (run 1->0, sjz=%lds st=%p) -> auto-start gated until run=1",
                        sa, (void *)st);
             } else {
-                bs_log("[us] run 1->0 but sjz=%lds (>%ds) -> not a user stop, no gate",
+                bs_evt("[us] run 1->0 but sjz=%lds (>%ds) -> not a user stop, no gate",
                        sa, US_STOP_FRESH);
             }
         }
         // ★ v6.7：脚本停了就抹模块。（★ v6.24q：原 g_reload_busy 排除随 [rl] 移除）
         if (saw_run && last_run == 1 && run == 0 && st != 0) {
-            bs_log("[wd] script stopped (run 1->0) -> wipe modules");
+            bs_evt("[wd] script stopped (run 1->0) -> wipe modules");
             char dpath[288];
             snprintf(dpath, sizeof(dpath), "%s", g_mod_dir);
             int wiped = 0;
@@ -3852,7 +4037,7 @@ static void *bs_watchdog(void *arg) {
                 }
                 closedir(d);
             }
-            bs_log("[wd] wiped %d module file(s) after stop", wiped);
+            bs_evt("[wd] wiped %d module file(s) after stop", wiped);
         }
         last_run = run;
 
@@ -3932,7 +4117,7 @@ static void *bs_watchdog(void *arg) {
                 static time_t ar_log = 0;
                 if (nowt - ar_log >= 60) {
                     ar_log = nowt;
-                    bs_log("[cr] ★ crash detected (%s%s) -> auto-start REMOVED v6.24p: "
+                    bs_evt("[cr] ★ crash detected (%s%s) -> auto-start REMOVED v6.24p: "
                            "kept STOPPED, press Run in center to resume",
                            cr_src == 0 ? "agent.log" : "sjz.log",
                            cr_loadfail ? " loadfail" : "");
@@ -3979,8 +4164,18 @@ static void *bs_watchdog(void *arg) {
                 static time_t stlog = 0;
                 if (nowt4 - stlog >= 300) {
                     stlog = nowt4;
-                    bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld us=%d",
-                           (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, us_stop);
+                    // ★ v6.24r：带上运行库生效状态。so=盘上 md5 前 8 位，pend=1 表示
+                    //   「盘上新的、内存旧的，还差一次手动运行」。这样远程一眼分得清
+                    //   三种停摆：盘上旧的坏包 / 盘上新包但没重启脚本 / 新包已生效还停。
+                    char smd5[40] = {0};
+                    long ssz = -1, sap = 0;
+                    int  spend = -1;
+                    if (!bs_so_state_read(smd5, sizeof(smd5), &ssz, &spend, &sap))
+                        snprintf(smd5, sizeof(smd5), "unknown");
+                    bs_evt("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld us=%d "
+                           "so=%.8s pend=%d size=%ld",
+                           (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, us_stop,
+                           smd5, spend, ssz);
                 }
             }
         }
@@ -4070,7 +4265,7 @@ static void *bs_watchdog(void *arg) {
         stale = 0;
 
         int rs = *(volatile int *)(base + OFF_RS_1A8);
-        bs_log("[wd] stale state=%p run=%u rs=%d -> request STOP",
+        bs_evt("[wd] stale state=%p run=%u rs=%d -> request STOP",
                (void *)st, (unsigned)run, rs);
 
         ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
