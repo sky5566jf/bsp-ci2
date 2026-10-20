@@ -826,7 +826,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25c"
+#define BS_DYLIB_VER       "v6.25d"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1051,17 +1051,48 @@ static int           g_so_tick = SO_SYNC_TICK_SECS;
 // 做法：connect 直接返回成功（不建真连接），send/recv 在内存里伪造应答。
 //   不监听端口、不开 socket、不产生任何外发流量。
 //   ★ 默认关闭（offline=0）；只有 conf offline=1 才启用，现网 238 台不受影响。
+//
+// ----------------------------------------------------------------
+// ★ v6.25d：协议变更哨兵（2026-10-21）
+// ----------------------------------------------------------------
+// 风险：桩是**严格线性状态机**（want: 262 → 208 → 16 → 262），acc 只 1024B。
+//   厂商哪天改了握手包长或 TLV 结构，桩会卡住 → 授权拿不到 → 设备**中控整机
+//   不上线**。这比「脚本挂」严重得多（脚本挂了至少中控还看得见设备），而现场
+//   完全看不出原因，只能一台台 SSH 上去翻日志。
+// 判据（单值、无误报来源）：正常每 15~20s 一轮且必走到 `16 = accepted`；
+//   连续 N 轮连接结束都没走到 accepted = 协议变了。
+// 打点：off_start 记分母（g_off_n_stub），off_worker 到 16 记分子（g_off_n_ok）
+//   并清零 g_off_fail_run；线程 6 个 break 出口统一在 close 前判「本次没 accepted」，
+//   连击达 g_offstall（conf offstall=，默认 5 ≈ 100s）置 g_off_stall 并写 bs_evt.log。
+// 上报：/hb query 追加 &of=ok|stall&ofn=<连击数>，服务端设备表标红。
+//   ★ 只在 offline=1 时带 —— 透传设备没有桩，带这个字段会污染设备表。
+// 恢复：下一次 accepted 自动清零并写 `[off] ★ recovered`，红标随之消失。
+// 零新线程、零新 CSS、与老 dylib/老服务端双向兼容（字段缺失即不显示）。
 #define OFF_RESP80_HEX                                                        \
     "500000000300430000000400000107000100000000060002736a7a"                  \
     "080003332e312e3023000a34326336393731656162646337326335303665333663656538"\
     "3537363630643607000b7518569f67b5df"
 
+// ★ v6.25d：bs_evt 本体定义在文件后段（事件专道），而离线桩线程在此处就要用，
+//   补一条前置声明，避免 clang 隐式声明（可变参数函数隐式声明是 UB）。
+static void bs_evt(const char *fmt, ...);
+
 static int      g_offline        = 0;   // conf offline= / hb off=
 static uint32_t g_off_vendor_net = 0;   // 60.204.159.47（网络序）
 static uint8_t  g_off_R[32];            // 设备最近一次 SecKeyEncrypt 的 32B 明文
 static volatile int    g_off_R_ok = 0;
-static volatile long   g_off_n    = 0;  // 握手轮次（日志节流）
 static char     g_off_devid[33];        // 本机 32 hex 设备码（填进 80B 应答）
+
+// ★ v6.25d：协议变更哨兵 —— 厂商若改握手包长/TLV 结构，桩会卡住拿不到授权，
+//   设备表现为「中控整机不上线」，且现场完全看不出原因。判据很单值：
+//   正常每 15~20s 一轮且必走到 `16 = accepted`；连续 N 轮没走到 = 协议变了。
+//   计数器在 off_worker 里打点，bs_devinfo_query 里读出带进 /hb，零新线程。
+static volatile long g_off_n_stub   = 0;  // 累计 connect 被拦截次数
+static volatile long g_off_n_ok     = 0;  // 累计 16 = accepted 次数
+static volatile int  g_off_fail_run = 0;  // 连续未 accepted 的连接数（告警判据）
+static volatile int  g_off_stall    = 0;  // 1 = 当前处于告警态
+static int           g_offstall     = 5;  // conf offstall= 阈值（2..60）
+static long          g_off_last_bad = 0;  // 最近一次异常时间戳
 
 /// 严格判断 32 位 hex（设备码格式）
 static int off_is_hex32(const char *s) {
@@ -1249,6 +1280,7 @@ static void *off_worker(void *arg) {
     int     want = 262;
     uint8_t m[32];
     int     round = 0;
+    int     accepted = 0;      // ★ v6.25d：本连接是否走到 16 = accepted
 
     for (;;) {
         if (accn < (size_t)want) {
@@ -1293,8 +1325,31 @@ static void *off_worker(void *arg) {
             bs_log("[off] #%d 208 -> 80 (auth ok)", round);
             accn = 0; want = 16;
         } else {                                  // want == 16
+            // ★ v6.25d：走到这里 = 授权链路全通，清掉失败连击
+            accepted = 1;
+            __sync_fetch_and_add(&g_off_n_ok, 1);
+            g_off_fail_run = 0;
+            if (g_off_stall) {
+                g_off_stall = 0;
+                bs_evt("[off] ★ recovered: accepted again after %lds (stub=%ld ok=%ld)",
+                       (long)(time(NULL) - g_off_last_bad),
+                       g_off_n_stub, g_off_n_ok);
+            }
             bs_log("[off] #%d 16 = accepted, vendor chain fully bypassed", round);
             accn = 0; want = 262;
+        }
+    }
+    // ★ v6.25d：连接结束但没走到 accepted —— 可能是偶发断连，也可能是协议变了。
+    //   6 个 break 出口（recv<=0 / send 失败 / aes 失败 / p80 缺失等）集中在这里判，
+    //   连续 N 次才报，单次抖动不喧哗。
+    if (!accepted) {
+        int n = __sync_add_and_fetch(&g_off_fail_run, 1);
+        g_off_last_bad = (long)time(NULL);
+        if (n >= g_offstall && !g_off_stall) {
+            g_off_stall = 1;
+            bs_evt("[off] ★ STALL %d consecutive rounds without accepted "
+                   "(stub=%ld ok=%ld) -> vendor protocol likely changed",
+                   n, g_off_n_stub, g_off_n_ok);
         }
     }
     close(s);
@@ -1304,6 +1359,7 @@ static void *off_worker(void *arg) {
 /// 把 fd 换成 socketpair 端点并起桩线程。connect 替身返回 0 后由它接管。
 static void off_start(int fd) {
     if (fd < 0) return;
+    __sync_fetch_and_add(&g_off_n_stub, 1);   // ★ v6.25d：拦截计数（分母）
     if (!g_off_vendor_net) g_off_vendor_net = inet_addr(STAT_VENDOR_IP);
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -1388,7 +1444,18 @@ static void bs_pc_ip_of_plist(char *out, size_t n) {
     free(b);
 }
 
-// 生成 "&nm=<设备名>&md=<型号>&ov=<系统版本>[&pc=<中控IP>]"；全空则返回空串
+// ★ v6.25d：协议变更哨兵状态（&of=ok|stall&ofn=N）。
+//   只在 offline=1 时带出 —— 透传设备根本没有桩，带这个字段会让设备表误判成"正常"。
+static void bs_off_query(char *out, size_t n) {
+    size_t cur;
+    if (!g_offline) return;
+    cur = strlen(out);
+    if (cur + 28 < n)
+        snprintf(out + cur, n - cur, "&of=%s&ofn=%d",
+                 g_off_stall ? "stall" : "ok", (int)g_off_fail_run);
+}
+
+// 生成 "&nm=<设备名>&md=<型号>&ov=<系统版本>[&pc=<中控IP>][&of=..]"；全空时只留 &of
 static void bs_devinfo_query(char *out, size_t n) {
     char hn[128], mach[64], osv[32], pc[64];
     char hn_e[384], mach_e[200], osv_e[100], pc_e[200];
@@ -1396,7 +1463,11 @@ static void bs_devinfo_query(char *out, size_t n) {
     bs_sysctl_str("hw.machine", mach, sizeof(mach));
     bs_sysctl_str("kern.osproductversion", osv, sizeof(osv));
     bs_pc_ip_of_plist(pc, sizeof(pc));
-    if (!hn[0] && !mach[0] && !osv[0] && !pc[0]) { out[0] = 0; return; }
+    if (!hn[0] && !mach[0] && !osv[0] && !pc[0]) {
+        out[0] = 0;
+        bs_off_query(out, n);
+        return;
+    }
     bs_urlenc(hn, hn_e, sizeof(hn_e));
     bs_urlenc(mach, mach_e, sizeof(mach_e));
     bs_urlenc(osv, osv_e, sizeof(osv_e));
@@ -1413,6 +1484,7 @@ static void bs_devinfo_query(char *out, size_t n) {
         if (cur + strlen(pc_e) + 8 < n)
             snprintf(out + cur, n - cur, "&pc=%s", pc_e);
     }
+    bs_off_query(out, n);   // ★ v6.25d：协议变更哨兵
 }
 
 static void bs_load_conf(void) {
@@ -1529,6 +1601,15 @@ static void bs_load_conf(void) {
             if (t > SO_SYNC_MAX_TICK) t = SO_SYNC_MAX_TICK;
             g_so_tick = t;
         }
+        else if (!strcmp(k, "offstall")) {
+            // ★ v6.25d：连续多少轮没走到 16=accepted 判为「厂商协议可能变了」
+            //   正常 15~20s 一轮，5 轮 ≈ 100s。clamp 2..60：写 0/1 会秒报警，
+            //   写太大则失去预警意义。
+            int t = atoi(v);
+            if (t < 2)  t = 2;
+            if (t > 60) t = 60;
+            g_offstall = t;
+        }
         else if (!strcmp(k, "sohost") && v[0]) {
             // ★ v6.9：局域网中继地址（仅 beta.so 下载走它；空/缺省=直连云端）
             strncpy(g_sohost, v, sizeof(g_sohost) - 1);
@@ -1559,12 +1640,12 @@ static void bs_load_conf(void) {
     // ★ v6.12：缓存 app.plist 的中控 ip —— beta.so 中继地址直接用它（见 so_sync 下载处）
     bs_pc_ip_of_plist(g_appip, sizeof(g_appip));
 
-    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sotick=%d autoreload=%d crashresume=%d blockvps=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
+    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
            BS_DYLIB_VER,
            g_port, g_tick, g_enable, g_mode == MODE_PROBE ? "probe" : "unlock",
            g_token[0] ? "(set)" : "(none)",
            g_qbuf[0] ? g_qbuf : "(none)", g_mod_dir, g_hb_max,
-           g_so_sync, g_so_tick, g_autoreload,
+           g_so_sync, g_so_tick, g_offstall, g_autoreload,
            g_crashresume, g_block_vps,
            g_cardcheck, g_cardgrace, g_cardtick,
            g_card_host, g_cardval[0] ? "(set)" : "(none)",

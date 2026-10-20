@@ -24,11 +24,15 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.25c" || (echo "MISSING v6.25c" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.25d" || (echo "MISSING v6.25d" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25b"; then echo "STALE: v6.25b string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.25c"; then echo "STALE: v6.25c string still present" && exit 1; fi
+          strings bs_unlock.dylib | grep -q "STALL %d consecutive rounds without accepted" || (echo "MISSING protocol stall alarm" && exit 1)
+          strings bs_unlock.dylib | grep -q "recovered: accepted again after" || (echo "MISSING stall recovery" && exit 1)
+          strings bs_unlock.dylib | grep -q "of=%s&ofn=%d" || (echo "MISSING of/ofn hb param" && exit 1)
           if strings bs_unlock.dylib | grep -q "auto-reload: request STOP"; then echo "FORBIDDEN: [rl] auto-reload still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "kicked=" || (echo "MISSING kicked field" && exit 1)
           strings bs_unlock.dylib | grep -q "newer input seen after kick" || (echo "MISSING unblock path" && exit 1)
