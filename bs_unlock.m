@@ -382,6 +382,18 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24p ★★★ 删除一切「自动运行脚本」（2026-10-20，用户指令：除「脚本本来在跑」
+//       与「中控手动下发运行」外，其余一律不得自动运行脚本）：
+//       ① [hg] 假运行看门狗（v6.24m/n）整块删除 —— OPER_STOP→OPER_START 自动重启；
+//       ② [cr] 崩溃签名自动 OPER_START 删除 —— 崩溃只落证据 + 节流日志，原地停住等人点；
+//       ③ [cr] 停摆/空闲兜底自动 OPER_START 删除 —— 只留 5 分钟诊断快照；
+//       ④ [cr] cr_pending 重试状态机（含会话死冷启 App 升级）整块删除；
+//       ⑤ [rl] so_sync 自动重载加守卫 —— 脚本没在跑（run==0）时不下发 START，
+//          新 so 留盘上，下次手动运行自然加载；脚本在跑才允许 STOP→START 换包。
+//       保留：崩溃签名扫描与 .bs_cr_pending 证据落盘（纯观察）、[cr] stall scan 诊断
+//       快照、用户停止闸门 .bs_userstop（继续压制 [rl]）、[fg] 前台看门狗（只拉游戏
+//       回前台，不碰脚本）、crashresume conf 键仍解析但不再有任何动作点。
+//
 // v6.24o ★★★ `crashresume=0` 真正接线（2026-10-20，用户要求撤销 func-nil 静默化）：
 //       背景：`g_crashresume` 自 v6.17 起只被解析、从未被任何判断使用 —— 是死配置。
 //             撤销 beta.so 硬化后，func-nil 崩溃会重新出现（这是用户要的「可见」），
@@ -690,38 +702,18 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define RL_RUN_TICKS    8       // 8 * 2s = 16s 内脚本未跑起来 → 放弃
 #define RL_KEY_TICKS    30      // ★ v6.8：30 * 2s = 60s 内 verwatch 没把盘上版本的键注入 → 放弃
 
-// ★ v6.17：func-nil 崩溃自动恢复（crash-resume）
-#define CR_COOLDOWN     300     // 两次自动恢复最小间隔（秒）
+// ★ v6.17：func-nil 崩溃自动恢复（crash-resume）—— ★ v6.24p 已按用户指令移除全部
+//   自动恢复动作，仅保留签名扫描做证据落盘与诊断日志（见下）。
 // ★ v6.24c：加载期失败也纳入自愈 —— 签名扩到 `can not find version key` /
 //   `load snail module failed`（10-17 .115 装 v1.56 后冷启：「加载运行库出错」）。
 //   该类失败发生在「中控上线 4s 就补发 run、而 dylib 还没铺完全部段版本键」的
 //   窗口内（实测键 17:45:19.7 才齐，加载 17:45:18 已失败），键齐后重试必成。
 //   同时把 init 阶段改成「同步预铺全部版本键」（见 bootstrap 1a-2），把窗口压到 ~1s。
 //   闸门对 loadfail 不要求 saw_run（run 可能已回落而 saw_run 尚未置位）。
-// ★ v6.24b：崩溃恢复「重试状态机」—— v6.24a 只救一次：OPER_START 后脚本若二次
-//   崩溃（厂商 bb_common 仍为 nil），后续不再产生新的 "run script error:" 行 →
-//   cr_hit 不再命中 → 永久躺平（10-17 .115 实锤停摆 53min）。
-//   改为「崩溃检出 → pending → 递增间隔无限重试」，只在真实崩溃签名命中时置位
-//   （不碰 sjz.log 静默，避免休眠误判 —— 即 v6.23z 静默看门狗被否的原因）。
-// ★ v6.24d：全链路自动闭环 —— 补齐 10-18 .216 实锤故障链的三段缺口：
-//   ① func-nil 瞬时竞态 → 快退避（首拉 15s，OPER_START 幂等 + run/st/hb 三闸防误拉）；
-//   ② 持久化形态 = App「启动服务」会话死（agent.log 尾部 recv rep key failed 循环）
-//      → 连续 CR_ESC_RETRIES 次 retry 失败后升级冷启 App：确保 .autosvc_pending
-//      marker（App 内 dylib 加载期检查并自动拨「启动服务」）→ killall → uiopen，
-//      CR_ESC_MIN 限速防冷启循环；
-//   ③ 脚本活但游戏被顶到后台（sjz 尾部 game is not front app + sjz 停摆）→
-//      [fg] 看门狗 uiopen 游戏拉回前台，FG_MIN 限速。
-#define CR_RETRY_BASE   15      // ★ v6.24d：首次重试间隔 60→15（之后线性递增，见下）
-#define CR_RETRY_CAP    600     // 重试间隔上限（秒）—— 到顶后固定 10min 一次，永不放弃
-#define CR_ESC_RETRIES  2       // ★ v6.24d：连续失败达到该 retry 次数后才考虑会话死升级
-#define CR_ESC_MIN      1800    // ★ v6.24d：冷启 App 限速（秒）
+// ★ v6.24b/d：崩溃恢复「重试状态机 + 会话死升级冷启 App」—— ★ v6.24p 已整块删除。
 #define FG_STALE_SECS   180     // ★ v6.24d：sjz.log 停摆判定（秒）
 #define FG_MIN          600     // ★ v6.24d：[fg] uiopen 游戏限速（秒）
-#define CR_STALL_SCAN   60      // ★ v6.24e：停摆兜底扫描周期（秒）
-#define CR_STALL_FRESH  3600    // ★ v6.24e：run-error 距今多久内仍值得自动拉（秒）
-#define CR_IDLE_SECS    600     // ★ v6.24i：脚本空闲多久后兜底拉起（秒）
-#define HG_SECS         900     // ★ v6.24m：run=1 但 sjz 停写多久判「假运行」（秒）
-#define HG_COOLDOWN     1800    // ★ v6.24m：两次挂死重启的最小间隔（秒）
+#define CR_STALL_SCAN   60      // ★ v6.24p：停摆扫描周期（秒）——现仅用于诊断快照
 #define FG_GAME_BID     "com.tencent.tmgp.dfm"   // ★ v6.24d：三角洲行动（DeltaForceClient.app）
 
 // ★ v6.8：大文件（beta.so ~1.16MB，上限 8MB）下载专用长超时。
@@ -804,7 +796,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24o"
+#define BS_DYLIB_VER       "v6.24p"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3786,26 +3778,8 @@ static void bs_spawnv(const char *path, char *const argv[]) {
     bs_log("[v624d] spawn %s rc=%d", path, rc);
 }
 
-// ★ v6.24d：冷启 App 重建「启动服务」会话（与 deb postinst / autosvc marker 同源机制）。
-//   marker 检查发生在 App 进程 dylib 加载期，所以这里只保证 marker 在场 + 冷启；
-//   App 起来后由它自己拨「启动服务」（v1.52 既有链路），Agent 会话随之重建。
-static void bs_cold_restart_app(void) {
-    char mp[300];
-    snprintf(mp, sizeof(mp), "%s/.autosvc_pending", DATA_DIR);
-    struct stat sb;
-    if (stat(mp, &sb) != 0) {                 // marker 不在场才补写（内容=版本串）
-        FILE *f = fopen(mp, "w");
-        if (f) { fputs(BS_DYLIB_VER, f); fclose(f); }
-    }
-    char *ka[] = { (char *)"/usr/bin/killall", (char *)"-9",
-                   (char *)"BetaScreenTYMDESUJCX8T", NULL };
-    bs_spawnv("/usr/bin/killall", ka);
-    sleep(2);
-    char *uo[] = { (char *)"/usr/bin/uiopen", (char *)"--bundleid",
-                   (char *)"com.app.BetaScreenTYMDESUJCX8T", NULL };
-    bs_spawnv("/usr/bin/uiopen", uo);
-    bs_log("[cr] cold restart App issued (marker ensured + killall + uiopen)");
-}
+// ★ v6.24d：冷启 App 重建「启动服务」会话 —— ★ v6.24p 已废弃（原为崩溃重试状态机
+//   的升级动作，状态机已删）。函数体保留会导致 unused 警告，故整段移除。
 
 static void *bs_watchdog(void *arg) {
     uintptr_t base = (uintptr_t)arg;
@@ -3825,20 +3799,11 @@ static void *bs_watchdog(void *arg) {
     int rl_phase = RL_IDLE;
     int rl_wait  = 0;
 
-    // ★ v6.17：func-nil 崩溃自动恢复（agent.log 增量扫描）
+    // ★ v6.17：func-nil 崩溃自动恢复（agent.log 增量扫描）—— v6.24p 起仅做证据与日志
     long   cr_size[2] = {-1, -1}; // ★ v6.23u [0]=agent.log [1]=sjz.log 上次尺寸（-1=首轮只记基线）
-    time_t cr_last = 0;     // 上次自动恢复时刻（冷却用）
-    // ★ v6.24b：崩溃恢复重试状态机
-    int    cr_pending = 0;  // 1 = 崩溃已检出、正等脚本跑起来
-    int    cr_retry   = 0;  // 已累计重试次数（间隔递增 + 日志节流）
-    time_t cr_next    = 0;  // 下次允许重试的时刻
-    time_t cr_esc_last = 0; // ★ v6.24d：上次冷启 App 时刻（升级限速）
     time_t fg_last     = 0; // ★ v6.24d：上次 [fg] uiopen 游戏时刻（限速）
-    time_t cr_stall_last = 0; // ★ v6.24e：上次停摆兜底扫描时刻
+    time_t cr_stall_last = 0; // ★ v6.24p：上次停摆诊断扫描时刻
     int    us_latched = 0;    // ★ v6.24k：用户停止闸门在本进程内的缓存（配合 .bs_userstop）
-    time_t hg_last    = 0;    // ★ v6.24m：上次「假运行」重启时刻（冷却）
-    time_t hg_busy_until = 0; // ★ v6.24m：挂死重启期间屏蔽用户停止闸门写入
-    int    hg_n       = 0;    // ★ v6.24m：累计挂死重启次数（诊断）
 
     for (;;) {
         sleep(WD_TICK_SECS);
@@ -3867,12 +3832,19 @@ static void *bs_watchdog(void *arg) {
             bs_log("[rl] auto-reload skipped (user stopped script, .bs_userstop present)");
         }
         if (g_need_reload && rl_phase == RL_IDLE) {
+            // ★ v6.24p：脚本没在跑就不许 reload 拉起（自动运行仅限「本来在跑」）。
+            //   新 so 留在盘上，下次中控手动点运行自然加载新包。
+            if (!run) {
+                g_need_reload = 0;
+                bs_log("[rl] new so ready but script not running -> skip reload (manual run will load it)");
+            } else {
             g_need_reload = 0;
             g_reload_busy = 1;
             rl_wait = 0;
             bs_log("[rl] auto-reload: request STOP (state=%p run=%u)", (void *)st, (unsigned)run);
             ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
             rl_phase = RL_WAIT_ZERO;
+            }
         }
         if (rl_phase == RL_WAIT_ZERO) {
             if (st == 0) {
@@ -3930,10 +3902,7 @@ static void *bs_watchdog(void *arg) {
         // ★ v6.24k：run 1->0 = 脚本被停。默认按「用户主动停」处理，落盘闸门（.bs_userstop），
         //   禁止后续一切自动 OPER_START。若扫到崩溃签名，下面会撤销该闸门（崩溃优先）。
         //   排除：reload 状态机自己停的、卡封禁下发的 STOP。
-        if (!g_reload_busy && !g_card_blocked && last_run == 1 && run == 0 && !us_latched
-            && time(NULL) >= hg_busy_until) {
-            // ★ v6.24m：挂死重启（[hg]）自己发的 OPER_STOP 不是用户停止 —— hg_busy_until
-            //   期间直接跳过本判定，避免 1->0 被误记成用户闸门（否则重启后永远不再自动拉）。
+        if (!g_reload_busy && !g_card_blocked && last_run == 1 && run == 0 && !us_latched) {
             // ★ v6.24l：必须确认「刚才真的在跑」才认定是用户停止。
             //   App 冷启时厂商 run 标志会残留为 1、初始化后掉 0（10-19 08:07 .216 实锤），
             //   那一下也构成 1->0，但 sjz.log 早已停摆 → 不是用户停止，不许落闸门（否则
@@ -4042,70 +4011,18 @@ static void *bs_watchdog(void *arg) {
             }
             if (cr_hit) {
                 time_t nowt = time(NULL);
-                // ★ v6.24k：崩溃证据优先于用户停止 —— 命中 run-error / loadfail 说明
-                //   「中控下发的 run 真的执行了并失败」，不是人工停。撤销 .bs_userstop，
-                //   否则 run 1->0 那一拍写的闸门会把本状态机整体挡死。
-                if (us_latched) {
-                    bs_us_mark_clear();
-                    us_latched = 0;
-                    bs_log("[us] crash signature overrides user-stop gate -> resume recovery");
-                }
                 // ★ v6.24h：先把证据落盘（App 重启会清空 agent.log，marker 不会）
                 if (run == 0) bs_cr_mark_write(cr_src == 0 ? "agent" : "sjz");
-                // ★ v6.24c：加载失败类签名不要求 saw_run —— 这种失败发生在
-                //   「中控已下发 run、脚本刚进 begin load script 就挂」的瞬间，
-                //   run 可能已回落 0 而 saw_run 还没来得及置位，用老闸门会漏判。
-                // ★ v6.24e：agent.log 里的 run-error 签名是 **agent 亲笔** —— 它证明
-                //   「中控已下发 run、脚本真的跑过、并且立刻挂了」。崩溃快于 1s 时看门狗
-                //   那一拍根本看不到 run=1，saw_run 永远是 0（10-19 07:55 .216 实锤：
-                //   07:55:39 begin run script → 07:55:40 run script error →
-                //   stop script，saw_run=0）→ 老闸门把整件事丢掉，连 retry #1 都不发，
-                //   设备从此永久停摆等人点。故 agent 源签名豁免 saw_run。
-                int cr_proven = (cr_src == 0);
-                // ★ v6.24o：g_crashresume 接进闸门 —— conf 写 crashresume=0 时，
-                //   崩溃只记录不拉起（用户要求「崩溃可见 + 手动点运行」）。
-                int gate_ok = (g_crashresume &&
-                               !g_reload_busy && (saw_run || cr_loadfail || cr_proven) &&
-                               run == 0 && st == 0 && g_hb_ok && !g_card_blocked &&
-                               (nowt - cr_last) >= CR_COOLDOWN);
-                if (gate_ok) {
-                    bs_log("[cr] script-error crash detected (%s) -> auto OPER_START (hb ok, last resume %ds ago)",
+                // ★ v6.24p：自动恢复已整体移除（用户指令：除「脚本本来在跑」与
+                //   「中控手动下发运行」外一律不自动运行脚本）。崩溃只留证据与节流日志，
+                //   原地停住，等人点「运行」。
+                static time_t ar_log = 0;
+                if (nowt - ar_log >= 60) {
+                    ar_log = nowt;
+                    bs_log("[cr] ★ crash detected (%s%s) -> auto-start REMOVED v6.24p: "
+                           "kept STOPPED, press Run in center to resume",
                            cr_src == 0 ? "agent.log" : "sjz.log",
-                           cr_last ? (int)(nowt - cr_last) : -1);
-                    ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-                    cr_last    = nowt;
-                    cr_pending = 1;                        // ★ v6.24b 进入重试状态机
-                    cr_retry   = 0;
-                    cr_next    = nowt + CR_RETRY_BASE;
-                } else {
-                    bs_log("[cr] script-error signature seen (%s) but skip (busy=%d saw_run=%d run=%u st=%p hb=%d cd=%d%s)",
-                           cr_src == 0 ? "agent.log" : "sjz.log",
-                           g_reload_busy, saw_run, (unsigned)run,
-                           (void *)st, g_hb_ok,
-                           cr_last ? (int)(nowt - cr_last) : -1,
-                           cr_loadfail ? " loadfail" : (cr_proven ? " run-error" : ""));
-                    // ★ v6.24o：崩溃可见模式 —— 只留证据和一行明确日志，绝不自动拉起。
-                    //   用户诉求（2026-10-20）：宁可看见 `attempt to call local 'func'
-                    //   (a nil value)` 然后自己在中控点「运行」，也不要被静默重启掩盖。
-                    if (!g_crashresume) {
-                        static time_t ar_log = 0;
-                        if (nowt - ar_log >= 60) {
-                            ar_log = nowt;
-                            bs_log("[cr] ★ crash CONFIRMED (%s) -> autoresume=0 (crashresume=0): "
-                                   "kept STOPPED on purpose, press Run in center to resume",
-                                   cr_src == 0 ? "agent.log" : "sjz.log");
-                        }
-                    }
-                    // ★ v6.24c：加载失败类签名不许丢弃 —— 签名行只会出现一次，
-                    //   丢弃就等于永久放弃。这里挂 pending，交给下面的重试状态机
-                    //   在条件恢复（st 归零 / 键补齐）后接着拉；若脚本其实已跑起来，
-                    //   pending 会以 recovery OK 自行解除，不产生副作用。
-                    if (g_crashresume && (cr_loadfail || cr_proven) && !g_reload_busy && !g_card_blocked && g_hb_ok) {
-                        cr_pending = 1;
-                        if (cr_next <= nowt) cr_next = nowt + CR_RETRY_BASE;
-                        bs_log("[cr] %s -> pending, state machine will retry",
-                               cr_loadfail ? "loadfail" : "run-error");
-                    }
+                           cr_loadfail ? " loadfail" : "");
                 }
             }
         }
@@ -4130,138 +4047,34 @@ static void *bs_watchdog(void *arg) {
                 long rage = bs_last_run_failed_age(ap, 65536);
                 long mage = bs_cr_mark_age();
                 if (mage > 86400) { bs_cr_mark_clear(); mage = -1; }   // 过期证据不作数
-                int stalled = (mage >= 0) || (rage >= 0 && rage <= CR_STALL_FRESH);
-                // ★ v6.24i：空闲兜底 —— App 一重启 marker 就没了（恢复时清 / 日志轮转），
-                //   中控的在线补发又常常被会话抖动吞掉 → 脚本静默停摆没人管（10-19 08:19
-                //   装完 deb 后实锤）。只要脚本确实没跑（st==0 && run==0）且 sjz 停摆
-                //   超过 CR_IDLE_SECS，且最后一条事件不是「中控显式停脚本」，就自动拉。
+                // ★ v6.24p：停摆/空闲兜底的自动 OPER_START 已删除（用户指令：脚本停了
+                //   就是停了，只等人点「运行」）。本扫描仅保留两件事：
+                //   ① 用户停止证据清理；② 5 分钟一条诊断快照（纯观察，远程定位卡点用）。
                 long sjz_age = -1;
                 char sp[300];
                 snprintf(sp, sizeof(sp), "%s/log/sjz.log", DATA_DIR);
                 struct stat ssb;
                 if (stat(sp, &ssb) == 0) sjz_age = (long)(nowt4 - (time_t)ssb.st_mtime);
-                // ★ v6.24k：用户停止闸门 —— 会话内缓存（us_latched，来自 run 1->0）或
-                //   agent.log 里的显式停止痕迹，任一成立就不许拉。窗口 64K→256K：
-                //   agent.log 的 server2 重连循环每 20s 写 3 行，64K 只够覆盖几分钟，
-                //   用户停脚本半小时后再扫描时停止痕迹早被挤出去了（10-19 20:53 实锤：
-                //   停止后 29s 被 idle 兜底拉起，因为 judge 串写错 + 窗口太窄）。
+                // ★ v6.24k：用户停止判定（us_latched 或 agent.log 显式停止痕迹）。
                 int us_stop = us_latched || bs_last_stop_is_user(ap, 262144);
-                int idle = (sjz_age >= CR_IDLE_SECS);
-                if (!us_stop && !cr_pending && st == 0 && run == 0 && g_hb_ok && g_crashresume
-                    && (stalled || idle)) {
-                    bs_log("[cr] stall confirmed (mark=%lds rage=%lds idle=%d sjz=%lds st=%p) -> OPER_START now",
-                           mage, rage, idle, sjz_age, (void *)st);
-                    ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-                    cr_last    = nowt4;
-                    cr_retry   = 0;
-                    cr_pending = 1;
-                    cr_next    = nowt4 + CR_RETRY_BASE;
-                } else {
-                    if (us_stop) {
-                        // 用户停的：把残留崩溃证据也作废，避免下次扫描又据此拉起
-                        if (mage >= 0) bs_cr_mark_clear();
-                        mage = -1;
-                    }
-                    // ★ v6.24m：「假运行」兜底 —— run=1 但脚本线程早已卡死。
-                    //   10-20 02:20 .2080（c42a8474…，deb 1.64 / dylib v6.24l）实锤：
-                    //   agent 心跳正常、run 一直为 1（中控显示「运行中」），但 sjz.log
-                    //   从 02:20:18「[长弓溪谷] find pickup icon first」后再无一行，
-                    //   截图通道 sreen.log 从 02:25:51 起只剩 "socket no data recv"。
-                    //   → 脚本卡在截图/找图上无限等待：既没有 run script error（不是崩溃，
-                    //   [cr] 看不见），也没停脚本（run 还是 1，idle 兜底看不见）。
-                    //   判据：run==1 && st!=0 && sjz 停写 ≥ HG_SECS && 无用户停止闸门
-                    //   → 先 OPER_STOP 打断卡死的线程，再 OPER_START 重建；起不来就交给
-                    //   cr_pending 状态机继续按 15s→…→600s 递增重试。
-                    //   ★ 判据不要求 st!=0：卡死时脚本容器指针可能已被厂商清成 0，
-                    //     但 run 标志仍留在 1（这正是「中控显示运行中」的来源）。
-                    if (!us_stop && !cr_pending && run == 1 && g_hb_ok && g_crashresume
-                        && sjz_age >= HG_SECS
-                        && (hg_last == 0 || nowt4 - hg_last >= HG_COOLDOWN)) {
-                        bs_log("[hg] script hung (run=1 st=%p sjz=%lds) -> OPER_STOP then OPER_START",
-                               (void *)st, sjz_age);
-                        hg_busy_until = nowt4 + 120;
-                        ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
-                        usleep(1500 * 1000);
-                        ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-                        hg_last    = nowt4;
-                        hg_n++;
-                        cr_last    = nowt4;
-                        cr_retry   = 0;
-                        cr_pending = 1;
-                        cr_next    = nowt4 + CR_RETRY_BASE;
-                    }
-                    // 每 5 分钟一条诊断快照（不动作），便于下次远程定位卡点
-                    static time_t stlog = 0;
-                    if (nowt4 - stlog >= 300) {
-                        stlog = nowt4;
-                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d us=%d hg=%d ar=%d",
-                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending, us_stop, hg_n, g_crashresume);
-                    }
+                if (us_stop) {
+                    // 用户停的：把残留崩溃证据也作废，避免误导后续诊断
+                    if (mage >= 0) bs_cr_mark_clear();
+                    mage = -1;
+                }
+                // 每 5 分钟一条诊断快照（不动作），便于下次远程定位卡点
+                static time_t stlog = 0;
+                if (nowt4 - stlog >= 300) {
+                    stlog = nowt4;
+                    bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld us=%d",
+                           (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, us_stop);
                 }
             }
         }
 
-        // --- ★ v6.24b：崩溃恢复重试状态机（不依赖新日志行）---
-        //   v6.24a 的 [cr] 只在 agent.log/sjz.log「新增字节」里命中签名时才动作；
-        //   OPER_START 后脚本若二次崩溃（bb_common 仍为 nil），不会再产生新签名
-        //   → cr_hit 永不再命中 → 永久停摆（10-17 .115：16:16 崩，停到 17:09+）。
-        //   这里改为：崩溃一旦检出就挂起 pending，每轮复查「脚本是否跑起来」；
-        //   没起来就按 60s→120s→…→600s 递增间隔反复 OPER_START，直到 run=1，
-        //   或条件不满足（卡封禁 / 心跳失联 / 正在 reload）时暂停但不清 pending。
-        //   只在真实崩溃签名命中时置位，故「用户主动停脚本」不会被误拉起。
-        if (cr_pending && !g_crashresume) {
-            // ★ v6.24o：autoresume 关闭 —— 只做收尾清理，一次也不重试。
-            //   脚本若已被用户手动点起来（run=1），正常清 pending。
-            if (run && !g_reload_busy) {
-                bs_log("[cr] recovery OK after manual run (retries=%d)", cr_retry);
-                bs_cr_mark_clear();
-                cr_pending = 0;
-                cr_retry   = 0;
-            }
-        } else if (cr_pending) {
-            time_t nowt2 = time(NULL);
-            // ★ v6.24k：用户主动停脚本 = 最高优先，直接放弃本状态机（不做任何重试）。
-            //   崩溃恢复只在「有崩溃证据」时置 pending，所以能走到这里的 us 只可能来自
-            //   「崩溃恢复过程中用户手动点了停止」——此时必须立刻停手。
-            if (us_latched && !run) {
-                bs_log("[cr] user stopped script -> drop pending recovery (retries=%d)", cr_retry);
-                cr_pending = 0;
-                cr_retry   = 0;
-                bs_cr_mark_clear();
-            } else if (run) {
-                bs_log("[cr] recovery OK, script running again (retries=%d)", cr_retry);
-                bs_cr_mark_clear();                 // ★ v6.24h：恢复即清证据
-                cr_pending = 0;
-                cr_retry   = 0;
-            } else if (g_reload_busy) {
-                /* reload 状态机接管，本状态机让位 */
-            } else if (st != 0) {
-                /* 脚本正在加载（state 非零）→ 等它跑起来 */
-            } else if (!g_hb_ok || g_card_blocked) {
-                /* 心跳失联 / 卡被封禁 → 暂停重试但不放弃，等条件恢复 */
-            } else if (nowt2 >= cr_next) {
-                long gap = (long)CR_RETRY_BASE * (cr_retry + 1);
-                if (gap > CR_RETRY_CAP) gap = CR_RETRY_CAP;
-                cr_retry++;
-                cr_next = nowt2 + (time_t)gap;
-                // ★ v6.24d：连续 CR_ESC_RETRIES 次 retry 失败 + agent.log 尾部
-                //   recv rep key failed 密集出现 = App 服务会话死（持久化形态，
-                //   10-18 .216 实锤：OPER_START 拉起即炸循环）→ 升级冷启 App
-                //   重建会话；下一轮 retry 走新会话即可成。CR_ESC_MIN 限速。
-                if (cr_retry >= CR_ESC_RETRIES
-                    && (cr_esc_last == 0 || nowt2 - cr_esc_last >= CR_ESC_MIN)
-                    && bs_tail_count(DATA_DIR "/log/agent.log", 2048,
-                                     "recv rep key failed") >= 2) {
-                    cr_esc_last = nowt2;
-                    bs_log("[cr] retry #%d failed + session flapping -> escalate cold restart App",
-                           cr_retry);
-                    bs_cold_restart_app();
-                }
-                bs_log("[cr] retry #%d -> OPER_START (st=0 run=0, next try in %lds)",
-                       cr_retry, gap);
-                ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
-            }
-        }
+        // --- ★ v6.24b：崩溃恢复重试状态机 —— ★ v6.24p 已整块删除 ---
+        //   （自动 OPER_START / 递增重试 / 会话死升级冷启 App 全部移除。
+        //     用户指令：脚本运行只认「本来在跑」与「中控手动下发」，其余不自动。）
 
         // --- ★ v6.24d：[fg] 游戏前台看门狗 ---
         //   脚本活着（run=1）但游戏被顶到后台：sjz.log 停摆 ≥ FG_STALE_SECS
