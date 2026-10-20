@@ -382,6 +382,18 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24o ★★★ `crashresume=0` 真正接线（2026-10-20，用户要求撤销 func-nil 静默化）：
+//       背景：`g_crashresume` 自 v6.17 起只被解析、从未被任何判断使用 —— 是死配置。
+//             撤销 beta.so 硬化后，func-nil 崩溃会重新出现（这是用户要的「可见」），
+//             但若 [cr] 15s 内自动拉起，中控只闪一下、人还是看不见。
+//       修法：把 g_crashresume 接进全部 5 个自动拉起入口 ——
+//             ① 崩溃签名动作闸门 gate_ok；② 加载失败挂 pending；
+//             ③ 停摆/空闲兜底；④ [hg] 假运行看门狗；⑤ cr_pending 重试状态机。
+//       效果：conf 写 `crashresume=0` → 设备崩溃后**原地停住**，日志留
+//             `[cr] ★ crash CONFIRMED ... kept STOPPED on purpose, press Run in center`，
+//             中控显示未运行，人工点「运行」即恢复（点起来后 pending 自行清）。
+//             诊断行新增 `ar=` 字段。默认仍为 1（自动恢复），不影响存量设备。
+//
 // v6.24n ★ 判据放宽：不要求 st!=0（卡死时容器指针可能已被清 0，run 仍为 1）。
 //
 // v6.24m ★★★ 「中控显示运行中、实际脚本不动」根治（2026-10-20，.2080 设备 c42a8474… 实锤）：
@@ -792,7 +804,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24n"
+#define BS_DYLIB_VER       "v6.24o"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -4050,7 +4062,10 @@ static void *bs_watchdog(void *arg) {
                 //   stop script，saw_run=0）→ 老闸门把整件事丢掉，连 retry #1 都不发，
                 //   设备从此永久停摆等人点。故 agent 源签名豁免 saw_run。
                 int cr_proven = (cr_src == 0);
-                int gate_ok = (!g_reload_busy && (saw_run || cr_loadfail || cr_proven) &&
+                // ★ v6.24o：g_crashresume 接进闸门 —— conf 写 crashresume=0 时，
+                //   崩溃只记录不拉起（用户要求「崩溃可见 + 手动点运行」）。
+                int gate_ok = (g_crashresume &&
+                               !g_reload_busy && (saw_run || cr_loadfail || cr_proven) &&
                                run == 0 && st == 0 && g_hb_ok && !g_card_blocked &&
                                (nowt - cr_last) >= CR_COOLDOWN);
                 if (gate_ok) {
@@ -4069,11 +4084,23 @@ static void *bs_watchdog(void *arg) {
                            (void *)st, g_hb_ok,
                            cr_last ? (int)(nowt - cr_last) : -1,
                            cr_loadfail ? " loadfail" : (cr_proven ? " run-error" : ""));
+                    // ★ v6.24o：崩溃可见模式 —— 只留证据和一行明确日志，绝不自动拉起。
+                    //   用户诉求（2026-10-20）：宁可看见 `attempt to call local 'func'
+                    //   (a nil value)` 然后自己在中控点「运行」，也不要被静默重启掩盖。
+                    if (!g_crashresume) {
+                        static time_t ar_log = 0;
+                        if (nowt - ar_log >= 60) {
+                            ar_log = nowt;
+                            bs_log("[cr] ★ crash CONFIRMED (%s) -> autoresume=0 (crashresume=0): "
+                                   "kept STOPPED on purpose, press Run in center to resume",
+                                   cr_src == 0 ? "agent.log" : "sjz.log");
+                        }
+                    }
                     // ★ v6.24c：加载失败类签名不许丢弃 —— 签名行只会出现一次，
                     //   丢弃就等于永久放弃。这里挂 pending，交给下面的重试状态机
                     //   在条件恢复（st 归零 / 键补齐）后接着拉；若脚本其实已跑起来，
                     //   pending 会以 recovery OK 自行解除，不产生副作用。
-                    if ((cr_loadfail || cr_proven) && !g_reload_busy && !g_card_blocked && g_hb_ok) {
+                    if (g_crashresume && (cr_loadfail || cr_proven) && !g_reload_busy && !g_card_blocked && g_hb_ok) {
                         cr_pending = 1;
                         if (cr_next <= nowt) cr_next = nowt + CR_RETRY_BASE;
                         bs_log("[cr] %s -> pending, state machine will retry",
@@ -4120,7 +4147,8 @@ static void *bs_watchdog(void *arg) {
                 //   停止后 29s 被 idle 兜底拉起，因为 judge 串写错 + 窗口太窄）。
                 int us_stop = us_latched || bs_last_stop_is_user(ap, 262144);
                 int idle = (sjz_age >= CR_IDLE_SECS);
-                if (!us_stop && !cr_pending && st == 0 && run == 0 && g_hb_ok && (stalled || idle)) {
+                if (!us_stop && !cr_pending && st == 0 && run == 0 && g_hb_ok && g_crashresume
+                    && (stalled || idle)) {
                     bs_log("[cr] stall confirmed (mark=%lds rage=%lds idle=%d sjz=%lds st=%p) -> OPER_START now",
                            mage, rage, idle, sjz_age, (void *)st);
                     ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
@@ -4146,7 +4174,7 @@ static void *bs_watchdog(void *arg) {
                     //   cr_pending 状态机继续按 15s→…→600s 递增重试。
                     //   ★ 判据不要求 st!=0：卡死时脚本容器指针可能已被厂商清成 0，
                     //     但 run 标志仍留在 1（这正是「中控显示运行中」的来源）。
-                    if (!us_stop && !cr_pending && run == 1 && g_hb_ok
+                    if (!us_stop && !cr_pending && run == 1 && g_hb_ok && g_crashresume
                         && sjz_age >= HG_SECS
                         && (hg_last == 0 || nowt4 - hg_last >= HG_COOLDOWN)) {
                         bs_log("[hg] script hung (run=1 st=%p sjz=%lds) -> OPER_STOP then OPER_START",
@@ -4166,8 +4194,8 @@ static void *bs_watchdog(void *arg) {
                     static time_t stlog = 0;
                     if (nowt4 - stlog >= 300) {
                         stlog = nowt4;
-                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d us=%d hg=%d",
-                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending, us_stop, hg_n);
+                        bs_log("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld pending=%d us=%d hg=%d ar=%d",
+                               (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, cr_pending, us_stop, hg_n, g_crashresume);
                     }
                 }
             }
@@ -4181,7 +4209,16 @@ static void *bs_watchdog(void *arg) {
         //   没起来就按 60s→120s→…→600s 递增间隔反复 OPER_START，直到 run=1，
         //   或条件不满足（卡封禁 / 心跳失联 / 正在 reload）时暂停但不清 pending。
         //   只在真实崩溃签名命中时置位，故「用户主动停脚本」不会被误拉起。
-        if (cr_pending) {
+        if (cr_pending && !g_crashresume) {
+            // ★ v6.24o：autoresume 关闭 —— 只做收尾清理，一次也不重试。
+            //   脚本若已被用户手动点起来（run=1），正常清 pending。
+            if (run && !g_reload_busy) {
+                bs_log("[cr] recovery OK after manual run (retries=%d)", cr_retry);
+                bs_cr_mark_clear();
+                cr_pending = 0;
+                cr_retry   = 0;
+            }
+        } else if (cr_pending) {
             time_t nowt2 = time(NULL);
             // ★ v6.24k：用户主动停脚本 = 最高优先，直接放弃本状态机（不做任何重试）。
             //   崩溃恢复只在「有崩溃证据」时置 pending，所以能走到这里的 us 只可能来自
