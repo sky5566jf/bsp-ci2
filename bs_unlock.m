@@ -382,6 +382,8 @@
 //       分发场景零配置——对方把 exe 放自己电脑、设备 app.plist 填他 IP，
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
+// v6.24n ★ 判据放宽：不要求 st!=0（卡死时容器指针可能已被清 0，run 仍为 1）。
+//
 // v6.24m ★★★ 「中控显示运行中、实际脚本不动」根治（2026-10-20，.2080 设备 c42a8474… 实锤）：
 //       现象：设备 run=1、agent 心跳 2min 一拍正常，中控显示脚本在跑，但游戏画面不动 6 小时。
 //       证据：sjz.log 最后一行 02:20:18 `[长弓溪谷] find pickup icon first` 之后再无输出；
@@ -790,7 +792,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24m"
+#define BS_DYLIB_VER       "v6.24n"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -4142,7 +4144,9 @@ static void *bs_watchdog(void *arg) {
                     //   判据：run==1 && st!=0 && sjz 停写 ≥ HG_SECS && 无用户停止闸门
                     //   → 先 OPER_STOP 打断卡死的线程，再 OPER_START 重建；起不来就交给
                     //   cr_pending 状态机继续按 15s→…→600s 递增重试。
-                    if (!us_stop && !cr_pending && run == 1 && st != 0 && g_hb_ok
+                    //   ★ 判据不要求 st!=0：卡死时脚本容器指针可能已被厂商清成 0，
+                    //     但 run 标志仍留在 1（这正是「中控显示运行中」的来源）。
+                    if (!us_stop && !cr_pending && run == 1 && g_hb_ok
                         && sjz_age >= HG_SECS
                         && (hg_last == 0 || nowt4 - hg_last >= HG_COOLDOWN)) {
                         bs_log("[hg] script hung (run=1 st=%p sjz=%lds) -> OPER_STOP then OPER_START",
