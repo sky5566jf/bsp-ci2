@@ -826,7 +826,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25"
+#define BS_DYLIB_VER       "v6.25a"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1116,6 +1116,53 @@ static const uint8_t *off_plain80(void) {
     return plain;
 }
 
+/// AES-128-CBC 解密，无 padding
+static int off_aes_dec(const uint8_t key[16], const uint8_t iv[16],
+                       const uint8_t *in, size_t n, uint8_t *out, size_t *moved) {
+    static int (*f)(unsigned, unsigned, unsigned, const void *, size_t,
+                    const void *, const void *, size_t, void *, size_t,
+                    size_t *) = NULL;
+    if (!f)
+        f = (int (*)(unsigned, unsigned, unsigned, const void *, size_t,
+                     const void *, const void *, size_t, void *, size_t,
+                     size_t *))dlsym(RTLD_DEFAULT, "CCCrypt");
+    if (!f) return -1;
+    *moved = 0;
+    // op=1(decrypt) alg=0(AES128) options=0
+    return f(1, 0, 0, key, 16, iv, in, n, out, n, moved);
+}
+
+/// 从 208B 请求反推 AES key。
+///
+/// 不需要 RSA 私钥，也不需要 hook 加密函数 —— 因为 208B 的明文首 4 字节是
+/// `d0 00 00 00`（= 总长 208 的小端），这是一个 32 bit 的已知明文。
+/// 而实测设备的 32B 随机 R 恒为单字节重复（0xec×32 / 0x16×32 / 0x3f×32 …），
+/// 于是 key = MD5(R) 只有 256 种可能 —— 逐一试解密首块，命中 `d0 00 00 00` 即中。
+///
+/// 命中判据 4 字节全等，误判概率 1/2^32，实测 8 轮全部一次命中。
+static int off_recover_key(const uint8_t *ct, size_t ctlen, const uint8_t m[32],
+                           uint8_t key_out[16]) {
+    uint8_t iv[16], r[32], dec[32];
+    size_t  moved = 0;
+    int     b;
+
+    if (ctlen < 16) return -1;
+    if (off_md5(m, 32, iv) != 0) return -1;
+
+    for (b = 0; b < 256; b++) {
+        memset(r, (uint8_t)b, 32);
+        if (off_md5(r, 32, key_out) != 0) return -1;
+        if (off_aes_dec(key_out, iv, ct, 16, dec, &moved) != 0 || moved != 16)
+            continue;
+        if (dec[0] == 0xd0 && dec[1] == 0x00 && dec[2] == 0x00 && dec[3] == 0x00) {
+            bs_log("[off] key recovered (R=0x%02x x32, key=%02x%02x%02x%02x)",
+                   b, key_out[0], key_out[1], key_out[2], key_out[3]);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 /// 桩工作线程：完全按实测的 262 → 38 → 208 → 80 → 16 顺序对答。
 ///   ★ 跑在 socketpair 的另一个端点上，Agent 的 select/poll 行为与真连接一致。
 static void *off_worker(void *arg) {
@@ -1135,10 +1182,6 @@ static void *off_worker(void *arg) {
         }
         if (want == 262) {
             round++;
-            if (!g_off_R_ok) {
-                bs_log("[off] no R captured yet, reply with zero material");
-                memset(g_off_R, 0, 32);
-            }
             off_make_m_buf(m);
             uint8_t r[38];
             r[0] = 0x26; r[1] = 0x00; r[2] = 0x00;
@@ -1153,9 +1196,19 @@ static void *off_worker(void *arg) {
             uint8_t key[16], iv[16], out[80];
             size_t  moved = 0;
             if (!p80) break;
-            if (off_md5(g_off_R, 32, key) != 0 || off_md5(m, 32, iv) != 0) {
-                bs_log("[off] md5 unavailable"); break;
+            // ① 首选：从 208B 的已知明文头反推 key（不依赖任何 hook）
+            if (off_recover_key(acc, accn, m, key) != 0) {
+                // ② 退路：用 SecKeyEncrypt 抄到的 R
+                if (g_off_R_ok) {
+                    memset(key, 0, 16);
+                    if (off_md5(g_off_R, 32, key) == 0)
+                        bs_log("[off] key from captured R (brute failed)");
+                } else {
+                    memset(key, 0, 16);
+                    bs_log("[off] !! no key at all, reply will not decrypt");
+                }
             }
+            if (off_md5(m, 32, iv) != 0) { bs_log("[off] md5 unavailable"); break; }
             if (off_aes_enc(key, iv, p80, 80, out, &moved) != 0 || moved != 80) {
                 bs_log("[off] aes fail moved=%zu", moved); break;
             }
