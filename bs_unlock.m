@@ -826,7 +826,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24s"
+#define BS_DYLIB_VER       "v6.25"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1036,6 +1036,168 @@ static void bs_s2_apply(const char *v, const char *src) {
 static int           g_so_sync = 1;
 static int           g_so_tick = SO_SYNC_TICK_SECS;
 
+// ================================================================
+// ★★★★ v6.25：真离线 —— 进程内接管 server2，一个字节都不发厂商
+// ================================================================
+//
+// 协议已完整破译（frida 在 .216 上实抓，非推断）：
+//   tx 262 = 06 01 | 00000000 | RSA-2048(SecKeyEncrypt, PKCS1) 加密的 32B 随机 R
+//   rx  38 = 26 00 00 00 01 00 | 32B 会话材料 M（明文；厂商对任意垃圾握手都回，不校验内容）
+//   KDF    = AES-128-CBC，key = MD5(R)，iv = MD5(M)
+//   tx 208 = CBC(key,iv) 加密的 TLV 请求（首 4 字节 d0 00 00 00 = 总长 208）
+//   rx  80 = CBC(key,iv) 加密的 TLV 应答（明文：50000000 … 0700 01 00 = 授权成功）
+//   tx  16 = 收尾确认；出现它就代表 Agent 认为授权通过 → 才会去连 server3（中控）
+//
+// 做法：connect 直接返回成功（不建真连接），send/recv 在内存里伪造应答。
+//   不监听端口、不开 socket、不产生任何外发流量。
+//   ★ 默认关闭（offline=0）；只有 conf offline=1 才启用，现网 238 台不受影响。
+#define OFF_RESP80_HEX                                                        \
+    "500000000300430000000400000107000100000000060002736a7a"                  \
+    "080003332e312e3023000a34326336393731656162646337326335303665333636656538"\
+    "3537363630643607000b7518569f67b5df"
+
+static int      g_offline        = 0;   // conf offline=
+static uint32_t g_off_vendor_net = 0;   // 60.204.159.47（网络序）
+static uint8_t  g_off_R[32];            // 设备最近一次 SecKeyEncrypt 的 32B 明文
+static volatile int    g_off_R_ok = 0;
+static volatile long   g_off_n    = 0;  // 握手轮次（日志节流）
+
+/// 走 dlsym 拿 CommonCrypto（Agent 已导入 CCCrypt/CC_MD5，必然已加载 libcommonCrypto）
+static int off_md5(const uint8_t *in, size_t n, uint8_t out[16]) {
+    static int (*f)(const void *, size_t, void *) = NULL;
+    if (!f) f = (int (*)(const void *, size_t, void *))dlsym(RTLD_DEFAULT, "CC_MD5");
+    if (!f) return -1;
+    f(in, n, out);
+    return 0;
+}
+
+/// AES-128-CBC 加密，无 padding（明文长度必须是 16 的整数倍）
+static int off_aes_enc(const uint8_t key[16], const uint8_t iv[16],
+                       const uint8_t *in, size_t n, uint8_t *out, size_t *moved) {
+    static int (*f)(unsigned, unsigned, unsigned, const void *, size_t,
+                    const void *, const void *, size_t, void *, size_t,
+                    size_t *) = NULL;
+    if (!f)
+        f = (int (*)(unsigned, unsigned, unsigned, const void *, size_t,
+                     const void *, const void *, size_t, void *, size_t,
+                     size_t *))dlsym(RTLD_DEFAULT, "CCCrypt");
+    if (!f) return -1;
+    *moved = 0;
+    // op=0(encrypt) alg=0(AES128) options=0(无填充)
+    return f(0, 0, 0, key, 16, iv, in, n, out, n, moved);
+}
+
+static int off_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/// 生成 32B 会话材料（厂商不校验内容，任意值均可）
+static void off_make_m_buf(uint8_t *out) {
+    arc4random_buf(out, 32);
+}
+
+/// 80B 明文（厂商应答原文，逐字节实测解密所得）
+static const uint8_t *off_plain80(void) {
+    static uint8_t plain[80];
+    static int     ok = 0;
+    if (ok == 1) return plain;
+    if (ok < 0)  return NULL;
+    const char *h = OFF_RESP80_HEX;
+    size_t i;
+    for (i = 0; i < 80; i++) {
+        int hi = off_hexval(h[i * 2]), lo = off_hexval(h[i * 2 + 1]);
+        if (hi < 0 || lo < 0) { ok = -1; bs_log("[off] bad RESP80 hex"); return NULL; }
+        plain[i] = (uint8_t)((hi << 4) | lo);
+    }
+    ok = 1;
+    return plain;
+}
+
+/// 桩工作线程：完全按实测的 262 → 38 → 208 → 80 → 16 顺序对答。
+///   ★ 跑在 socketpair 的另一个端点上，Agent 的 select/poll 行为与真连接一致。
+static void *off_worker(void *arg) {
+    int s = (int)(intptr_t)arg;
+    uint8_t acc[1024];
+    size_t  accn = 0;
+    int     want = 262;
+    uint8_t m[32];
+    int     round = 0;
+
+    for (;;) {
+        if (accn < (size_t)want) {
+            ssize_t n = recv(s, acc + accn, sizeof(acc) - accn, 0);
+            if (n <= 0) { bs_log("[off] stub conn closed (n=%zd)", n); break; }
+            accn += (size_t)n;
+            continue;
+        }
+        if (want == 262) {
+            round++;
+            if (!g_off_R_ok) {
+                bs_log("[off] no R captured yet, reply with zero material");
+                memset(g_off_R, 0, 32);
+            }
+            off_make_m_buf(m);
+            uint8_t r[38];
+            r[0] = 0x26; r[1] = 0x00; r[2] = 0x00;
+            r[3] = 0x00; r[4] = 0x01; r[5] = 0x00;
+            memcpy(r + 6, m, 32);
+            if (send(s, r, 38, 0) != 38) { bs_log("[off] send 38 failed"); break; }
+            bs_log("[off] #%d 262 -> 38 (M=%02x%02x%02x%02x..)", round,
+                   m[0], m[1], m[2], m[3]);
+            accn = 0; want = 208;
+        } else if (want == 208) {
+            const uint8_t *p80 = off_plain80();
+            uint8_t key[16], iv[16], out[80];
+            size_t  moved = 0;
+            if (!p80) break;
+            if (off_md5(g_off_R, 32, key) != 0 || off_md5(m, 32, iv) != 0) {
+                bs_log("[off] md5 unavailable"); break;
+            }
+            if (off_aes_enc(key, iv, p80, 80, out, &moved) != 0 || moved != 80) {
+                bs_log("[off] aes fail moved=%zu", moved); break;
+            }
+            if (send(s, out, 80, 0) != 80) { bs_log("[off] send 80 failed"); break; }
+            bs_log("[off] #%d 208 -> 80 (auth ok)", round);
+            accn = 0; want = 16;
+        } else {                                  // want == 16
+            bs_log("[off] #%d 16 = accepted, vendor chain fully bypassed", round);
+            accn = 0; want = 262;
+        }
+    }
+    close(s);
+    return NULL;
+}
+
+/// 把 fd 换成 socketpair 端点并起桩线程。connect 替身返回 0 后由它接管。
+static void off_start(int fd) {
+    if (fd < 0) return;
+    if (!g_off_vendor_net) g_off_vendor_net = inet_addr(STAT_VENDOR_IP);
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        bs_log("[off] socketpair fail errno=%d", errno);
+        return;
+    }
+    if (dup2(sv[0], fd) < 0) {
+        bs_log("[off] dup2 fail errno=%d", errno);
+        close(sv[0]); close(sv[1]);
+        return;
+    }
+    close(sv[0]);
+    pthread_t th;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    int rc = pthread_create(&th, &at, off_worker, (void *)(intptr_t)sv[1]);
+    pthread_attr_destroy(&at);
+    if (rc != 0) {
+        bs_log("[off] pthread_create fail rc=%d", rc);
+        close(sv[1]);
+    }
+}
+
 // ★ v6.7：落盘后自动重启（conf autoreload=，默认开）
 static int           g_autoreload   = 1;
 // ★ v6.17：func-nil 崩溃自动恢复（conf crashresume=，默认开）
@@ -1219,6 +1381,17 @@ static void bs_load_conf(void) {
             // ★ v6.24s：server2 改道目标（离线兜底）。格式 ip[:port] / off / vendor。
             //   优先级低于 /hb 下发：心跳每拍会覆盖本值（含 off 清空）。
             bs_s2_apply(v, "conf");
+        }
+        else if (!strcmp(k, "offline")) {
+            // ★ v6.25：真离线开关。1=进程内接管 server2（不连厂商）；0=照常直连。
+            //   默认 0，现网设备不受影响；开启后 s2 改道优先（有 s2 仍走 s2）。
+            int on = atoi(v) ? 1 : 0;
+            if (on != g_offline) {
+                g_offline = on;
+                bs_log("[off] offline=%d (%s)", on,
+                       on ? "server2 fully in-process, zero vendor traffic"
+                          : "vendor passthrough");
+            }
         }
         else if (!strcmp(k, "cardval")) {
             // ★ v6.21：手动卡密（兜底通道）——getter/日志捕获均无卡时用它激活
@@ -4442,6 +4615,26 @@ static int bs_hook_connect(int fd, const struct sockaddr *addr, socklen_t len) {
                            port, g_s2_ip, g_s2_port, g_s2_src, n);
                 return g_orig_connect(fd, (struct sockaddr *)&a, sizeof(a));
             }
+            // ★★★★ v6.25：真离线 —— offline=1 且没有 s2 改道时，直接把这条连接
+            //   标成"已连上"并交给 send/recv 伪造应答。一个字节都不出去。
+            else if (port == S2_DEF_PORT && !g_s2_net && g_offline) {
+                off_start(fd);
+                bs_log("[off] connect " STAT_VENDOR_IP ":%d intercepted -> in-proc stub",
+                       port);
+                return 0;
+            }
+        }
+    }
+    // ★ v6.25：旧厂商地址 43.154.19.236:7891 同样接管（offline 时）
+    if (g_offline && addr && addr->sa_family == AF_INET) {
+        struct sockaddr_in a;
+        memcpy(&a, addr, sizeof(a));
+        if (a.sin_addr.s_addr == g_vps_ip_net &&
+            (int)ntohs(a.sin_port) == S2_DEF_PORT && !g_s2_net) {
+            off_start(fd);
+            bs_log("[off] connect " VPS_IP_STR ":%d intercepted -> in-proc stub",
+                   S2_DEF_PORT);
+            return 0;
         }
     }
     // ★ v6.24s：43.154.19.236:7891（旧厂商地址，业务端口已不可用）在 s2 有效时
@@ -4502,6 +4695,31 @@ static int bs_hook_getaddrinfo(const char *node, const char *service,
     return g_orig_getaddrinfo(node, service, hints, res);
 }
 
+// ★★★★ v6.25：SecKeyEncrypt 替身 —— 只为把 32B 明文 R 抄下来。
+//   262B 握手包里 R 是 RSA 密文，桩解不开；但加密前它就在寄存器/内存里明文躺着，
+//   在进程内抄一份给桩用，是唯一不需要私钥的路。抄完立刻交回原函数，零副作用。
+static int (*g_orig_skenc)(void *, int, const uint8_t *, size_t, uint8_t *, size_t *);
+static int      g_skenc_hit = 0;
+
+static int bs_hook_seckeyencrypt(void *key, int padding, const uint8_t *plain,
+                                 size_t plen, uint8_t *cipher, size_t *clen) {
+    if (g_offline && plain && plen == 32) {
+        memcpy(g_off_R, plain, 32);
+        g_off_R_ok = 1;
+        if (!g_skenc_hit) {
+            g_skenc_hit = 1;
+            bs_log("[off] R captured %02x%02x%02x%02x..%02x%02x%02x%02x (pad=%d)",
+                   plain[0], plain[1], plain[2], plain[3],
+                   plain[28], plain[29], plain[30], plain[31], padding);
+        }
+    }
+    if (!bs_orig_fn("SecKeyEncrypt", (void **)&g_orig_skenc)) {
+        errno = ENOSYS;
+        return -1;
+    }
+    return g_orig_skenc(key, padding, plain, plen, cipher, clen);
+}
+
 static void bs_install_net_block(void) {
     if (g_blk_installed) return;
     g_vps_ip_net = inet_addr(VPS_IP_STR);
@@ -4535,6 +4753,9 @@ static void bs_install_net_block(void) {
 
 BS_INTERPOSE(bs_hook_connect, connect);
 BS_INTERPOSE(bs_hook_getaddrinfo, getaddrinfo);
+// ★ v6.25：真离线。Security.framework 必然存在（Agent 已导入 SecKeyEncrypt），
+//   CI 需加 -framework Security 才能链接到该符号。
+BS_INTERPOSE(bs_hook_seckeyencrypt, SecKeyEncrypt);
 
 /// ★ v6.19：constructor 立即起的安装线程 —— 赶在 Agent 首次外联之前。
 ///   不等 bootstrap 的 2s sleep：自己快扫 conf 的 mode=/blockvps=（毫秒级纯 C）。

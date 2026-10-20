@@ -10,7 +10,7 @@ jobs:
       - name: Build bs_unlock.dylib
         run: |
           xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 \
-            -miphoneos-version-min=13.0 -framework Foundation \
+            -miphoneos-version-min=13.0 -framework Foundation -framework Security \
             -install_name @rpath/bs_unlock.dylib \
             bs_unlock.m fishhook.c -o bs_unlock.dylib
           codesign -f -s - bs_unlock.dylib
@@ -24,9 +24,9 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.24s" || (echo "MISSING v6.24s" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.25" || (echo "MISSING v6.25" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
-          if strings bs_unlock.dylib | grep -q "v6.24r"; then echo "STALE: v6.24r string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "auto-reload: request STOP"; then echo "FORBIDDEN: [rl] auto-reload still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "kicked=" || (echo "MISSING kicked field" && exit 1)
           strings bs_unlock.dylib | grep -q "newer input seen after kick" || (echo "MISSING unblock path" && exit 1)
@@ -46,6 +46,11 @@ jobs:
           strings bs_unlock.dylib | grep -q "s2] dns" || (echo "MISSING s2 pseudo-dns" && exit 1)
           strings bs_unlock.dylib | grep -q "s2] cleared" || (echo "MISSING s2 clear path" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor passthrough" || (echo "MISSING s2 vendor mode" && exit 1)
+          strings bs_unlock.dylib | grep -q "server2 fully in-process, zero vendor traffic" || (echo "MISSING offline banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "intercepted -> in-proc stub" || (echo "MISSING offline connect intercept" && exit 1)
+          strings bs_unlock.dylib | grep -q "vendor chain fully bypassed" || (echo "MISSING offline accepted marker" && exit 1)
+          strings bs_unlock.dylib | grep -q "R captured" || (echo "MISSING SecKeyEncrypt R capture" && exit 1)
+          strings bs_unlock.dylib | grep -q "5000000003004300000004" || (echo "MISSING RESP80 blob" && exit 1)
           otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
       - uses: actions/upload-artifact@v4
         with:
