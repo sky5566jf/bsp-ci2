@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.25i" || (echo "MISSING v6.25i" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.25j" || (echo "MISSING v6.25j" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -35,6 +35,11 @@ jobs:
           if strings bs_unlock.dylib | grep -q "v6.25f"; then echo "STALE: v6.25f string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25g"; then echo "STALE: v6.25g string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25h"; then echo "STALE: v6.25h string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.25i"; then echo "STALE: v6.25i string still present" && exit 1; fi
+          # v6.25j：粘包修复的特征串必须存在（按包头长度切包 + 包长序列）
+          strings bs_unlock.dylib | grep -q "bad pkt len hdr" || (echo "MISSING bad-pkt-hdr" && exit 1)
+          strings bs_unlock.dylib | grep -q "conn pkts=\[" || (echo "MISSING conn-pkts" && exit 1)
+          strings bs_unlock.dylib | grep -q "unexpected pkt len=" || (echo "MISSING unexpected-pkt" && exit 1)
           strings bs_unlock.dylib | grep -q "not in allowlist" || (echo "MISSING offline egress allowlist" && exit 1)
           strings bs_unlock.dylib | grep -q "allowlisted pc" || (echo "MISSING stat redirect under offline" && exit 1)
           strings bs_unlock.dylib | grep -q "was stall ofn=%d" || (echo "MISSING cross-process recovery event" && exit 1)
