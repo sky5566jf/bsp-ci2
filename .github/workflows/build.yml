@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.26" || (echo "MISSING v6.26" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.27" || (echo "MISSING v6.27" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -37,6 +37,11 @@ jobs:
           if strings bs_unlock.dylib | grep -q "v6.25h"; then echo "STALE: v6.25h string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25i"; then echo "STALE: v6.25i string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25j"; then echo "STALE: v6.25j string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.26"; then echo "STALE: v6.26 string still present" && exit 1; fi
+          # v6.27：密文包长度自适应（厂商包首 4 字节 = 明文总长，208 只是其中一种，
+          # 实测同一批客户端有发 192 的 —— 硬等 208 会 30s 超时 auth failed）
+          strings bs_unlock.dylib | grep -q "cmd pkt len=" || (echo "MISSING autolen log" && exit 1)
+          strings bs_unlock.dylib | grep -q "hdr probe fail" || (echo "MISSING probe-fail log" && exit 1)
           # v6.26：设备码本地持久化兜底（杜绝字面量 unknown 造成多机共享 ID）
           strings bs_unlock.dylib | grep -q ".bs_devid" || (echo "MISSING bs_devid path" && exit 1)
           strings bs_unlock.dylib | grep -q "src=local-gen" || (echo "MISSING local-gen devid" && exit 1)

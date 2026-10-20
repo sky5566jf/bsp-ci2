@@ -827,7 +827,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.26"
+#define BS_DYLIB_VER       "v6.27"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1303,7 +1303,7 @@ static int off_aes_dec(const uint8_t key[16], const uint8_t iv[16],
 ///
 /// 命中判据 4 字节全等，误判概率 1/2^32，实测 8 轮全部一次命中。
 static int off_recover_key(const uint8_t *ct, size_t ctlen, const uint8_t m[32],
-                           uint8_t key_out[16]) {
+                           uint8_t key_out[16], size_t expect_len) {
     uint8_t iv[16], r[32], dec[32];
     size_t  moved = 0;
     int     b;
@@ -1316,10 +1316,41 @@ static int off_recover_key(const uint8_t *ct, size_t ctlen, const uint8_t m[32],
         if (off_md5(r, 32, key_out) != 0) return -1;
         if (off_aes_dec(key_out, iv, ct, 16, dec, &moved) != 0 || moved != 16)
             continue;
-        if (dec[0] == 0xd0 && dec[1] == 0x00 && dec[2] == 0x00 && dec[3] == 0x00) {
+        // ★ v6.27：命中判据参数化 —— 明文首 4 字节 = 明文总长（小端），
+        //   208 只是其中一种；实测还有 192。3 个高位字节必须为 0。
+        if (expect_len > 0 && expect_len < 256 &&
+            dec[0] == (uint8_t)(expect_len & 0xff) &&
+            dec[1] == 0x00 && dec[2] == 0x00 && dec[3] == 0x00) {
             bs_log("[off] key recovered (R=0x%02x x32, key=%02x%02x%02x%02x)",
                    b, key_out[0], key_out[1], key_out[2], key_out[3]);
             return 0;
+        }
+    }
+    return -1;
+}
+
+/// ★ v6.27：从密文首块探测明文包长（自适应 192/208/…）。
+///
+/// 厂商包是自描述 TLV：明文首 4 字节 = 明文总长（小端）。key = MD5(R)，
+/// 而实测 R 恒为单字节重复的 32 字节 → 只有 256 种可能，逐个试解首块即可。
+/// 判据放宽到「3 个高位字节为 0 且首字节 32..255」（因为此时还不知道长度，
+/// 不能像 off_recover_key 那样比对具体值）；误判概率约 2^-24，可忽略。
+///
+/// 返回明文长度（>=32），失败 -1。成功时 key_out 填好，后续解密直接复用。
+static int off_probe_len(const uint8_t *ct, const uint8_t m[32], uint8_t key_out[16]) {
+    uint8_t iv[16], r[32], dec[16];
+    size_t  moved = 0;
+    int     b;
+    if (off_md5(m, 32, iv) != 0) return -1;
+    for (b = 0; b < 256; b++) {
+        memset(r, (uint8_t)b, 32);
+        if (off_md5(r, 32, key_out) != 0) return -1;
+        if (off_aes_dec(key_out, iv, ct, 16, dec, &moved) != 0 || moved != 16)
+            continue;
+        if (dec[1] == 0x00 && dec[2] == 0x00 && dec[3] == 0x00 &&
+            dec[0] >= 32) {
+            bs_log("[off] pkt len probed=%d (R=0x%02x x32)", (int)dec[0], b);
+            return (int)dec[0];
         }
     }
     return -1;
@@ -1406,6 +1437,11 @@ static void *off_worker(void *arg) {
     int     naccept = 0;
     char    seq[200];
     int     cur = 0;
+    // ★ v6.27：密文包长度自适应
+    int     needhdr  = 0;          // 1 = 刚回完 38，等首块探包长
+    int     in_cmd   = 0;          // 1 = 当前 want 是探出来的密文包长度
+    int     probefail = 0;         // 1 = 探测失败已回退 208
+    uint8_t ck[16];                // 探测阶段算出的 AES key（复用到解密）
 
     // ★★★ v6.25j：**只改一处** —— 消费式缓冲，修「粘包尾巴被整块丢弃」
     //
@@ -1430,6 +1466,41 @@ static void *off_worker(void *arg) {
     //     38(2600)、16(1000) 三个明文包的首 2 字节才等于长度。
     //     所以包类型只能由状态机 want 判断，长度头仅用于诊断打印。
     for (;;) {
+        // ★★★ v6.27：密文包长度自适应（本条是 v6.25j 之后剩下的活）
+        //
+        //   厂商请求包是**自描述 TLV**：明文首 4 字节 = 明文总长（小端）。
+        //   实证：应答模板 OFF_RESP80_HEX 首 4 字节 = 50 00 00 00 = 80；
+        //         请求包 208 的首 4 字节 = d0 00 00 00 = 208。
+        //   所以 208 只是**其中一种长度**。实测同一批客户端还有发 192 的：
+        //     [off] stub conn closed (n=0 want=208 accn=192)
+        //   桩硬等 208 → 永远凑不齐 → 客户端 30s 后 recv auth failed → 脚本停。
+        //   统计（86 台有该日志的设备）：208/192 的设备 auth_failed 37~38 次，
+        //   262/0 的设备 0 次；与 iOS 版本无关（16.7.4~16.7.8 同样出现 192）。
+        //
+        //   做法：回完 38 先攒 16 字节首块 → 256 个 MD5(单字节×32) 试解 →
+        //         明文首 4 字节就是包长 → want 设为它。探不出才回退 208。
+        if (needhdr) {
+            if (accn >= 16) {
+                int L = off_probe_len(acc, m, ck);
+                if (L >= 32) {
+                    want = L;
+                    in_cmd = 1;
+                    needhdr = 0;
+                    bs_log("[off] #%d cmd pkt len=%d (autodetect)", round, L);
+                } else {
+                    bs_log("[off] !! hdr probe fail accn=%zu head=%02x%02x%02x%02x"
+                           "%02x%02x%02x%02x -> fallback 208",
+                           accn, acc[0], acc[1], acc[2], acc[3],
+                           acc[4], acc[5], acc[6], acc[7]);
+                    want = 208;
+                    in_cmd = 1;
+                    needhdr = 0;
+                    probefail = 1;
+                }
+                continue;           // 重新走循环：成功后立刻按新 want 处理
+            }
+            // accn < 16：首块还没齐，落到下面 recv
+        } else {
         // ① 状态机：凑够 want 就处理，处理完**只消费 want 字节**，剩余前移
         while (accn >= (size_t)want) {
             size_t plen = (size_t)want;          // 本包要消费的字节数
@@ -1449,39 +1520,45 @@ static void *off_worker(void *arg) {
                 if (send(s, r, 38, 0) != 38) { bs_log("[off] send 38 failed"); goto done; }
                 bs_log("[off] #%d 262 -> 38 (M=%02x%02x%02x%02x..)", round,
                        m[0], m[1], m[2], m[3]);
-                want = 208;
-            } else if (want == 208) {
+                // ★ v6.27：不再硬等 208 —— 先攒首块探真实包长
+                want = 16;
+                needhdr = 1;
+            } else if (in_cmd) {
                 const uint8_t *p80 = off_plain80();
-                uint8_t key[16], iv[16], out[80];
-                uint8_t pkt[208];
+                uint8_t iv[16], out[80];
+                uint8_t pkt[512];
+                size_t  cl = (size_t)want;      // ★ v6.27：实际包长（192/208/…）
                 size_t  moved = 0;
                 // ★ v6.25e：80B 应答模板解析不出来 = 固化的 TLV 结构不再成立 -> 协议级异常
                 if (!p80) { proto_bad = 1; goto done; }
+                if (cl > sizeof(pkt)) { proto_bad = 1; goto done; }
                 // 精确抠出这一包（缓冲里可能还躺着下一包，不能直接把 acc 当整包）
-                memcpy(pkt, acc, 208);
-                // ① 首选：从 208B 的已知明文头反推 key（不依赖任何 hook）
-                if (off_recover_key(pkt, 208, m, key) != 0) {
+                memcpy(pkt, acc, cl);
+                // ① 首选：从明文首 4 字节（= 包长小端）反推 key（不依赖任何 hook）
+                //    ★ v6.27：包长作参数传入；探测阶段已算出的 ck 会先被这次覆盖/校验
+                if (off_recover_key(pkt, cl, m, ck, cl) != 0) {
                     // ★ v6.25e：厂商那块「已知明文头」不再能反推 key -> 协议级异常
                     proto_bad = 1;
                     // ② 退路：用 SecKeyEncrypt 抄到的 R
                     if (g_off_R_ok) {
-                        memset(key, 0, 16);
-                        if (off_md5(g_off_R, 32, key) == 0)
+                        memset(ck, 0, 16);
+                        if (off_md5(g_off_R, 32, ck) == 0)
                             bs_log("[off] key from captured R (brute failed)");
                     } else {
-                        memset(key, 0, 16);
+                        memset(ck, 0, 16);
                         bs_log("[off] !! no key at all, reply will not decrypt");
                     }
                 }
                 if (off_md5(m, 32, iv) != 0) { bs_log("[off] md5 unavailable"); goto done; }
-                if (off_aes_enc(key, iv, p80, 80, out, &moved) != 0 || moved != 80) {
+                if (off_aes_enc(ck, iv, p80, 80, out, &moved) != 0 || moved != 80) {
                     proto_bad = 1;   // ★ v6.25e：加密都走不通 -> 协议级异常
                     bs_log("[off] aes fail moved=%zu", moved); goto done;
                 }
                 if (send(s, out, 80, 0) != 80) { bs_log("[off] send 80 failed"); goto done; }
-                bs_log("[off] #%d 208 -> 80 (auth ok)", round);
+                bs_log("[off] #%d %zu -> 80 (auth ok)", round, cl);
                 want = 16;
-            } else {                                  // want == 16
+                in_cmd = 0;
+            } else {                                  // want == 16（accepted 包）
                 // ★ v6.25d：走到这里 = 授权链路全通，清掉失败连击
                 naccept++;
                 __sync_fetch_and_add(&g_off_n_ok, 1);
@@ -1515,6 +1592,7 @@ static void *off_worker(void *arg) {
             memmove(acc, acc + plen, accn - plen);
             accn -= plen;
         }
+        }   // ★ v6.27：else 结束（needhdr 分支的另一半）
 
         // ② 收更多数据
         if (accn >= sizeof(acc)) {          // 缓冲满还凑不出完整包 -> 异常
@@ -1547,7 +1625,8 @@ done:
         for (int i = 0; i < nplen && cur < (int)sizeof(seq) - 12; i++)
             cur += snprintf(seq + cur, sizeof(seq) - cur, "%s%d:%04x",
                             i ? "," : "", plens[i], (unsigned)phdr[i]);
-        bs_log("[off] conn pkts=[%s] accept=%d", seq, naccept);
+        bs_log("[off] conn pkts=[%s] accept=%d%s", seq, naccept,
+               probefail ? " PROBE_FAIL" : "");
     }
     // ★ v6.25d：连接结束。★ v6.25e：**只有 proto_bad 才计入连击** ——
     //   「客户端主动断开」「只走两跳就关」「连接被上游取消」都是正常形态，
