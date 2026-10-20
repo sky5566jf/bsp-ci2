@@ -383,6 +383,11 @@
 //       统计自动落到他电脑，无需 conf 再填 statip。
 //
 // v6.24p ★★★ 删除一切「自动运行脚本」（2026-10-20，用户指令：除「脚本本来在跑」
+// v6.24q ★★★ 补上 v6.24p 核对发现的唯一遗漏窗口：[rl] reload 的 STOP→START 之间
+//       用户点停止时 1->0 判定被 g_reload_busy 屏蔽、闸门写不进 → st 归零后仍会
+//       START。修法：RL_WAIT_ZERO 每拍 START 前直接查 agent.log 停止痕迹
+//       （agent stop script / begin process stop script msg），查到即 abort 不 START。
+//       reload 自身发的 OPER_STOP 直调产品函数不留痕迹，正常 reload 不受影响。
 //       与「中控手动下发运行」外，其余一律不得自动运行脚本）：
 //       ① [hg] 假运行看门狗（v6.24m/n）整块删除 —— OPER_STOP→OPER_START 自动重启；
 //       ② [cr] 崩溃签名自动 OPER_START 删除 —— 崩溃只落证据 + 节流日志，原地停住等人点；
@@ -796,7 +801,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.24p"
+#define BS_DYLIB_VER       "v6.24q"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3848,11 +3853,25 @@ static void *bs_watchdog(void *arg) {
         }
         if (rl_phase == RL_WAIT_ZERO) {
             if (st == 0) {
+                // ★ v6.24q：reload 窗口内用户可能刚点了停止 —— 1->0 判定被 g_reload_busy
+                //   屏蔽（v6.24p 删除 hg_busy_until 后仍如此），写不了 .bs_userstop，
+                //   us_latched 也不会置位。START 前直接查 agent.log 停止痕迹兜底：
+                //   中控停止必打 `agent stop script` / `begin process stop script msg`，
+                //   而本 reload 自己发的 OPER_STOP 是直调产品函数、不走 agent 消息
+                //   通道，不会留停止痕迹 → 不会误伤正常 reload。
+                char alp[300];
+                snprintf(alp, sizeof(alp), "%s/log/agent.log", DATA_DIR);
+                if (us_latched || bs_last_stop_is_user(alp, 262144)) {
+                    bs_log("[rl] user stop seen during reload -> abort (no START)");
+                    rl_phase = RL_IDLE;
+                    g_reload_busy = 0;
+                    g_rl_ver[0] = 0;
+                }
                 // ★ v6.8：START 前必须确认 verwatch 已把「盘上版本」的密钥注入
                 //   （g_mh_ver == g_rl_ver）。不等的话脚本会拿旧键解新包 → 解密失败
                 //   → 16s 超时白折腾（09-28 .45 实测事故：START 比键注入早了 20s）。
                 //   verwatch tick=3s；云端缺键时它自带 30s 节流，所以给足 60s。
-                if (g_rl_ver[0] && strcmp(g_mh_ver, (const char *)g_rl_ver) != 0) {
+                else if (g_rl_ver[0] && strcmp(g_mh_ver, (const char *)g_rl_ver) != 0) {
                     if (++rl_wait >= RL_KEY_TICKS) {
                         bs_log("[rl] key %s not injected after %ds (have '%s') -> abort reload",
                                g_rl_ver, RL_KEY_TICKS * WD_TICK_SECS,
