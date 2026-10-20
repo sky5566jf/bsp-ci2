@@ -691,6 +691,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #include <sys/sysctl.h>  // ★ v6.10：设备名/型号/系统版本上报
 #include <dlfcn.h>       // ★ v6.20：dlsym 解析 Agent 卡密 getter
 #include <sys/socket.h>  // ★ v6.19：厂商服务器进程内屏蔽
+#include <sys/time.h>    // ★ v6.25e：SO_RCVTIMEO 的 struct timeval（桩接收超时）
 #include <netinet/in.h>  // ★ v6.19
 #include <arpa/inet.h>   // ★ v6.19：inet_addr/ntohs
 #include <netdb.h>       // ★ v6.19：getaddrinfo/EAI_NONAME
@@ -826,7 +827,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25d"
+#define BS_DYLIB_VER       "v6.25e"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1059,15 +1060,34 @@ static int           g_so_tick = SO_SYNC_TICK_SECS;
 //   厂商哪天改了握手包长或 TLV 结构，桩会卡住 → 授权拿不到 → 设备**中控整机
 //   不上线**。这比「脚本挂」严重得多（脚本挂了至少中控还看得见设备），而现场
 //   完全看不出原因，只能一台台 SSH 上去翻日志。
-// 判据（单值、无误报来源）：正常每 15~20s 一轮且必走到 `16 = accepted`；
-//   连续 N 轮连接结束都没走到 accepted = 协议变了。
+// 判据（★ v6.25e 修正，见下）：只数**协议级异常**，不数「连接没走完」。
 // 打点：off_start 记分母（g_off_n_stub），off_worker 到 16 记分子（g_off_n_ok）
-//   并清零 g_off_fail_run；线程 6 个 break 出口统一在 close 前判「本次没 accepted」，
+//   并清零 g_off_fail_run；只有 proto_bad=1 的 break 才计入连击，
 //   连击达 g_offstall（conf offstall=，默认 5 ≈ 100s）置 g_off_stall 并写 bs_evt.log。
 // 上报：/hb query 追加 &of=ok|stall&ofn=<连击数>，服务端设备表标红。
 //   ★ 只在 offline=1 时带 —— 透传设备没有桩，带这个字段会污染设备表。
 // 恢复：下一次 accepted 自动清零并写 `[off] ★ recovered`，红标随之消失。
 // 零新线程、零新 CSS、与老 dylib/老服务端双向兼容（字段缺失即不显示）。
+//
+// ----------------------------------------------------------------
+// ★ v6.25e：修正 v6.25d 的误报来源 + 修桩线程 fd 泄漏（2026-10-21 实测）
+// ----------------------------------------------------------------
+// 实测发现 v6.25d 的判据「本轮没走到 accepted」**不是**协议变更的干净信号，
+//   因为它把三种完全正常的情况也算成失败：
+//     a) 客户端连上、什么都没发就关闭（`stub conn closed (n=0)`）—— 连接被上游取消；
+//     b) 客户端只走 262→208 两跳、不走到 16 就关闭 —— 密钥刷新根本不需要第三步；
+//     c) 进程/脚本重启瞬间的连续短连接。
+//   真机日志回放：历史最长连击 9 次，全部由上面三种构成 → 阈值 5 会误报。
+//   故改为：只在**协议级异常**处置 proto_bad，仅 proto_bad 计入连击：
+//     · off_plain80() 返回 NULL   —— 固化的 80B 应答模板解析失败（TLV 结构变了）
+//     · aes fail                  —— key/iv 与厂商侧的期望对不上
+//     · 208B 明文头反推 key 失败  —— 厂商那块「已知明文头」不再成立
+//   这四处任一长期反复出现，才是「厂商真的改了协议」。
+// 同时修 fd/线程泄漏：客户端发完 262 收到 38 后，某些状态（如卡密闸门已开）会
+//   **既不发 208 也不关闭**，worker 永久阻塞在 recv —— 实测 28 个连接卡死在此，
+//   每轮泄漏一个 socketpair fd + 一个线程。现在给桩 fd 加 OFF_IDLE_TIMEOUT（90s）
+//   接收超时，超时即收尾关闭；超时记为 abort（不计数），只有 proto_bad 才计数。
+#define OFF_IDLE_TIMEOUT   90      // 桩接收空闲超时（秒）。实测跳间 RTT < 50ms，90s 极宽松
 #define OFF_RESP80_HEX                                                        \
     "500000000300430000000400000107000100000000060002736a7a"                  \
     "080003332e312e3023000a34326336393731656162646337326335303665333663656538"\
@@ -1084,12 +1104,11 @@ static volatile int    g_off_R_ok = 0;
 static char     g_off_devid[33];        // 本机 32 hex 设备码（填进 80B 应答）
 
 // ★ v6.25d：协议变更哨兵 —— 厂商若改握手包长/TLV 结构，桩会卡住拿不到授权，
-//   设备表现为「中控整机不上线」，且现场完全看不出原因。判据很单值：
-//   正常每 15~20s 一轮且必走到 `16 = accepted`；连续 N 轮没走到 = 协议变了。
-//   计数器在 off_worker 里打点，bs_devinfo_query 里读出带进 /hb，零新线程。
+//   设备表现为「中控整机不上线」，且现场完全看不出原因。
+//   ★ v6.25e：判据改为「连续 N 次协议级异常」（见上方说明），计数器零新线程。
 static volatile long g_off_n_stub   = 0;  // 累计 connect 被拦截次数
 static volatile long g_off_n_ok     = 0;  // 累计 16 = accepted 次数
-static volatile int  g_off_fail_run = 0;  // 连续未 accepted 的连接数（告警判据）
+static volatile int  g_off_fail_run = 0;  // 连续协议级异常次数（★v6.25e 告警判据）
 static volatile int  g_off_stall    = 0;  // 1 = 当前处于告警态
 static int           g_offstall     = 5;  // conf offstall= 阈值（2..60）
 static long          g_off_last_bad = 0;  // 最近一次异常时间戳
@@ -1280,12 +1299,22 @@ static void *off_worker(void *arg) {
     int     want = 262;
     uint8_t m[32];
     int     round = 0;
-    int     accepted = 0;      // ★ v6.25d：本连接是否走到 16 = accepted
+    int     proto_bad = 0;     // ★ v6.25e：本次是否出现协议级异常（只有它计入连击）
 
     for (;;) {
         if (accn < (size_t)want) {
             ssize_t n = recv(s, acc + accn, sizeof(acc) - accn, 0);
-            if (n <= 0) { bs_log("[off] stub conn closed (n=%zd)", n); break; }
+            if (n <= 0) {
+                // ★ v6.25e：SO_RCVTIMEO 到点会返回 -1/EAGAIN。客户端发完 262 收到 38
+                //   后「既不发 208 也不关闭」的状态实测存在（卡密闸门已开时），
+                //   以前 worker 永久阻塞 → fd+线程泄漏。现在超时即收尾，且**不计数**。
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                    bs_log("[off] stub idle %ds -> close (want=%d got=%d)",
+                           OFF_IDLE_TIMEOUT, want, (int)accn);
+                else
+                    bs_log("[off] stub conn closed (n=%zd)", n);
+                break;
+            }
             accn += (size_t)n;
             continue;
         }
@@ -1304,9 +1333,12 @@ static void *off_worker(void *arg) {
             const uint8_t *p80 = off_plain80();
             uint8_t key[16], iv[16], out[80];
             size_t  moved = 0;
-            if (!p80) break;
+            // ★ v6.25e：80B 应答模板解析不出来 = 固化的 TLV 结构不再成立 → 协议级异常
+            if (!p80) { proto_bad = 1; break; }
             // ① 首选：从 208B 的已知明文头反推 key（不依赖任何 hook）
             if (off_recover_key(acc, accn, m, key) != 0) {
+                // ★ v6.25e：厂商那块「已知明文头」不再能反推 key → 协议级异常
+                proto_bad = 1;
                 // ② 退路：用 SecKeyEncrypt 抄到的 R
                 if (g_off_R_ok) {
                     memset(key, 0, 16);
@@ -1319,6 +1351,7 @@ static void *off_worker(void *arg) {
             }
             if (off_md5(m, 32, iv) != 0) { bs_log("[off] md5 unavailable"); break; }
             if (off_aes_enc(key, iv, p80, 80, out, &moved) != 0 || moved != 80) {
+                proto_bad = 1;   // ★ v6.25e：加密都走不通 → 协议级异常
                 bs_log("[off] aes fail moved=%zu", moved); break;
             }
             if (send(s, out, 80, 0) != 80) { bs_log("[off] send 80 failed"); break; }
@@ -1326,7 +1359,6 @@ static void *off_worker(void *arg) {
             accn = 0; want = 16;
         } else {                                  // want == 16
             // ★ v6.25d：走到这里 = 授权链路全通，清掉失败连击
-            accepted = 1;
             __sync_fetch_and_add(&g_off_n_ok, 1);
             g_off_fail_run = 0;
             if (g_off_stall) {
@@ -1339,15 +1371,15 @@ static void *off_worker(void *arg) {
             accn = 0; want = 262;
         }
     }
-    // ★ v6.25d：连接结束但没走到 accepted —— 可能是偶发断连，也可能是协议变了。
-    //   6 个 break 出口（recv<=0 / send 失败 / aes 失败 / p80 缺失等）集中在这里判，
-    //   连续 N 次才报，单次抖动不喧哗。
-    if (!accepted) {
+    // ★ v6.25d：连接结束。★ v6.25e：**只有 proto_bad 才计入连击** ——
+    //   「客户端主动断开」「只走两跳就关」「连接被上游取消」都是正常形态，
+    //   数它们只会误报（真机回放：历史最长连击 9 次全由这些构成）。
+    if (proto_bad) {
         int n = __sync_add_and_fetch(&g_off_fail_run, 1);
         g_off_last_bad = (long)time(NULL);
         if (n >= g_offstall && !g_off_stall) {
             g_off_stall = 1;
-            bs_evt("[off] ★ STALL %d consecutive rounds without accepted "
+            bs_evt("[off] ★ STALL %d consecutive protocol errors "
                    "(stub=%ld ok=%ld) -> vendor protocol likely changed",
                    n, g_off_n_stub, g_off_n_ok);
         }
@@ -1372,6 +1404,15 @@ static void off_start(int fd) {
         return;
     }
     close(sv[0]);
+    // ★ v6.25e：桩端接收超时。客户端发完 262、收到 38 后可能既不推进也不关闭
+    //   （实测卡密闸门已开时如此），没超时的话 worker 永久阻塞 → 每轮泄漏
+    //   一个 socketpair fd + 一个线程。超时后走 abort 分支收尾，不误判协议变更。
+    {
+        struct timeval tv;
+        tv.tv_sec  = OFF_IDLE_TIMEOUT;
+        tv.tv_usec = 0;
+        setsockopt(sv[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
     pthread_t th;
     pthread_attr_t at;
     pthread_attr_init(&at);
@@ -1602,8 +1643,9 @@ static void bs_load_conf(void) {
             g_so_tick = t;
         }
         else if (!strcmp(k, "offstall")) {
-            // ★ v6.25d：连续多少轮没走到 16=accepted 判为「厂商协议可能变了」
-            //   正常 15~20s 一轮，5 轮 ≈ 100s。clamp 2..60：写 0/1 会秒报警，
+            // ★ v6.25e：连续多少次**协议级异常**判为「厂商协议可能变了」。
+            //   （v6.25d 数的是「没走到 accepted」，会把正常短连接算进去 → 误报）
+            //   正常 15~20s 一轮，5 次 ≈ 100s。clamp 2..60：写 0/1 会秒报警，
             //   写太大则失去预警意义。
             int t = atoi(v);
             if (t < 2)  t = 2;
