@@ -36,10 +36,9 @@ jobs:
           if strings bs_unlock.dylib | grep -q "v6.25g"; then echo "STALE: v6.25g string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25h"; then echo "STALE: v6.25h string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25i"; then echo "STALE: v6.25i string still present" && exit 1; fi
-          # v6.25j：粘包修复的特征串必须存在（按包头长度切包 + 包长序列）
-          strings bs_unlock.dylib | grep -q "bad pkt len hdr" || (echo "MISSING bad-pkt-hdr" && exit 1)
+          # v6.25j：消费式缓冲修复的特征串（粘包尾巴不再被整块丢弃）
           strings bs_unlock.dylib | grep -q "conn pkts=\[" || (echo "MISSING conn-pkts" && exit 1)
-          strings bs_unlock.dylib | grep -q "unexpected pkt len=" || (echo "MISSING unexpected-pkt" && exit 1)
+          strings bs_unlock.dylib | grep -q "rx buffer full" || (echo "MISSING rx-buffer-full" && exit 1)
           strings bs_unlock.dylib | grep -q "not in allowlist" || (echo "MISSING offline egress allowlist" && exit 1)
           strings bs_unlock.dylib | grep -q "allowlisted pc" || (echo "MISSING stat redirect under offline" && exit 1)
           strings bs_unlock.dylib | grep -q "was stall ofn=%d" || (echo "MISSING cross-process recovery event" && exit 1)

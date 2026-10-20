@@ -1056,11 +1056,13 @@ static int           g_so_tick = SO_SYNC_TICK_SECS;
 // ----------------------------------------------------------------
 // ★ v6.25d：协议变更哨兵（2026-10-21）
 // ----------------------------------------------------------------
-// ★ v6.25j：状态机改为**按包头长度驱动 + 消费式缓冲**（首 2 字节小端 = 包总长）。
-//   旧版按硬编码 want（262/208/16）凑字节、用完 accn=0 丢剩余 → 262 与 208 粘包到达时
-//   208 被整包丢弃，桩等 208 永不至、客户端等 80 永不至，30s 后 recv auth failed。
+// ★ v6.25j：修 **消费式缓冲** —— 状态机 want(262/208/16) 不变，只是处理完一包后
+//   把剩余字节 memmove 前移，而不是 accn=0 整块丢弃。
+//   旧版 262 与 208 粘包到达（accn=470）时只认前 262，后半个 208 被丢进黑洞 →
+//   桩等 208 永不至、客户端等 80 永不至 → 30s 后 recv auth failed 并 close。
 //   实测 24 台受害机全部是这一形态（14ms 完成 262->38、30.0s closed(n=0)、无 idle）。
-// 风险：桩是**严格线性状态机**（pkt: 262 → 208 → 16 → 262），acc 只 1024B。
+//   ★ 不能用包头长度切包：208 是密文包，首字节随机（.216 实测 86d6/1521/43e0）。
+// 风险：桩是**严格线性状态机**（want: 262 → 208 → 16 → 262），acc 只 1024B。
 //   厂商哪天改了握手包长或 TLV 结构，桩会卡住 → 授权拿不到 → 设备**中控整机
 //   不上线**。这比「脚本挂」严重得多（脚本挂了至少中控还看得见设备），而现场
 //   完全看不出原因，只能一台台 SSH 上去翻日志。
@@ -1393,54 +1395,51 @@ static void *off_worker(void *arg) {
     int s = (int)(intptr_t)arg;
     uint8_t acc[1024];
     size_t  accn = 0;
+    int     want = 262;
     uint8_t m[32];
     int     round = 0;
     int     proto_bad = 0;     // ★ v6.25e：本次是否出现协议级异常（只有它计入连击）
-    // ★ v6.25j：诊断字段 —— 本连接实际收到的包长序列（最多 16 条）
-    int     plens[16];
+    // ★ v6.25j：诊断 —— 本连接逐包记录「长度:首2字节hex」，最多 16 条
+    int     plens[16];         // 期望长度（262/208/16）
+    unsigned short phdr[16];   // 该包实收前 2 字节（拼成 short，仅用于打印）
     int     nplen  = 0;
     int     naccept = 0;
-    char    seq[160];
+    char    seq[200];
     int     cur = 0;
-    arc4random_buf(m, 32);     // 首包就是 208 时 m 尚未生成，先给初值兜底
 
-    // ★★★ v6.25j：消费式收包 —— 修「粘包丢字节」
+    // ★★★ v6.25j：**只改一处** —— 消费式缓冲，修「粘包尾巴被整块丢弃」
     //
     //   旧逻辑（v6.25i 及以前）：
     //       if (accn < want) { n = recv(acc+accn, 1024-accn); accn += n; continue; }
-    //       ...处理...
-    //       accn = 0;                     ←←← 缓冲里剩下的字节被整块丢弃
-    //   其中 want 是硬编码的 262 / 208 / 16，纯靠「凑够多少字节」猜包类型。
+    //       ...处理这一包...
+    //       accn = 0;                     <<< 缓冲里剩下的字节被整块扔掉
     //
-    //   根因（2026-10-21 云端 74 台实测定位）：
-    //     客户端存在「262 与 208 在同一次 recv 到达」的时序（流水线写 / 单次 write）。
-    //     此时 accn = 262+208 = 470，旧逻辑只认前 262 → 回 38 → accn=0，
-    //     后半个 208 被丢进黑洞。于是桩永远等 208、客户端永远等 80，
-    //     30 秒后客户端打 `recv auth failed` 并 close，桩打 `stub conn closed (n=0)`。
-    //   实测证据（24 台受害机，逐条吻合）：
-    //     - 262 -> 38 只间隔 14ms（数据早已到达，不可能是「没发」）
-    //     - 每条连接恰好 30.0s 后 closed(n=0)（客户端超时主动关）
+    //   为什么必须改：客户端存在「262 与 208 在同一次 recv 到达」的时序
+    //   （流水线写 / 单次 write）。此时 accn = 262+208 = 470，旧逻辑只认前 262
+    //   -> 回 38 -> accn=0，后半个 208 被丢进黑洞。于是桩永远等 208、
+    //   客户端永远等 80，30 秒后客户端打 `recv auth failed` 并 close，
+    //   桩打 `stub conn closed (n=0)`。
+    //   实测证据（2026-10-21 云端 24 台受害机，逐条吻合）：
+    //     - `262 -> 38` 只间隔 14ms（数据早已到达，不是「没发」）
+    //     - 每条连接恰好 30.0s 后 `closed(n=0)`（客户端超时主动关）
     //     - 桩侧 `stub idle` 行 0 条（从未等到 90s 超时）
-    //     - 其余机器把 262 / 208 分两次写，同样版本同样包就正常 —— 时序相关
+    //     - 同版本同包，把 262/208 分两次写的机器全部正常 —— 纯粹是到达时序
     //
-    //   修法：包格式实测统一为「首 2 字节小端 = 包总长」
-    //     06 01 -> 262 (密钥请求) / d0 00 -> 208 (认证包) / 10 00 -> 16 (accepted)
-    //   按长度头切包、处理完 memmove 把剩余字节前移，绝不丢。
+    //   ★ 为什么不按包头长度切包：208 是**加密包**，首字节是密文，不是长度！
+    //     .216 真机实测 hdr=86d6 / 1521 / 43e0 完全随机；只有 262(0601)、
+    //     38(2600)、16(1000) 三个明文包的首 2 字节才等于长度。
+    //     所以包类型只能由状态机 want 判断，长度头仅用于诊断打印。
     for (;;) {
-        // ① 先把缓冲里所有「完整包」消费干净（可能一次 recv 里就有好几个）
-        for (;;) {
-            if (accn < 2) break;
-            size_t plen = (size_t)acc[0] | ((size_t)acc[1] << 8);
-            if (plen < 2 || plen > sizeof(acc)) {
-                proto_bad = 1;
-                bs_log("[off] bad pkt len hdr %02x %02x (accn=%zu)", acc[0], acc[1], accn);
-                goto done;
+        // ① 状态机：凑够 want 就处理，处理完**只消费 want 字节**，剩余前移
+        while (accn >= (size_t)want) {
+            size_t plen = (size_t)want;          // 本包要消费的字节数
+            if (nplen < (int)(sizeof(plens) / sizeof(plens[0]))) {
+                plens[nplen] = (int)plen;
+                phdr[nplen]  = (unsigned short)((acc[0] << 8) | acc[1]);
+                nplen++;
             }
-            if (accn < plen) break;              // 未收全 → 回到 ② 继续收
-            if (nplen < (int)(sizeof(plens) / sizeof(plens[0])))
-                plens[nplen++] = (int)plen;
 
-            if (plen == 262) {
+            if (want == 262) {
                 round++;
                 off_make_m_buf(m);
                 uint8_t r[38];
@@ -1450,18 +1449,19 @@ static void *off_worker(void *arg) {
                 if (send(s, r, 38, 0) != 38) { bs_log("[off] send 38 failed"); goto done; }
                 bs_log("[off] #%d 262 -> 38 (M=%02x%02x%02x%02x..)", round,
                        m[0], m[1], m[2], m[3]);
-            } else if (plen == 208) {
+                want = 208;
+            } else if (want == 208) {
                 const uint8_t *p80 = off_plain80();
                 uint8_t key[16], iv[16], out[80];
                 uint8_t pkt[208];
                 size_t  moved = 0;
-                // ★ v6.25e：80B 应答模板解析不出来 = 固化的 TLV 结构不再成立 → 协议级异常
+                // ★ v6.25e：80B 应答模板解析不出来 = 固化的 TLV 结构不再成立 -> 协议级异常
                 if (!p80) { proto_bad = 1; goto done; }
-                // 从缓冲里精确抠出这一包（后面可能还有别的包，不能直接把 acc 当整包用）
+                // 精确抠出这一包（缓冲里可能还躺着下一包，不能直接把 acc 当整包）
                 memcpy(pkt, acc, 208);
                 // ① 首选：从 208B 的已知明文头反推 key（不依赖任何 hook）
                 if (off_recover_key(pkt, 208, m, key) != 0) {
-                    // ★ v6.25e：厂商那块「已知明文头」不再能反推 key → 协议级异常
+                    // ★ v6.25e：厂商那块「已知明文头」不再能反推 key -> 协议级异常
                     proto_bad = 1;
                     // ② 退路：用 SecKeyEncrypt 抄到的 R
                     if (g_off_R_ok) {
@@ -1475,22 +1475,21 @@ static void *off_worker(void *arg) {
                 }
                 if (off_md5(m, 32, iv) != 0) { bs_log("[off] md5 unavailable"); goto done; }
                 if (off_aes_enc(key, iv, p80, 80, out, &moved) != 0 || moved != 80) {
-                    proto_bad = 1;   // ★ v6.25e：加密都走不通 → 协议级异常
+                    proto_bad = 1;   // ★ v6.25e：加密都走不通 -> 协议级异常
                     bs_log("[off] aes fail moved=%zu", moved); goto done;
                 }
                 if (send(s, out, 80, 0) != 80) { bs_log("[off] send 80 failed"); goto done; }
                 bs_log("[off] #%d 208 -> 80 (auth ok)", round);
-            } else if (plen == 16) {
+                want = 16;
+            } else {                                  // want == 16
                 // ★ v6.25d：走到这里 = 授权链路全通，清掉失败连击
                 naccept++;
                 __sync_fetch_and_add(&g_off_n_ok, 1);
                 g_off_fail_run = 0;
-                // ★ v6.25e：无论是哪个进程走到 accepted，都证明厂商链路没坏 →
+                // ★ v6.25e：无论是哪个进程走到 accepted，都证明厂商链路没坏 ->
                 //   无条件清掉共享告警（这是唯一能证伪「协议变了」的硬证据）。
                 // ★ v6.25h：**先读再清再判**。告警多半是上一次冷启前那个进程报的，
-                //   本进程 g_off_stall 恒为 0，只看它就变成「状态清了、事件没打」——
-                //   实测（.216）恢复后文件已回 `ok 0`，日志里却一条 ★ recovered 都没有，
-                //   运维事后查不到「什么时候恢复、坏了多久」。
+                //   本进程 g_off_stall 恒为 0，只看它就变成「状态清了、事件没打」。
                 {
                     int  f_ofn = 0;
                     long f_fb  = 0;
@@ -1508,44 +1507,46 @@ static void *off_worker(void *arg) {
                     }
                 }
                 bs_log("[off] #%d 16 = accepted, vendor chain fully bypassed", round);
-            } else {
-                // 未知包：只记录，不判协议异常（客户端可能有多余控制包）
-                bs_log("[off] unexpected pkt len=%zu (accn=%zu) -> skipped", plen, accn);
+                want = 262;
             }
 
-            // ★ v6.25j：消费本包，剩余字节前移（不再 accn=0 整块丢弃）
+            // ★ v6.25j：只消费掉本包长度，剩余字节**前移保留**
+            //   （旧版这里是 accn = 0，粘包时把下一包整块扔掉）
             memmove(acc, acc + plen, accn - plen);
             accn -= plen;
         }
 
         // ② 收更多数据
-        if (accn >= sizeof(acc)) {          // 缓冲满仍凑不出完整包 → 包头异常
+        if (accn >= sizeof(acc)) {          // 缓冲满还凑不出完整包 -> 异常
             proto_bad = 1;
-            bs_log("[off] rx buffer full (%zu) -> drop conn", accn);
+            bs_log("[off] rx buffer full (%zu want=%d) -> drop conn", accn, want);
             goto done;
         }
         ssize_t n = recv(s, acc + accn, sizeof(acc) - accn, 0);
         if (n <= 0) {
             // ★ v6.25e：SO_RCVTIMEO 到点会返回 -1/EAGAIN。客户端发完 262 收到 38
             //   后「既不发 208 也不关闭」的状态实测存在（卡密闸门已开时），
-            //   以前 worker 永久阻塞 → fd+线程泄漏。现在超时即收尾，且**不计数**。
+            //   以前 worker 永久阻塞 -> fd+线程泄漏。现在超时即收尾，且**不计数**。
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                bs_log("[off] stub idle %ds -> close (accn=%zu pkts=%d)",
-                       OFF_IDLE_TIMEOUT, accn, nplen);
+                bs_log("[off] stub idle %ds -> close (want=%d accn=%zu pkts=%d)",
+                       OFF_IDLE_TIMEOUT, want, accn, nplen);
             else
-                bs_log("[off] stub conn closed (n=%zd) pkts=%d", n, nplen);
+                bs_log("[off] stub conn closed (n=%zd want=%d accn=%zu)",
+                       n, want, accn);
             break;
         }
         accn += (size_t)n;
     }
 
 done:
-    // ★ v6.25j：把本连接收到的包长序列打一条 —— 云端日志只有尾 8KB，
-    //   有了这一行就能直接看出「首包是多少 / 有没有粘包 / 走到第几包 / 是否 accepted」，
+    // ★ v6.25j：把本连接收到的包序列打一条 —— 云端日志只有尾 8KB，
+    //   有了这一行就能直接看出「走到第几包 / 是否 accepted / 各包首字节形态」，
     //   不必再靠外部推理（v6.25i 之前所有现场都缺这个信息）。
+    //   格式 长度:首2字节，如 262:0601,208:86d6 —— 208 头随机即证明它是密文包。
     if (nplen > 0) {
-        for (int i = 0; i < nplen && cur < (int)sizeof(seq) - 8; i++)
-            cur += snprintf(seq + cur, sizeof(seq) - cur, "%s%d", i ? "," : "", plens[i]);
+        for (int i = 0; i < nplen && cur < (int)sizeof(seq) - 12; i++)
+            cur += snprintf(seq + cur, sizeof(seq) - cur, "%s%d:%04x",
+                            i ? "," : "", plens[i], (unsigned)phdr[i]);
         bs_log("[off] conn pkts=[%s] accept=%d", seq, naccept);
     }
     // ★ v6.25d：连接结束。★ v6.25e：**只有 proto_bad 才计入连击** ——
