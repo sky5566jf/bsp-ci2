@@ -1175,7 +1175,9 @@ static const uint8_t *off_plain80(void) {
     if (ok < 0)  return NULL;
     const char *h = OFF_RESP80_HEX;
     size_t i;
-    if (strlen(h) != 160) {          // 防止改模板行时把长度写错 → 越界读
+    // volatile：h 是编译期字面量，-O2 会算出 strlen==160 恒真 → 整段检查被当死代码消掉
+    volatile size_t need = 160;
+    if (strlen(h) != need) {         // 防止改模板行时把长度写错 → 越界读
         ok = -1;
         bs_log("[off] RESP80 hex len=%d (want 160)", (int)strlen(h));
         return NULL;
