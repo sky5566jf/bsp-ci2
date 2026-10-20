@@ -827,7 +827,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.25j"
+#define BS_DYLIB_VER       "v6.26"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -5748,6 +5748,48 @@ static void bs_card_cache_load(void) {
            g_card_expire, g_card_lastok, g_card_cur, g_card_kicked, g_card_kickts);
 }
 
+/// ★ v6.26：本地持久化设备码 —— hw.serial 与 token 都拿不到时的最终兜底。
+///   现场（2026-10-21）：postinst 靠 agent.log 的 "send dev online success:<hex>"
+///   取 DEVID 写 token=，装包时 Agent 尚未上报成功就跳过、且无补写 ⇒ token 恒空
+///   ⇒ device_id 全变字面量 "unknown" ⇒ 同网/多机共享同一虚拟设备 ID，服务端按
+///   device 判定换卡 ⇒ 互相顶卡，每顶一次写一条 auto-unbind（实测 4973 条）。
+///   这里生成 32hex 落盘复用，保证每台设备有稳定且互不相同的 device_id。
+static void bs_card_devid_local(void) {
+    unsigned char *b = NULL;
+    size_t bl = 0;
+    if (bs_read_file(DATA_DIR "/.bs_devid", &b, &bl)) {
+        if (b && bl >= 32) {
+            char t[40] = {0};
+            memcpy(t, b, 32);
+            t[32] = 0;
+            if (off_is_hex32(t)) {
+                memcpy(g_card_devid, t, 32);
+                g_card_devid[32] = 0;
+                free(b);
+                bs_log("[card] devid=%.32s (src=.bs_devid)", t);
+                return;
+            }
+        }
+        if (b) free(b);
+    }
+    // 生成：md5(序号|时间|pid|栈地址|clock|hw.machine) → 32 hex，落盘长期复用
+    char mach[64] = {0};
+    bs_sysctl_str("hw.machine", mach, sizeof(mach));
+    static unsigned s_seq = 0;
+    char ent[192] = {0};
+    snprintf(ent, sizeof(ent), "%u|%ld|%d|%p|%lu|%s",
+             ++s_seq, (long)time(NULL), (int)getpid(), (void *)&b,
+             (unsigned long)clock(), mach);
+    char hex[40] = {0};
+    bs_md5_buf((const unsigned char *)ent, strlen(ent), hex, sizeof(hex));
+    if (!off_is_hex32(hex)) return;
+    memcpy(g_card_devid, hex, 32);
+    g_card_devid[32] = 0;
+    mkdir(DATA_DIR, 0755);
+    bs_write_file_atomic(DATA_DIR "/.bs_devid", (const unsigned char *)hex, 32);
+    bs_log("[card] devid=%.32s (src=local-gen)", hex);
+}
+
 /// device_id：优先硬件序列号（卸载重装不变），回退 token。
 /// ★ v6.23j：hw.serial 在部分机型/环境返回**字面量 "unknown"**（非空字符串），
 ///   旧写法直接采信 → device_id="unknown" 存进绑定字段；且所有此类设备
@@ -5762,6 +5804,8 @@ static void bs_card_device_id(void) {
         snprintf(g_card_devid, sizeof(g_card_devid), "%s", srl);
     if (!g_card_devid[0] && g_token[0])
         snprintf(g_card_devid, sizeof(g_card_devid), "%s", g_token);
+    if (!g_card_devid[0])
+        bs_card_devid_local();      // ★ v6.26：本地 32hex 兜底，杜绝字面量 unknown
     if (!g_card_devid[0])
         snprintf(g_card_devid, sizeof(g_card_devid), "unknown");
     bs_log("[card] device_id=%.24s (serial=%s)", g_card_devid,
