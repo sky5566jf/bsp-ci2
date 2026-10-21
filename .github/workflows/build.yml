@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.27" || (echo "MISSING v6.27" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.28" || (echo "MISSING v6.28" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -38,6 +38,7 @@ jobs:
           if strings bs_unlock.dylib | grep -q "v6.25i"; then echo "STALE: v6.25i string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25j"; then echo "STALE: v6.25j string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.26"; then echo "STALE: v6.26 string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.27"; then echo "STALE: v6.27 string still present" && exit 1; fi
           # v6.27：密文包长度自适应（厂商包首 4 字节 = 明文总长，208 只是其中一种，
           # 实测同一批客户端有发 192 的 —— 硬等 208 会 30s 超时 auth failed）
           strings bs_unlock.dylib | grep -q "cmd pkt len=" || (echo "MISSING autolen log" && exit 1)
@@ -60,7 +61,12 @@ jobs:
           if strings bs_unlock.dylib | grep -q "auto-reload: request STOP"; then echo "FORBIDDEN: [rl] auto-reload still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "kicked=" || (echo "MISSING kicked field" && exit 1)
           strings bs_unlock.dylib | grep -q "newer input seen after kick" || (echo "MISSING unblock path" && exit 1)
-          strings bs_unlock.dylib | grep -q "kept STOPPED, press Run in center" || (echo "MISSING crash kept-stopped" && exit 1)
+          # v6.28：设备端「运行中 → 自己停」自动接上（严格版，中控下发停止不接）
+          strings bs_unlock.dylib | grep -q "RUNNING observed (st=%p" || (echo "MISSING ar running marker" && exit 1)
+          strings bs_unlock.dylib | grep -q "resume #%d" || (echo "MISSING ar resume" && exit 1)
+          strings bs_unlock.dylib | grep -q "auto-resume OFF until next Run" || (echo "MISSING ar disarm on center stop" && exit 1)
+          strings bs_unlock.dylib | grep -q "lst=%d" || (echo "MISSING ar lst in stall scan" && exit 1)
+          if strings bs_unlock.dylib | grep -q "kept STOPPED, press Run in center"; then echo "FORBIDDEN: v6.24p kept-stopped banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "stall scan: run=" || (echo "MISSING stall diag" && exit 1)
           strings bs_unlock.dylib | grep -q "so=%.8s pend=%d" || (echo "MISSING so state in stall scan" && exit 1)
           strings bs_unlock.dylib | grep -q "src=evt" || (echo "MISSING event log channel" && exit 1)

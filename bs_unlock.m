@@ -398,6 +398,30 @@
 //       ③ `[cr] stall scan` 追加 `so=<md5前8> pend=<0|1> size=<n>`：一眼分清三种停摆
 //          ——盘上是旧的坏包 / 盘上新包但还没重启脚本 / 新包已生效仍然停。
 //
+// v6.28 ★★★ [ar] 脚本自停自动恢复（2026-10-21，用户指令：判断中控下发过运行，
+//       在没有主动停止的情况下，检测到脚本自己停了就再运行一次**；且明确不走中控方案）。
+//       ★ 与 v6.24p/q 不矛盾：那两次删的是**无条件**自动拉起（假运行看门狗 / 崩溃即拉 /
+//         空闲兜底），共同毛病是不区分「谁停的」。本版把「谁停的」作为第一判据，
+//         并把授权态落盘（.bs_ar）—— 重启/装包后仍记得「这台本来就该跑」，
+//         这正是「装完包必须手动点运行」的根因。
+//       ① 新增授权态 armed（落盘 DATA_DIR/.bs_ar，字段 armed/att/last/next/gu/gts）：
+//          置 1：run 0->1 且 sjz 新鲜（排除冷启残留）｜agent.log 尾部事件是运行；
+//          置 0：中控/用户停止（stop 且近 4KB 无 recv auth failed）｜run 1->0 且 sjz 新鲜
+//                ｜[kill] killswitch（新增 g_kill_sent，180s 内不落 .bs_userstop）。
+//       ② 三条触发：A 崩溃签名 + run=0 st=0 ｜B run=1 st=0 持续 45s ｜
+//          C 静默停摆 st=0 run=0 且 sjz 停写 ≥600s（装包/重启后的主路径，
+//          因为新进程 last_run 初值 0，看不到 1->0）。
+//       ③ 抑制矩阵：卡封禁 / 心跳未授权 / 用户停闸门 / 中控停证据 / killswitch 冷却 600s /
+//          厂商杀冷却 900s（stop 紧邻 recv auth failed）/ 退避未到 / GIVEUP / 启动静默 180s / probe。
+//       ④ 退避：0/60/120/300/600s，连败 5 次 GIVEUP，静默 1800s 后再给一轮；
+//          **必须跑稳 300s 才清失败计数**（只看「起来了」会被崩-拉循环钻空子）。
+//       ⑤ 顺带修：killswitch 自己 STOP 造成的 run 1->0 会被 v6.24k 误判成「用户主动停」
+//          并落 .bs_userstop（7 天 TTL）→ 心跳恢复后永久躺平。这是历史上「停了就再也不动」
+//          的一条隐蔽成因。
+//       ⑥ `[cr] stall scan` 追加 `ar=<armed>/<att>/<stop_kind>`，远程一眼分清
+//          「没授权 / 退避中 / 已放弃」。
+//       ★ 全 dylib 唯一 OPER_START 调用点 = [ar] 块（grep 可验证），不再有无条件拉起。
+//
 // v6.24p ★★★ 删除一切「自动运行脚本」（2026-10-20，用户指令：除「脚本本来在跑」
 // v6.24q ★★★ [rl] so_sync 自动重载整体移除（用户指令：新 so 只落盘，脚本由人工
 //       手动运行时加载）——核对 v6.24p 时发现 reload 的 STOP→START 窗口内用户点停止
@@ -827,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.27"
+#define BS_DYLIB_VER       "v6.28"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -883,6 +907,12 @@ static volatile int  g_hb_miss  = 0;    // 连续失败次数
 static volatile int  g_hb_ok    = 0;    // 最近一次是否成功（1=授权中）
 static volatile long g_hb_last  = 0;    // 最近成功的时间戳（秒）
 static int           g_hb_max   = HB_MISS_MAX_DEF;  // ★ v6.1 运行时阈值（conf hbmiss=）
+
+// ★ v6.28：本进程是否发过 killswitch 的 OPER_STOP（跨线程，puller 写 / watchdog 读）。
+//   用途：killswitch 自己停脚本会造成 run 1->0，v6.24k 的闸门会把它误判成「用户主动停」
+//   并落盘 .bs_userstop → 心跳恢复后设备永久躺平。有此标志即可排除。
+static volatile int  g_kill_sent = 0;
+static volatile long g_kill_ts   = 0;
 
 // 拼好的 query string（"?key=xxx&nm=..&md=..&ov=.." 或 ""）——纯 C 拼接，供 URL 构造直接 snprintf 用
 static char   g_qbuf[512] = {0};
@@ -2979,6 +3009,8 @@ static void bs_killswitch(uintptr_t base, const char *why) {
 
     // 1) 停脚本（产品内部函数，必须从非裸线程调用路径进入 → watchdog 线程已就绪）
     if (base) {
+        g_kill_sent = 1;                 // ★ v6.28：标记「这次停是我们自己干的」
+        g_kill_ts   = (long)time(NULL);
         ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
         bs_log("[kill] OPER_STOP issued");
     }
@@ -4707,6 +4739,155 @@ static int bs_us_mark_exists(void) {
     return 1;
 }
 
+// ================================================================
+// ★★★ v6.28：[ar] 运行授权态（armed）+ 脚本自停自动恢复（纯设备端）
+// ================================================================
+//   用户需求（原话）：「判断中控下发运行，如果没有主动停止脚本运行的情况下，
+//   检测到脚本自己停止运行就给他运行下脚本」。
+//
+//   ★ 与 v6.24p / v6.24q 的关系（为什么这次不会重蹈覆辙）：
+//     p/q 两次删掉的是**无条件**自动拉起 —— 假运行看门狗（v6.24m/n）、崩溃即拉、
+//     空闲兜底。它们共同的毛病是**不区分「谁停的」**：用户点停、厂商杀脚本、
+//     我们自己 killswitch，全都被当成「崩了」去救，于是跟人对打（v6.24k 前的血案）。
+//     本版把「谁停的」提到第一判据，并且把授权态**落盘** —— 重启 / 装包后仍然
+//     记得「这台设备本来就该跑」，这正是之前装完包必须手动点运行的根本原因。
+//
+//   授权态 armed / 运行凭据 lst 的来源：
+//     armed：① run 0->1 且 sjz.log 在 US_STOP_FRESH 内有写入（真在跑，非冷启残留）
+//            ② agent.log 尾部的最后一次 run/stop 事件是 run（中控点了运行）
+//     lst  ：③ st!=0（脚本容器真的在跑）—— 最硬的凭据，一置就落盘
+//   解除（任一，两个凭据一起清）：
+//     ① 中控/用户停止（agent stop script 且近窗口无 recv auth failed）
+//     ② run 1->0 且 sjz 新鲜（US_MARK 闸门，现有逻辑）
+//     ③ 我们自己 killswitch 发 OPER_STOP
+//     ④ 厂商杀脚本（stop 紧邻 recv auth failed）
+//
+//   触发恢复（需 armed && lst，★ 唯一判据，v6.28 严格版）：
+//     「脚本本来是运行态，现在自己停了」 st!=0 曾经成立（lst=1）→ 现在 st==0 && run==0
+//     ★ 不救「点了运行但从来没起来」（st 一直 0 → lst 从未置 1）：
+//        那是加载失败/密钥没铺齐，属于另一类问题，拉一百次也起不来，只会刷屏。
+//     ★ 不救「中控下发停止」：stop_kind==2 / us_latched / killswitch 一律把 lst 清 0。
+//     ★ 装包 / App 重启：lst 落盘，重启后仍为 1 → 新进程 st==0 → 触发一次（这正是
+//       用户要的「不是人停的就接上」）；若装包前用户点过停止，盘上 lst 已是 0 → 不拉。
+//
+//   抑制矩阵（任一成立一律不拉，只留节流日志）：
+//     卡封禁 / 心跳未授权 / 用户停闸门 / 中控停证据 / killswitch 冷却 /
+//     厂商杀冷却 / 退避未到 / 已放弃（GIVEUP）
+#define AR_MARK         DATA_DIR "/.bs_ar"
+#define AR_BOOT_GRACE   180     // 进程启动静默期（躲 App 初始化、装包后重建）
+#define AR_STUCK_SECS   900     // run 标志=1 但 st 持续 0 的兜底阈值（装包后标志残留）
+#define AR_OK_STABLE    300     // 拉起后稳定跑满该秒数才清失败计数（防崩拉循环）
+#define AR_VENDOR_COOL  900     // 厂商杀脚本后冷却（授权没恢复，拉了也会被杀）
+#define AR_KILL_COOL    600     // 本进程 killswitch 后冷却
+#define AR_GIVEUP_N     5       // 连续失败上限
+#define AR_GIVEUP_HOLD  1800    // 放弃后静默多久再给一轮机会（防永久躺平）
+static const int AR_BACKOFF[AR_GIVEUP_N] = { 60, 120, 300, 600, 1200 };
+
+typedef struct {
+    int  armed;     // 1 = 中控授权过运行，且尚无主动停止证据
+    int  lst;       // ★ 1 = 上次观察到脚本确实在跑（st!=0）——「运行态 → 自己停」的唯一凭据
+    int  att;       // 连续失败（拉起后没跑稳）次数
+    long last;      // 上次拉起时刻
+    long next;      // 退避：下次允许拉起时刻
+    int  gu;        // 1 = 已放弃本轮
+    long gts;       // 放弃时刻
+} bs_ar_t;
+
+static void bs_ar_read(bs_ar_t *a) {
+    memset(a, 0, sizeof(*a));
+    FILE *f = fopen(AR_MARK, "r");
+    if (!f) return;
+    char line[256];
+    memset(line, 0, sizeof(line));
+    if (fgets(line, sizeof(line) - 1, f)) {
+        long t = 0, last = 0, next = 0, gts = 0;
+        int  armed = 0, lst = 0, att = 0, gu = 0;
+        int n = sscanf(line, "t=%ld armed=%d lst=%d att=%d last=%ld next=%ld gu=%d gts=%ld",
+                       &t, &armed, &lst, &att, &last, &next, &gu, &gts);
+        if (n == 8) {
+            a->armed = armed; a->lst = lst; a->att = att; a->last = last;
+            a->next  = next;  a->gu  = gu;  a->gts = gts;
+        } else if (sscanf(line, "t=%ld armed=%d att=%d last=%ld next=%ld gu=%d gts=%ld",
+                          &t, &armed, &att, &last, &next, &gu, &gts) == 7) {
+            // 旧格式（v6.28 初稿）：没有 lst 字段。若 armed=1 则视为「上次在跑」，
+            // 否则一律 0 —— 宁可少拉一次，也不误拉起。
+            a->armed = armed; a->lst = armed ? 1 : 0; a->att = att; a->last = last;
+            a->next  = next;  a->gu  = gu;  a->gts = gts;
+        }
+    }
+    fclose(f);
+}
+
+static void bs_ar_write(const bs_ar_t *a, const char *why) {
+    FILE *f = fopen(AR_MARK, "w");
+    if (!f) return;
+    fprintf(f, "t=%ld armed=%d lst=%d att=%d last=%ld next=%ld gu=%d gts=%ld why=%s\n",
+            (long)time(NULL), a->armed, a->lst, a->att, a->last, a->next, a->gu, a->gts,
+            why ? why : "-");
+    fclose(f);
+}
+
+// 扫 agent.log 尾部，判断「最后一次 run / stop 事件是谁的」：
+//   0 = 无证据   1 = 最后是运行（中控点过运行）
+//   2 = 中控/用户停止              3 = 厂商停止（紧邻 recv auth failed 授权失败）
+// 说明：`recv rep key failed` 每 ~2min 一次属正常尾巴，**不能**作为厂商判据；
+//       只有 `recv auth failed`（30s 等不到 80）才代表授权链路真的坏了。
+static int bs_ar_stop_kind(const char *path, long want) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return 0; }
+    long off = sb.st_size > want ? sb.st_size - want : 0;
+    long add = sb.st_size - off;
+    char *buf = (char *)malloc((size_t)add + 1);
+    if (!buf) { close(fd); return 0; }
+    lseek(fd, off, SEEK_SET);
+    ssize_t gn = read(fd, buf, (size_t)add);
+    close(fd);
+    if (gn <= 0) { free(buf); return 0; }
+    buf[gn] = 0;
+
+    char *lr = NULL, *ls = NULL, *q = buf;
+    // 「运行」事件两种落法都收：Agent 直打 `begin run script`，
+    // 走中控下发时是 `begin process run script msg`（中间夹 process）。
+    // ★ 不能用 `begin process operate script msg`：它是中控「操作消息」总入口，
+    //   运行/停止共用同一条，语义不可靠（v6.24l 已实证）。
+    while ((q = strstr(q, "begin run script")) != NULL) { lr = q; ++q; }
+    q = buf;
+    while ((q = strstr(q, "run script msg")) != NULL) {
+        if (!lr || q > lr) lr = q;
+        ++q;
+    }
+    q = buf;
+    while ((q = strstr(q, "agent stop script")) != NULL) {
+        if (!ls || q > ls) ls = q;
+        ++q;
+    }
+    q = buf;
+    while ((q = strstr(q, "begin process stop script msg")) != NULL) {
+        if (!ls || q > ls) ls = q;
+        ++q;
+    }
+
+    int kind = 0;
+    if (lr && (!ls || lr > ls)) {
+        kind = 1;                              // 停之后又点了运行
+    } else if (ls) {
+        char *w0 = (ls - buf > 4096) ? ls - 4096 : buf;
+        char *p  = w0;
+        int   af = 0;
+        while (p < ls) {
+            if (!strncmp(p, "recv auth failed", 16)) { af = 1; break; }
+            ++p;
+        }
+        kind = af ? 3 : 2;
+    } else if (lr) {
+        kind = 1;
+    }
+    free(buf);
+    return kind;
+}
+
 // ★ v6.24i：判断「最后一条事件是中控显式停脚本」——用于避免空闲兜底与人工停脚本打架。
 //   中控停脚本会在 agent.log 留 "begin process operate script msg!"（★ v6.24k：
 //   原写 "begin process stop script msg" 是错的 —— 设备实查该串 0 次、
@@ -4848,6 +5029,20 @@ static void *bs_watchdog(void *arg) {
     time_t cr_stall_last = 0; // ★ v6.24p：上次停摆诊断扫描时刻
     int    us_latched = 0;    // ★ v6.24k：用户停止闸门在本进程内的缓存（配合 .bs_userstop）
 
+    // ★ v6.28：[ar] 自动恢复运行时状态
+    bs_ar_t ar;                      // 授权态（落盘 .bs_ar，重启后仍有效）
+    bs_ar_read(&ar);
+    time_t ar_t0        = time(NULL);  // 进程启动时刻（AR_BOOT_GRACE 静默期基准）
+    time_t ar_notrun    = 0;           // st==0 持续起点（只用于 run 标志残留 1 的兜底）
+    time_t ar_ok        = 0;           // 跑稳起点（满 AR_OK_STABLE 才清失败计数）
+    time_t ar_vendor_ts = 0;           // 厂商杀脚本时刻（冷却用）
+    int    ar_stop_kind = 0;           // agent.log 尾部事件分类（0/1/2/3）
+    int    ar_cr_hit    = 0;           // 本拍崩溃签名（由下面 cr 扫描块回填）
+    if (ar.armed) {
+        bs_evt("[ar] armed restored from disk (att=%d gu=%d) -> auto-resume active",
+               ar.att, ar.gu);
+    }
+
     // ★ v6.24r：给运行库状态建基线（一次性，无状态文件时按盘上 beta.so 算 md5）
     bs_so_state_bootstrap();
 
@@ -4856,6 +5051,21 @@ static void *bs_watchdog(void *arg) {
 
         uint64_t st  = *stp;
         uint8_t  run = *runp;
+
+        // ★★★ v6.28 严格版：lst = 「上次观察到脚本确实在跑」的唯一凭据。
+        //   触发自动恢复只认它 —— st!=0 是真在跑（容器有效），一旦置 1 就落盘，
+        //   进程重启/装包后仍然记得「这台机器本来在跑」。中控点停止时会被清 0。
+        //   只在翻转时写盘（每秒一次 tick 不能都落盘）。
+        if (st != 0) {
+            if (!ar.lst || !ar.armed) {
+                int was_armed = ar.armed;
+                ar.lst = 1;
+                if (!ar.armed) { ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0; }
+                bs_ar_write(&ar, "running");
+                bs_evt("[ar] RUNNING observed (st=%p run=%u) -> armed=%d lst=1",
+                       (void *)st, (unsigned)run, was_armed);
+            }
+        }
 
         // ★ v6.24k：用户停止闸门同步 —— run==1（中控下发「运行」）即解除。
         //   放在最前面：本拍后续所有自动拉起分支统一读 us_latched。
@@ -4867,6 +5077,22 @@ static void *bs_watchdog(void *arg) {
             us_latched = 0;
         } else {
             us_latched = bs_us_mark_exists();
+        }
+
+        // ★ v6.28：授权态路径①——run 0->1 且「确实在跑」才算中控下发了运行。
+        //   冷启时厂商 run 标志会残留为 1（10-19 08:07 .216 实锤），若不加 sjz 新鲜度
+        //   校验，装完包/重启后会误把「残留」当成新授权，用户点过停止也照样被拉起。
+        //   路径②（agent.log 尾部是 begin run script）在下面 60s 扫描块里补。
+        if (run && !last_run && !ar.armed) {
+            long a_sja = bs_file_age(DATA_DIR "/log/sjz.log");
+            if (saw_run || (a_sja >= 0 && a_sja <= US_STOP_FRESH)) {
+                ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
+                bs_ar_write(&ar, "run1");
+                bs_evt("[ar] armed (run 0->1, sjz=%lds) -> auto-resume active", a_sja);
+            } else {
+                bs_evt("[ar] run 0->1 but sjz=%lds (>%ds) -> stale flag, NOT armed",
+                       a_sja, US_STOP_FRESH);
+            }
         }
 
         // ★ v6.24r：运行库生效确认 —— run=1 说明脚本真的起来了，此刻加载的
@@ -4903,14 +5129,36 @@ static void *bs_watchdog(void *arg) {
             //   那一下也构成 1->0，但 sjz.log 早已停摆 → 不是用户停止，不许落闸门（否则
             //   装完包/重启 App 后兜底永远不拉起，设备静默躺平）。
             long sa = bs_file_age(DATA_DIR "/log/sjz.log");
-            if (sa >= 0 && sa <= US_STOP_FRESH) {
+            time_t nwk = time(NULL);
+            if (g_kill_sent && nwk - g_kill_ts <= 180) {
+                // ★ v6.28：这次 1->0 是**我们自己** killswitch 发的 OPER_STOP，不是用户停。
+                //   旧版会照旧落 .bs_userstop → 心跳恢复后设备永久躺平（7 天 TTL 才解），
+                //   这是历史上「停了就再也不动」的一条隐蔽成因，必须排除。
+                //   ★ 严格版：killswitch 的停也不许被 [ar] 接上（卡封禁期间拉起就是白拉），
+                //   直接把 lst 清 0，只留 AR_KILL_COOL 冷却。
+                if (ar.lst) {
+                    ar.lst = 0;
+                    bs_ar_write(&ar, "killswitch-stop");
+                }
+                bs_evt("[us] run 1->0 from our killswitch (%lds ago) -> NOT a user stop, no gate",
+                       (long)(nwk - g_kill_ts));
+            } else if (sa >= 0 && sa <= US_STOP_FRESH) {
                 bs_us_mark_write("run 1->0");
                 us_latched = 1;
                 bs_cr_mark_clear();          // 用户停了，旧的崩溃证据一并作废
+                // ★ v6.28：用户/中控明确停止 → 撤销授权态 + 清运行凭据，自动恢复不再介入。
+                if (ar.armed || ar.lst) {
+                    ar.armed = 0; ar.lst = 0; ar.att = 0; ar.gu = 0; ar.next = 0;
+                    bs_ar_write(&ar, "user-stop");
+                    bs_evt("[ar] disarmed (explicit stop, run 1->0 sjz=%lds) -> no auto-resume",
+                           sa);
+                }
                 bs_evt("[us] script stop observed (run 1->0, sjz=%lds st=%p) -> auto-start gated until run=1",
                        sa, (void *)st);
             } else {
-                bs_evt("[us] run 1->0 but sjz=%lds (>%ds) -> not a user stop, no gate",
+                // ★★★ v6.28 严格版：run 掉了但 sjz 早已停摆 = **不是人停的**（自己崩了 /
+                //   厂商杀的）。lst 保持 1，交给下面的 [ar] 块决定是否接上。
+                bs_evt("[us] run 1->0 but sjz=%lds (>%ds) -> self-stop, ar will decide",
                        sa, US_STOP_FRESH);
             }
         }
@@ -5007,16 +5255,15 @@ static void *bs_watchdog(void *arg) {
                 time_t nowt = time(NULL);
                 // ★ v6.24h：先把证据落盘（App 重启会清空 agent.log，marker 不会）
                 if (run == 0) bs_cr_mark_write(cr_src == 0 ? "agent" : "sjz");
-                // ★ v6.24p：自动恢复已整体移除（用户指令：除「脚本本来在跑」与
-                //   「中控手动下发运行」外一律不自动运行脚本）。崩溃只留证据与节流日志，
-                //   原地停住，等人点「运行」。
-                static time_t ar_log = 0;
-                if (nowt - ar_log >= 60) {
-                    ar_log = nowt;
-                    bs_evt("[cr] ★ crash detected (%s%s) -> auto-start REMOVED v6.24p: "
-                           "kept STOPPED, press Run in center to resume",
+                // ★ v6.28：崩溃不再「原地等人点运行」——交给下面 [ar] 判定，
+                //   由 armed + 抑制矩阵决定要不要拉起。这里只回填标记 + 节流日志。
+                ar_cr_hit = 1;
+                static time_t cr_log = 0;
+                if (nowt - cr_log >= 60) {
+                    cr_log = nowt;
+                    bs_evt("[cr] crash detected (%s%s) -> hand to [ar] (armed=%d)",
                            cr_src == 0 ? "agent.log" : "sjz.log",
-                           cr_loadfail ? " loadfail" : "");
+                           cr_loadfail ? " loadfail" : "", ar.armed);
                 }
             }
         }
@@ -5056,6 +5303,33 @@ static void *bs_watchdog(void *arg) {
                     if (mage >= 0) bs_cr_mark_clear();
                     mage = -1;
                 }
+                // ★★★ v6.28：agent.log 尾部「最后一条 run/stop 事件是谁的」——60s 一次，
+                //   零额外开销（本来就要读这块）。这是「中控下发运行」的第二证据源：
+                //   App 刚装完包时 run 标志是 0、sjz 也停摆，只能从日志看中控到底点过什么。
+                ar_stop_kind = bs_ar_stop_kind(ap, 262144);
+                if (ar_stop_kind == 1 && !ar.armed) {
+                    ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
+                    bs_ar_write(&ar, "run-log");
+                    bs_evt("[ar] armed (agent.log: last event = begin run script)");
+                } else if (ar_stop_kind == 2) {
+                    // ★ 严格版：中控（或用户在 App 里）下发停止 → 两个凭据都清，
+                    //   之后无论脚本停多久、重启多少次，都不许自动接上。
+                    if (ar.armed || ar.lst) {
+                        ar.armed = 0; ar.lst = 0; ar.att = 0; ar.gu = 0; ar.next = 0;
+                        bs_ar_write(&ar, "stop-log");
+                        bs_evt("[ar] disarmed (agent.log: center/user stop, no auth-fail nearby) "
+                               "-> auto-resume OFF until next Run");
+                    }
+                } else if (ar_stop_kind == 3) {
+                    // 厂商杀脚本（授权坏了）：不是「自己空转」，拉了也会被杀 → 清 lst + 冷却。
+                    ar_vendor_ts = nowt4;
+                    if (ar.lst) {
+                        ar.lst = 0;
+                        bs_ar_write(&ar, "vendor-stop");
+                    }
+                    bs_evt("[ar] vendor stop detected (stop + recv auth failed) -> hold %ds",
+                           AR_VENDOR_COOL);
+                }
                 // 每 5 分钟一条诊断快照（不动作），便于下次远程定位卡点
                 static time_t stlog = 0;
                 if (nowt4 - stlog >= 300) {
@@ -5069,16 +5343,115 @@ static void *bs_watchdog(void *arg) {
                     if (!bs_so_state_read(smd5, sizeof(smd5), &ssz, &spend, &sap))
                         snprintf(smd5, sizeof(smd5), "unknown");
                     bs_evt("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld us=%d "
-                           "so=%.8s pend=%d size=%ld",
+                           "so=%.8s pend=%d size=%ld ar=%d/%d/%d lst=%d",
                            (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, us_stop,
-                           smd5, spend, ssz);
+                           smd5, spend, ssz, ar.armed, ar.att, ar_stop_kind, ar.lst);
                 }
             }
         }
 
-        // --- ★ v6.24b：崩溃恢复重试状态机 —— ★ v6.24p 已整块删除 ---
-        //   （自动 OPER_START / 递增重试 / 会话死升级冷启 App 全部移除。
-        //     用户指令：脚本运行只认「本来在跑」与「中控手动下发」，其余不自动。）
+        // ================================================================
+        // ★★★ v6.28 严格版：[ar] 只接「运行中 → 自己停」（纯设备端，中控零参与）
+        // ================================================================
+        //   唯一判据：ar.armed && ar.lst && st==0
+        //     ar.lst=1  = 上次确实看到 st!=0（脚本容器真在跑，已落盘，重启后仍记得）
+        //     st==0     = 现在容器没了（自己崩了 / 被杀 / App 重启后没起来）
+        //   ★ 不接的三种：
+        //     ① 中控/用户下发停止 → lst 已被清 0，这里外层就进不来
+        //     ② 我们自己 killswitch → lst 已清 0
+        //     ③ 从来没跑起来（点了运行但 st 一直 0，lst 从未置 1）→ 不拉，拉了也起不来
+        //   ★ run==1 但 st==0 超过 AR_STUCK_SECS 也认（装包后 run 标志残留 1 的情况）。
+        if (g_mode == MODE_UNLOCK && ar.armed && ar.lst) {
+            time_t nowa  = time(NULL);
+            long   a_sja = bs_file_age(DATA_DIR "/log/sjz.log");
+
+            // --- 跑稳计数：拉起/手动跑起来后连续 st!=0 && run=1 满 AR_OK_STABLE 才算真恢复 ---
+            if (run && st != 0) {
+                if (!ar_ok) ar_ok = nowa;
+                if (nowa - ar_ok >= AR_OK_STABLE && (ar.att || ar.gu)) {
+                    ar.att = 0; ar.gu = 0; ar.next = 0;
+                    bs_ar_write(&ar, "stable");
+                    bs_evt("[ar] stable %ds -> failure counter reset", (int)(nowa - ar_ok));
+                }
+            } else {
+                ar_ok = 0;
+            }
+            // --- st==0 持续计时（只用于「run 标志残留 1」这一种兜底）---
+            if (st == 0) {
+                if (!ar_notrun) ar_notrun = nowa;
+            } else {
+                ar_notrun = 0;
+            }
+
+            int want = 0;
+            const char *why = NULL;
+            // 启动静默期：躲 App 初始化 / 装包后重建 / bootstrap 铺密钥
+            if (nowa - ar_t0 >= AR_BOOT_GRACE && st == 0) {
+                if (run == 0) {
+                    want = 1;
+                    why = ar_cr_hit ? "crash" : "self-stop";
+                } else if (ar_notrun && nowa - ar_notrun >= AR_STUCK_SECS) {
+                    // run 标志还在、容器却一直不存在 → 同样是「跑着跑着没了」，兜底接一次
+                    want = 1; why = "stuck-run1";
+                }
+            }
+
+            // --- 抑制矩阵 ---
+            const char *hold = NULL;
+            if (want) {
+                if (g_card_blocked) {
+                    want = 0; hold = "card-blocked";
+                } else if (!g_hb_ok) {
+                    want = 0; hold = "hb-not-ok";
+                } else if (us_latched || bs_us_mark_exists()) {
+                    want = 0; hold = "user-stop";
+                } else if (ar_stop_kind == 2) {
+                    want = 0; hold = "center-stop";
+                } else if (g_kill_sent && nowa - g_kill_ts < AR_KILL_COOL) {
+                    want = 0; hold = "kill-cool";
+                } else if (ar_vendor_ts && nowa - ar_vendor_ts < AR_VENDOR_COOL) {
+                    want = 0; hold = "vendor-cool";
+                } else if (ar.gu) {
+                    if (nowa - ar.gts > AR_GIVEUP_HOLD) {
+                        ar.gu = 0; ar.att = 0; ar.next = 0;
+                        bs_evt("[ar] giveup window over -> new retry round");
+                    } else {
+                        want = 0; hold = "giveup";
+                    }
+                }
+                if (want && ar.next && nowa < ar.next) {
+                    want = 0; hold = "backoff";
+                }
+            }
+
+            if (want) {
+                ar.att++;
+                ar.last = nowa;
+                int bi = ar.att - 1;
+                if (bi >= AR_GIVEUP_N) bi = AR_GIVEUP_N - 1;
+                ar.next = nowa + AR_BACKOFF[bi];
+                if (ar.att >= AR_GIVEUP_N) { ar.gu = 1; ar.gts = nowa; }
+                bs_ar_write(&ar, why);
+                bs_evt("[ar] ★ resume #%d (%s) run=%u st=%p hb=%d sjz=%ld next=+%ds%s -> OPER_START",
+                       ar.att, why, (unsigned)run, (void *)st, g_hb_ok, a_sja,
+                       AR_BACKOFF[bi], ar.gu ? " GIVEUP-AFTER-THIS" : "");
+                ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
+                bs_cr_mark_clear();
+                ar_cr_hit = 0;
+                ar_notrun = 0;
+            } else if (hold) {
+                static time_t hold_log = 0;
+                if (nowa - hold_log >= 300) {
+                    hold_log = nowa;
+                    bs_evt("[ar] hold=%s att=%d run=%u st=%p hb=%d sjz=%ld stop=%d",
+                           hold, ar.att, (unsigned)run, (void *)st, g_hb_ok, a_sja, ar_stop_kind);
+                }
+            }
+        }
+
+        // --- ★ v6.24b：崩溃恢复重试状态机 —— ★ v6.24p 删除，v6.28 由 [ar] 接管 ---
+        //   （旧机型的无脑 OPER_START / 会话死升级冷启 App 全部不再使用；
+        //     现在的自动运行只走上面的 [ar]，条件=armed + 无主动停止证据 + 抑制矩阵放行。）
 
         // --- ★ v6.24d：[fg] 游戏前台看门狗 ---
         //   脚本活着（run=1）但游戏被顶到后台：sjz.log 停摆 ≥ FG_STALE_SECS
