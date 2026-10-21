@@ -851,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.30"
+#define BS_DYLIB_VER       "v6.31"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -5023,6 +5023,27 @@ static int bs_us_mark_exists(void) {
 #define AR_GIVEUP_HOLD  1800    // 放弃后静默多久再给一轮机会（防永久躺平）
 static const int AR_BACKOFF[AR_GIVEUP_N] = { 60, 120, 300, 600, 1200 };
 
+// ★★★ v6.31：resume 回执 + 失败分类 + 硬失败收敛
+//   背景：v6.30 发完 OPER_START 就 att++，从不验证「这次到底起没起来」。
+//   一轮 48min / 5 次空转 / 一天约 150 次，且无法区分「点了没反应」与「起来了又崩」。
+//   做法：① 每次 resume 开 AR_VERIFY_SECS 回执窗口，窗口内 st!=0 才算点着；
+//         ② 没点着就按 sjz/agent 日志新增字节分类，各走对症动作；
+//         ③ 连续 AR_HARD_N 次没点着且属于「点多少次都一样」的类别 → 静默 AR_HARD_HOLD，
+//            不再占用 CPU/刷日志，等人工介入或换包。
+//   ★ 手工解除：中控再点运行（run 0→1）自动清；或删 DATA_DIR/.bs_ar。
+#define AR_VERIFY_SECS  90      // resume 后必须在该秒数内看到 st!=0，否则算「点了没起来」
+#define AR_HARD_N       2       // 连续「点了没起来」上限（仅对 config/auth/unknown 生效）
+#define AR_HARD_HOLD    21600   // 硬失败静默 6h（覆盖一次夜班，天亮后重来一轮）
+
+// 失败分类（ar_fail_class 的返回值）
+enum {
+    AR_CLS_UNKNOWN = 0,   // 无匹配签名 → 按原退避重试
+    AR_CLS_MODULE  = 1,   // 模块/容器缺失 → 等 puller 补，继续退避（不硬失败）
+    AR_CLS_CONFIG  = 2,   // 脚本配置类 nil 算术 → 点多少次都一样，立即硬失败
+    AR_CLS_FG      = 3,   // 游戏不在前台 → uiopen 拉回后立即重试一次
+    AR_CLS_AUTH    = 4    // 授权失败 → 厂商随时会杀，立即硬失败
+};
+
 typedef struct {
     int  armed;     // 1 = 中控授权过运行，且尚无主动停止证据
     int  lst;       // ★ 1 = 上次观察到脚本确实在跑（st!=0）——「运行态 → 自己停」的唯一凭据
@@ -5032,6 +5053,11 @@ typedef struct {
     long next;      // 退避：下次允许拉起时刻
     int  gu;        // 1 = 已放弃本轮
     long gts;       // 放弃时刻
+    // ★ v6.31：resume 回执与硬失败（追加在尾部，旧格式行仍可读，见 bs_ar_read）
+    int  up;        // 1 = 本次 resume 后见过 st!=0（点着了）；0 = 点了没反应
+    int  hard;      // 连续「点了没起来」次数
+    long vfy;       // 回执窗口截止时刻（0 = 无待验证）
+    long hv;        // 硬失败静默起点（0 = 未硬失败）
 } bs_ar_t;
 
 static void bs_ar_read(bs_ar_t *a) {
@@ -5043,9 +5069,19 @@ static void bs_ar_read(bs_ar_t *a) {
     if (fgets(line, sizeof(line) - 1, f)) {
         long t = 0, last = 0, next = 0, gts = 0, hold = 0;
         int  armed = 0, lst = 0, att = 0, gu = 0;
-        int n = sscanf(line, "t=%ld armed=%d lst=%d att=%d hold=%ld last=%ld next=%ld gu=%d gts=%ld",
-                       &t, &armed, &lst, &att, &hold, &last, &next, &gu, &gts);
-        if (n == 9) {
+        // ★ v6.31：新字段（旧行里不存在 → sscanf 只返回 9，落到下面的 n==9 分支）
+        int  up = 0, hard = 0;
+        long vfy = 0, hv = 0;
+        int n = sscanf(line,
+                       "t=%ld armed=%d lst=%d att=%d hold=%ld last=%ld next=%ld gu=%d gts=%ld"
+                       " up=%d hard=%d vfy=%ld hv=%ld",
+                       &t, &armed, &lst, &att, &hold, &last, &next, &gu, &gts,
+                       &up, &hard, &vfy, &hv);
+        if (n == 13) {
+            a->armed = armed; a->lst = lst; a->att = att; a->hold = hold;
+            a->last = last; a->next = next; a->gu = gu; a->gts = gts;
+            a->up = up; a->hard = hard; a->vfy = vfy; a->hv = hv;
+        } else if (n == 9) {
             a->armed = armed; a->lst = lst; a->att = att; a->hold = hold;
             a->last = last; a->next = next; a->gu = gu; a->gts = gts;
         } else if (sscanf(line, "t=%ld armed=%d lst=%d att=%d last=%ld next=%ld gu=%d gts=%ld",
@@ -5066,8 +5102,12 @@ static void bs_ar_read(bs_ar_t *a) {
 static void bs_ar_write(const bs_ar_t *a, const char *why) {
     FILE *f = fopen(AR_MARK, "w");
     if (!f) return;
-    fprintf(f, "t=%ld armed=%d lst=%d att=%d hold=%ld last=%ld next=%ld gu=%d gts=%ld why=%s\n",
+    // ★ v6.31：up/hard/vfy/hv 追加在 gts 之后、why 之前 —— bs_ar_read 按连续字段解析；
+    //   旧版（v6.30 及更早）用 9 字段 sscanf 读本行仍返回 9，不会因多出字段而失效。
+    fprintf(f, "t=%ld armed=%d lst=%d att=%d hold=%ld last=%ld next=%ld gu=%d gts=%ld"
+               " up=%d hard=%d vfy=%ld hv=%ld why=%s\n",
             (long)time(NULL), a->armed, a->lst, a->att, a->hold, a->last, a->next, a->gu, a->gts,
+            a->up, a->hard, a->vfy, a->hv,
             why ? why : "-");
     fclose(f);
 }
@@ -5232,6 +5272,62 @@ static int bs_tail_count(const char *path, long want, const char *needle) {
     return cnt;
 }
 
+// ★★★ v6.31：文件尺寸（-1 = 不存在）。resume 时记基线，失败分类只看之后的增量。
+static long bs_file_size(const char *path) {
+    struct stat sb;
+    return (stat(path, &sb) == 0) ? (long)sb.st_size : -1;
+}
+
+// ★★★ v6.31：只统计 [from, EOF) 区间的命中数（from<0 → 退化成「尾部 4KB」）。
+//   为什么必须带区间：sjz.log 里历史那条 `nil value` 会一直躺在文件里，
+//   若按尾部固定窗口扫，每一次新失败都会被误判成「配置类」，进而错误硬失败。
+static int bs_count_from(const char *path, long from, const char *needle) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return 0; }
+    long off = from >= 0 ? from : (sb.st_size > 4096 ? sb.st_size - 4096 : 0);
+    if (off > sb.st_size) off = sb.st_size;
+    if (sb.st_size - off > 256 * 1024) off = sb.st_size - 256 * 1024;   // 上限 256KB
+    long add = sb.st_size - off;
+    if (add <= 0) { close(fd); return 0; }
+    char *buf = (char *)malloc((size_t)add + 1);
+    if (!buf) { close(fd); return 0; }
+    lseek(fd, off, SEEK_SET);
+    ssize_t gn = read(fd, buf, (size_t)add);
+    close(fd);
+    if (gn <= 0) { free(buf); return 0; }
+    buf[gn] = 0;
+    int cnt = 0;
+    const char *p = buf;
+    while ((p = strstr(p, needle)) != NULL) { cnt++; p++; }
+    free(buf);
+    return cnt;
+}
+
+// ★★★ v6.31：给「点了没起来」定性。只看 resume 之后新增字节（sjz_from / ag_from 是基线）。
+//   顺序即优先级：模块类先判 —— nil 算术常常是模块没灌进去导致的次生错误，不能反着来。
+static int ar_fail_class(char *out, size_t on, long sjz_from, long ag_from) {
+    static const struct { const char *k; int c; const char *n; } T[] = {
+        { "bs_module_lost",                               AR_CLS_MODULE, "module-lost" },
+        { "load snail module failed",                     AR_CLS_MODULE, "loadfail"    },
+        { "can not find version key",                     AR_CLS_MODULE, "noverkey"    },
+        { "recv auth failed",                             AR_CLS_AUTH,   "auth-fail"   },
+        { "attempt to perform arithmetic on a nil value",  AR_CLS_CONFIG, "nil-arith"   },
+        { "game is not front app",                        AR_CLS_FG,     "not-front"   },
+    };
+    int i;
+    for (i = 0; i < (int)(sizeof(T) / sizeof(T[0])); i++) {
+        if (bs_count_from(DATA_DIR "/log/sjz.log",   sjz_from, T[i].k) > 0 ||
+            bs_count_from(DATA_DIR "/log/agent.log", ag_from,  T[i].k) > 0) {
+            snprintf(out, on, "%s", T[i].n);
+            return T[i].c;
+        }
+    }
+    snprintf(out, on, "unknown");
+    return AR_CLS_UNKNOWN;
+}
+
 // ★ v6.24d：posix_spawn 薄封装 —— rootless 设备没有 /bin/sh，system() 必挂，
 //   必须 posix_spawn + 显式绝对路径；sigdefault 全置 + mask 清空（继承标准语义）。
 static void bs_spawnv(const char *path, char *const argv[]) {
@@ -5283,6 +5379,8 @@ static void *bs_watchdog(void *arg) {
     time_t ar_vendor_ts = 0;           // 厂商杀脚本时刻（冷却用）
     int    ar_stop_kind = 0;           // agent.log 尾部事件分类（0/1/2/3）
     int    ar_cr_hit    = 0;           // 本拍崩溃签名（由下面 cr 扫描块回填）
+    long   ar_sjz_mark  = -1;          // ★ v6.31：resume 时刻 sjz.log 尺寸（分类只看之后的增量）
+    long   ar_ag_mark   = -1;          // ★ v6.31：同上 agent.log
     if (ar.armed) {
         bs_evt("[ar] armed restored from disk (att=%d gu=%d) -> auto-resume active",
                ar.att, ar.gu);
@@ -5313,6 +5411,7 @@ static void *bs_watchdog(void *arg) {
                 ar.lst = 1;
                 if (!ar.armed && can_arm) {
                     ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
+                    ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：重新武装=解除硬失败
                 }
                 bs_ar_write(&ar, can_arm && !was_armed ? "running" : "running-lst");
                 bs_evt("[ar] RUNNING observed (st=%p run=%u) -> armed=%d lst=1%s",
@@ -5341,6 +5440,7 @@ static void *bs_watchdog(void *arg) {
             long a_sja = bs_file_age(DATA_DIR "/log/sjz.log");
             if (saw_run || (a_sja >= 0 && a_sja <= US_STOP_FRESH)) {
                 ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
+                ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：中控点了运行=解除硬失败
                 bs_ar_write(&ar, "run1");
                 bs_evt("[ar] armed (run 0->1, sjz=%lds) -> auto-resume active", a_sja);
             } else {
@@ -5564,6 +5664,7 @@ static void *bs_watchdog(void *arg) {
                 ar_stop_kind = bs_ar_stop_kind(ap, 262144);
                 if (ar_stop_kind == 1 && !ar.armed) {
                     ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
+                    ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：日志证据=解除硬失败
                     bs_ar_write(&ar, "run-log");
                     bs_evt("[ar] armed (agent.log: last event = begin run script)");
                 } else if (ar_stop_kind == 2) {
@@ -5630,15 +5731,20 @@ static void *bs_watchdog(void *arg) {
         //     ② 我们自己 killswitch → lst 已清 0
         //     ③ 从来没跑起来（点了运行但 st 一直 0，lst 从未置 1）→ 不拉，拉了也起不来
         //   ★ run==1 但 st==0 超过 AR_STUCK_SECS 也认（装包后 run 标志残留 1 的情况）。
-        if (g_mode == MODE_UNLOCK && ar.armed && ar.lst) {
+        //   ★ v6.31：把 g_crashresume 接回真闸门 —— 写 crashresume=0 才是真的「原地等人点运行」。
+        //     （v6.28 把旧 5 个入口换成 [ar] 时漏了这个条件，导致该开关空转了一整版。）
+        //     注意：postinst 的 conf_set 会强制写 1，历史现场被手改成 0 的机器装包后自动恢复；
+        //     想让某台机器不自动拉起，装包后再改文件（此处只读，不覆盖现场）。
+        if (g_mode == MODE_UNLOCK && ar.armed && ar.lst && g_crashresume) {
             time_t nowa  = time(NULL);
             long   a_sja = bs_file_age(DATA_DIR "/log/sjz.log");
 
             // --- 跑稳计数：拉起/手动跑起来后连续 st!=0 && run=1 满 AR_OK_STABLE 才算真恢复 ---
             if (run && st != 0) {
                 if (!ar_ok) ar_ok = nowa;
-                if (nowa - ar_ok >= AR_OK_STABLE && (ar.att || ar.gu)) {
+                if (nowa - ar_ok >= AR_OK_STABLE && (ar.att || ar.gu || ar.hard || ar.hv)) {
                     ar.att = 0; ar.gu = 0; ar.next = 0;
+                    ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：真跑稳=全部清零
                     bs_ar_write(&ar, "stable");
                     bs_evt("[ar] stable %ds -> failure counter reset", (int)(nowa - ar_ok));
                 }
@@ -5650,6 +5756,65 @@ static void *bs_watchdog(void *arg) {
                 if (!ar_notrun) ar_notrun = nowa;
             } else {
                 ar_notrun = 0;
+            }
+
+            // --- ★★★ v6.31：resume 回执 —— 点了一次到底起没起来 ---
+            //   窗口内看到 st!=0 = 点着了（ar.up=1；hard 计数等跑满 AR_OK_STABLE 才清）；
+            //   窗口到期仍 st==0 = 点了没反应 → 分类 + 对症动作 + 计数。
+            if (ar.vfy) {
+                if (st != 0) {
+                    ar.up = 1;
+                    ar.vfy = 0;
+                    bs_evt("[ar] resume#%d verified (st!=0) -> started", ar.att);
+                } else if (nowa >= ar.vfy) {
+                    ar.vfy = 0;
+                    char sig[24];
+                    int  cls = ar_fail_class(sig, sizeof(sig), ar_sjz_mark, ar_ag_mark);
+                    long dsz = ar_sjz_mark >= 0 ? bs_file_size(DATA_DIR "/log/sjz.log")   - ar_sjz_mark : -1;
+                    long dga = ar_ag_mark  >= 0 ? bs_file_size(DATA_DIR "/log/agent.log") - ar_ag_mark  : -1;
+                    bs_evt("[ar] ★ resume#%d NOT started in %ds (sig=%s cls=%d sjz+%ldB agent+%ldB)",
+                           ar.att, AR_VERIFY_SECS, sig, cls, dsz, dga);
+                    if (cls == AR_CLS_FG) {
+                        // 环境问题：游戏被顶到后台 → 拉回前台，下一拍立刻重试一次（不吃退避档）
+                        bs_evt("[ar] cls=fg -> uiopen %s then retry immediately", FG_GAME_BID);
+                        char *uo[] = { (char *)"/usr/bin/uiopen", (char *)"--bundleid",
+                                       (char *)FG_GAME_BID, NULL };
+                        bs_spawnv("/usr/bin/uiopen", uo);
+                        fg_last = nowa;
+                        ar.next = 0;
+                        bs_ar_write(&ar, "verify-fg");
+                    } else if (cls == AR_CLS_MODULE) {
+                        // 模块/容器缺失：重复点运行无效，puller 每 g_tick 自己会补回来。
+                        //   → 不增 hard 计数，只把下次重试推到 5 分钟后，别把退避档位烧光。
+                        bs_evt("[ar] cls=module -> wait puller (next=+300s, no hard-fail)");
+                        ar.next = nowa + 300;
+                        bs_ar_write(&ar, "verify-module");
+                    } else {
+                        // config / auth / unknown：点多少次都是同一结果 → 计数，够了就静默
+                        ar.hard++;
+                        if (cls == AR_CLS_CONFIG || cls == AR_CLS_AUTH) ar.hard = AR_HARD_N;
+                        if (ar.hard >= AR_HARD_N) {
+                            ar.hv = nowa; ar.gu = 1; ar.gts = nowa;
+                            bs_ar_write(&ar, "hard-fail");
+                            bs_evt("[ar] ★★ HARD FAIL att=%d sig=%s cls=%d hard=%d "
+                                   "-> silent %ds (needs human / new pack)",
+                                   ar.att, sig, cls, ar.hard, AR_HARD_HOLD);
+                        } else {
+                            bs_ar_write(&ar, "verify-fail");
+                            bs_evt("[ar] hard=%d/%d -> keep retrying", ar.hard, AR_HARD_N);
+                        }
+                    }
+                    // 分类基线推到当前末尾：下一次判定只看再往后的新增字节
+                    ar_sjz_mark = bs_file_size(DATA_DIR "/log/sjz.log");
+                    ar_ag_mark  = bs_file_size(DATA_DIR "/log/agent.log");
+                }
+            }
+
+            // --- ★ v6.31：硬失败到期 → 自动重开一轮（否则 hv 会永久挡住，等于设备躺平）---
+            if (ar.hv && nowa - ar.hv >= AR_HARD_HOLD) {
+                ar.hv = 0; ar.hard = 0; ar.gu = 0; ar.att = 0; ar.next = 0;
+                bs_evt("[ar] hard-fail window over -> new round (manual check advised)");
+                bs_ar_write(&ar, "hard-expired");
             }
 
             int want = 0;
@@ -5680,6 +5845,8 @@ static void *bs_watchdog(void *arg) {
                     want = 0; hold = "kill-cool";
                 } else if (ar_vendor_ts && nowa - ar_vendor_ts < AR_VENDOR_COOL) {
                     want = 0; hold = "vendor-cool";
+                } else if (ar.hv && nowa - ar.hv < AR_HARD_HOLD) {
+                    want = 0; hold = "hard-fail";
                 } else if (ar.gu) {
                     if (nowa - ar.gts > AR_GIVEUP_HOLD) {
                         ar.gu = 0; ar.att = 0; ar.next = 0;
@@ -5696,6 +5863,11 @@ static void *bs_watchdog(void *arg) {
             if (want) {
                 ar.att++;
                 ar.last = nowa;
+                // ★★★ v6.31：开回执窗口 + 记分类基线（分类只看本次 resume 之后新增的日志字节）
+                ar.vfy = nowa + AR_VERIFY_SECS;
+                ar.up  = 0;
+                ar_sjz_mark = bs_file_size(DATA_DIR "/log/sjz.log");
+                ar_ag_mark  = bs_file_size(DATA_DIR "/log/agent.log");
                 int bi = ar.att - 1;
                 if (bi >= AR_GIVEUP_N) bi = AR_GIVEUP_N - 1;
                 ar.next = nowa + AR_BACKOFF[bi];
