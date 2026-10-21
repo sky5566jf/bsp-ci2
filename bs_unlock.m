@@ -4787,6 +4787,7 @@ typedef struct {
     int  armed;     // 1 = 中控授权过运行，且尚无主动停止证据
     int  lst;       // ★ 1 = 上次观察到脚本确实在跑（st!=0）——「运行态 → 自己停」的唯一凭据
     int  att;       // 连续失败（拉起后没跑稳）次数
+    long hold;      // ★ 中控/用户停止时刻（该时刻后 60s 内不许被 st!=0 重新武装）
     long last;      // 上次拉起时刻
     long next;      // 退避：下次允许拉起时刻
     int  gu;        // 1 = 已放弃本轮
@@ -4800,11 +4801,15 @@ static void bs_ar_read(bs_ar_t *a) {
     char line[256];
     memset(line, 0, sizeof(line));
     if (fgets(line, sizeof(line) - 1, f)) {
-        long t = 0, last = 0, next = 0, gts = 0;
+        long t = 0, last = 0, next = 0, gts = 0, hold = 0;
         int  armed = 0, lst = 0, att = 0, gu = 0;
-        int n = sscanf(line, "t=%ld armed=%d lst=%d att=%d last=%ld next=%ld gu=%d gts=%ld",
-                       &t, &armed, &lst, &att, &last, &next, &gu, &gts);
-        if (n == 8) {
+        int n = sscanf(line, "t=%ld armed=%d lst=%d att=%d hold=%ld last=%ld next=%ld gu=%d gts=%ld",
+                       &t, &armed, &lst, &att, &hold, &last, &next, &gu, &gts);
+        if (n == 9) {
+            a->armed = armed; a->lst = lst; a->att = att; a->hold = hold;
+            a->last = last; a->next = next; a->gu = gu; a->gts = gts;
+        } else if (sscanf(line, "t=%ld armed=%d lst=%d att=%d last=%ld next=%ld gu=%d gts=%ld",
+                          &t, &armed, &lst, &att, &last, &next, &gu, &gts) == 8) {
             a->armed = armed; a->lst = lst; a->att = att; a->last = last;
             a->next  = next;  a->gu  = gu;  a->gts = gts;
         } else if (sscanf(line, "t=%ld armed=%d att=%d last=%ld next=%ld gu=%d gts=%ld",
@@ -4821,8 +4826,8 @@ static void bs_ar_read(bs_ar_t *a) {
 static void bs_ar_write(const bs_ar_t *a, const char *why) {
     FILE *f = fopen(AR_MARK, "w");
     if (!f) return;
-    fprintf(f, "t=%ld armed=%d lst=%d att=%d last=%ld next=%ld gu=%d gts=%ld why=%s\n",
-            (long)time(NULL), a->armed, a->lst, a->att, a->last, a->next, a->gu, a->gts,
+    fprintf(f, "t=%ld armed=%d lst=%d att=%d hold=%ld last=%ld next=%ld gu=%d gts=%ld why=%s\n",
+            (long)time(NULL), a->armed, a->lst, a->att, a->hold, a->last, a->next, a->gu, a->gts,
             why ? why : "-");
     fclose(f);
 }
@@ -5057,13 +5062,22 @@ static void *bs_watchdog(void *arg) {
         //   进程重启/装包后仍然记得「这台机器本来在跑」。中控点停止时会被清 0。
         //   只在翻转时写盘（每秒一次 tick 不能都落盘）。
         if (st != 0) {
-            if (!ar.lst || !ar.armed) {
+            // ★ 中控/用户刚下发停止时，脚本并不会立刻消失（st 还会非 0 几秒）。
+            //   这几秒里若被「看到运行」重新武装，停止就会被接上（.216 实测踩到）。
+            //   双重闸门：① stop_kind==2 / hold 后 60s 内；② run 必须仍为 1。
+            int hold_stop = (ar_stop_kind == 2)
+                         || (ar.hold && time(NULL) - ar.hold <= 60);
+            int can_arm   = (run != 0) && !hold_stop;
+            if (!ar.lst || (!ar.armed && can_arm)) {
                 int was_armed = ar.armed;
                 ar.lst = 1;
-                if (!ar.armed) { ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0; }
-                bs_ar_write(&ar, "running");
-                bs_evt("[ar] RUNNING observed (st=%p run=%u) -> armed=%d lst=1",
-                       (void *)st, (unsigned)run, was_armed);
+                if (!ar.armed && can_arm) {
+                    ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
+                }
+                bs_ar_write(&ar, can_arm && !was_armed ? "running" : "running-lst");
+                bs_evt("[ar] RUNNING observed (st=%p run=%u) -> armed=%d lst=1%s",
+                       (void *)st, (unsigned)run, ar.armed,
+                       (!can_arm && !was_armed) ? " (center-stop hold, lst only)" : "");
             }
         }
 
@@ -5137,7 +5151,7 @@ static void *bs_watchdog(void *arg) {
                 //   ★ 严格版：killswitch 的停也不许被 [ar] 接上（卡封禁期间拉起就是白拉），
                 //   直接把 lst 清 0，只留 AR_KILL_COOL 冷却。
                 if (ar.lst) {
-                    ar.lst = 0;
+                    ar.lst = 0; ar.hold = nwk;
                     bs_ar_write(&ar, "killswitch-stop");
                 }
                 bs_evt("[us] run 1->0 from our killswitch (%lds ago) -> NOT a user stop, no gate",
@@ -5149,6 +5163,7 @@ static void *bs_watchdog(void *arg) {
                 // ★ v6.28：用户/中控明确停止 → 撤销授权态 + 清运行凭据，自动恢复不再介入。
                 if (ar.armed || ar.lst) {
                     ar.armed = 0; ar.lst = 0; ar.att = 0; ar.gu = 0; ar.next = 0;
+                    ar.hold = time(NULL);   // 记录停止时刻，挡住 st 滞后带来的重武装
                     bs_ar_write(&ar, "user-stop");
                     bs_evt("[ar] disarmed (explicit stop, run 1->0 sjz=%lds) -> no auto-resume",
                            sa);
@@ -5316,6 +5331,7 @@ static void *bs_watchdog(void *arg) {
                     //   之后无论脚本停多久、重启多少次，都不许自动接上。
                     if (ar.armed || ar.lst) {
                         ar.armed = 0; ar.lst = 0; ar.att = 0; ar.gu = 0; ar.next = 0;
+                    ar.hold = time(NULL);   // 记录停止时刻，挡住 st 滞后带来的重武装
                         bs_ar_write(&ar, "stop-log");
                         bs_evt("[ar] disarmed (agent.log: center/user stop, no auth-fail nearby) "
                                "-> auto-resume OFF until next Run");
@@ -5324,7 +5340,7 @@ static void *bs_watchdog(void *arg) {
                     // 厂商杀脚本（授权坏了）：不是「自己空转」，拉了也会被杀 → 清 lst + 冷却。
                     ar_vendor_ts = nowt4;
                     if (ar.lst) {
-                        ar.lst = 0;
+                        ar.lst = 0; ar.hold = nowt4;
                         bs_ar_write(&ar, "vendor-stop");
                     }
                     bs_evt("[ar] vendor stop detected (stop + recv auth failed) -> hold %ds",
