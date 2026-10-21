@@ -76,7 +76,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "prewarm done" || (echo "MISSING key prewarm" && exit 1)
           strings bs_unlock.dylib | grep -q "auto-start gated until run=1" || (echo "MISSING userstop gate" && exit 1)
           strings bs_unlock.dylib | grep -q "agent stop script" || (echo "MISSING user-stop sig" && exit 1)
-          strings bs_unlock.dylib | grep -q "not a user stop, no gate" || (echo "MISSING sjz freshness guard" && exit 1)
+          strings bs_unlock.dylib | grep -q "self-stop, ar will decide" || (echo "MISSING sjz freshness guard" && exit 1)
           strings bs_unlock.dylib | grep -q "s2] applied" || (echo "MISSING s2 apply" && exit 1)
           strings bs_unlock.dylib | grep -q "s2] connect" || (echo "MISSING s2 connect redirect" && exit 1)
           strings bs_unlock.dylib | grep -q "s2] dns" || (echo "MISSING s2 pseudo-dns" && exit 1)
