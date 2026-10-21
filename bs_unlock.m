@@ -851,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.29"
+#define BS_DYLIB_VER       "v6.30"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -4308,10 +4308,15 @@ static void bs_so_maybe_reload(const char *verhex, const unsigned char *buf, siz
 //   尺寸可能相同 → so_sync 只升不降永远不触发。这里在「版本一致」时
 //   主动体检：逐段查键（字典已有零开销；缺 → 云端 /key bypass 现查），
 //   存在字典+云端都无键的段 = 永久解不开 → 按当前版本号重拉覆盖。
-#define SO_REPAIR_COOLDOWN   3600    // 成功后的长冷却（秒），防下载打爆
-#define SO_REPAIR_RETRY        60    // ★ v6.29：失败后的短冷却 —— 见下
+#define SO_REPAIR_COOL_OK       600    // ★ v6.30：成功后短冷却（原 3600 太长，实测空窗 1h）
+#define SO_REPAIR_COOL_THROTTLE 3600   // ★ v6.30：窗口内超额后的节流冷却
+#define SO_REPAIR_WIN          3600    // ★ v6.30：成功修复的滚动窗口
+#define SO_REPAIR_BUDGET          3    // ★ v6.30：窗口内允许的「短冷却」修复次数
+#define SO_REPAIR_RETRY          60    // ★ v6.29：失败后的短冷却
 static time_t g_so_repair_last = 0;
-static int    g_so_repair_cd   = SO_REPAIR_RETRY;   // ★ v6.29：当前生效的冷却档位
+static int    g_so_repair_cd   = SO_REPAIR_RETRY;   // 当前生效的冷却档位
+static time_t g_so_repair_win  = 0;                 // ★ v6.30：预算窗口起点
+static int    g_so_repair_ok   = 0;                 // ★ v6.30：窗口内成功修复次数
 
 /// 两个 32 位 hex 串大小写不敏感比较（云端 json 小写，本地自实现 md5 也小写，
 /// 保险起见仍按不敏感比）。相等返回 0。
@@ -4338,6 +4343,10 @@ static int bs_hexieq(const char *a, const char *b) {
 ///     着旧包 → md5 闸门 abort → 600+ 台一次性锁死 3600s，锁到 20:48，
 ///     只有 239 台抢在前面拿到。中继慢、弱网抖动、密钥晚到都会重演同一幕。
 ///   现在：入口先按「失败」记档（60s），只有 bs_write_file_atomic 成功才转长冷却。
+/// ★ v6.30：成功档从「无条件 3600s」改为「600s + 滚动预算」——
+///   v6.29 在 216 上实测出空窗：21:38:47 修好 → 21:40:47 又被换坏 →
+///   mismatch 打了日志却被 3600 冷却 return，盘上坏包要挂满 1 小时。
+///   现在 1h 窗口内前 3 次成功修复冷却 600s，超额才退 3600s 节流。
 static void bs_so_repair_pull(const char *ip, int port, const char *verhex,
                               const char *want_md5) {
     time_t now = time(NULL);
@@ -4399,10 +4408,21 @@ static void bs_so_repair_pull(const char *ip, int port, const char *verhex,
         else
             bs_evt("[so] ★★ container repaired: clean ver=%s (%lu B) written",
                    verhex, (unsigned long)sn);
-        // ★ v6.29：成功后转长冷却（1h）—— 盘上已是云端当前版本，若厂商又把包换回去，
-        //   一小时内不重复下载 1.16MB，避免被反复触发打爆带宽。
+        // ★ v6.30：成功后按「滚动预算」定档 —— 而不是无条件锁 1h。
+        //   原因（216 实测）：v6.29 成功后一律 3600s，21:38:47 修好、21:40:47 厂商
+        //   又把包换坏，mismatch 检测到了却因冷却直接 return，空窗整 1 小时。
+        //   新规则：1h 窗口内前 3 次成功修复只冷却 600s（10 分钟一检，够快），
+        //   超额（= 厂商在反复换包）才退到 3600s 节流，保住带宽不被打爆。
+        if (g_so_repair_win == 0 || now - g_so_repair_win >= SO_REPAIR_WIN) {
+            g_so_repair_win = now;
+            g_so_repair_ok  = 0;
+        }
+        g_so_repair_ok++;
         g_so_repair_last = now;
-        g_so_repair_cd   = SO_REPAIR_COOLDOWN;
+        g_so_repair_cd   = (g_so_repair_ok > SO_REPAIR_BUDGET)
+                           ? SO_REPAIR_COOL_THROTTLE : SO_REPAIR_COOL_OK;
+        bs_evt("[so] repair cooldown -> %ds (ok=%d in %ds window)",
+               g_so_repair_cd, g_so_repair_ok, SO_REPAIR_WIN);
         bs_so_maybe_reload(verhex, so, sn);
     }
     free(so);
