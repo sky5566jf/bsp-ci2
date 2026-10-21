@@ -5381,9 +5381,19 @@ static void *bs_watchdog(void *arg) {
     int    ar_cr_hit    = 0;           // 本拍崩溃签名（由下面 cr 扫描块回填）
     long   ar_sjz_mark  = -1;          // ★ v6.31：resume 时刻 sjz.log 尺寸（分类只看之后的增量）
     long   ar_ag_mark   = -1;          // ★ v6.31：同上 agent.log
+    // ★★★ v6.31：上个进程遗留的 resume 回执窗口一律作废。
+    //   为什么必须作废：vfy 是落盘的，进程重启后第一拍 st 必然是 0（容器还没起来），
+    //   若照判就会把「装包/冷启」记成「点了没起来」，白白攒 hard 计数甚至直接硬失败。
+    //   同时 ar.up 是单进程内的观察量，跨进程无意义。hard/hv 保留（6h 静默要跨重启生效）。
+    if (ar.vfy && ar.vfy <= ar_t0) {
+        bs_evt("[ar] stale verify window from prev process dropped (vfy=%ld t0=%ld)",
+               (long)ar.vfy, (long)ar_t0);
+        ar.vfy = 0;
+        ar.up  = 0;
+    }
     if (ar.armed) {
-        bs_evt("[ar] armed restored from disk (att=%d gu=%d) -> auto-resume active",
-               ar.att, ar.gu);
+        bs_evt("[ar] armed restored from disk (att=%d gu=%d hard=%d hv=%ld) -> auto-resume active",
+               ar.att, ar.gu, ar.hard, ar.hv);
     }
 
     // ★ v6.24r：给运行库状态建基线（一次性，无状态文件时按盘上 beta.so 算 md5）
