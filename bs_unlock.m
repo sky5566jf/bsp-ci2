@@ -851,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.28"
+#define BS_DYLIB_VER       "v6.29"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1923,10 +1923,113 @@ static void bs_devinfo_query(char *out, size_t n) {
     // ★ v6.25g：这里**不再**追加 &of=&ofn= —— 见 bs_q_live() 的注释。
 }
 
+// ---- ★ v6.29：conf 单键原子回写（token 自愈专用）
+//
+// 背景（2026-10-21 取证）：云端 635 台里 48 台 devid 与 dv 都是空串。
+//   断链 A —— postinst 只在装包那一刻从 agent.log 抓
+//      `send dev online success:<hex>` 写 token=，抓不到就跳过，**此后再无补写机会**；
+//   断链 B —— v6.26 的本地设备码只救了卡密（bs_card_device_id），心跳 /hb?key=
+//      用的 g_token 从来不回填。结果同一台设备卡密侧有稳定 32hex、心跳侧是空。
+// 后果：云端按 `ip:<addr>` 记账（bsmod_server.py touch_dev），s2 改道/离线开关/
+//   deny 全按 devid 匹配 → IP 一变规则全失效；devlog 收不到（云端完全瞎）。
+//
+// 这里做一次性自愈：token 空 → 按 hw.serial → .bs_devid 32hex 取一个稳定身份，
+// 与 bs_card_device_id() 完全同一套优先级，保证 /hb 的 key 与卡密 device_id 恒等。
+// 只在 g_token 为空时动手，已有 token 的设备一行不改。
+static int bs_conf_set_key(const char *path, const char *key, const char *val) {
+    size_t kl = strlen(key), vl = strlen(val);
+    char *body = NULL;
+    size_t bl = 0, cap = 0;
+    int hit = 0;
+
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            size_t ln = strlen(line);
+            size_t need = bl + (kl + vl + 4) + ln + 1;
+            if (need > cap) {
+                size_t nc = cap ? cap : 4096;
+                while (nc < need) nc *= 2;
+                char *nb = (char *)realloc(body, nc);
+                if (!nb) { free(body); fclose(f); return 0; }
+                body = nb; cap = nc;
+            }
+            if (!hit && ln > kl && !strncmp(line, key, kl) && line[kl] == '=') {
+                int w = snprintf(body + bl, cap - bl, "%s=%s\n", key, val);
+                if (w > 0) bl += (size_t)w;
+                hit = 1;
+                continue;                       // 整行替换，不保留原值
+            }
+            memcpy(body + bl, line, ln);
+            bl += ln;
+            body[bl] = 0;
+        }
+        fclose(f);
+    }
+    if (!hit) {                                 // 没有这个键 → 末尾追加
+        size_t need = bl + kl + vl + 4 + 1;
+        if (need > cap) {
+            size_t nc = cap ? cap : 4096;
+            while (nc < need) nc *= 2;
+            char *nb = (char *)realloc(body, nc);
+            if (!nb) { free(body); return 0; }
+            body = nb; cap = nc;
+        }
+        // 原文件末行若没换行，先补一个，否则会把新键粘在半行后面
+        if (bl > 0 && body[bl - 1] != '\n') {
+            body[bl++] = '\n';
+            body[bl] = 0;
+        }
+        int w = snprintf(body + bl, cap - bl, "%s=%s\n", key, val);
+        if (w > 0) bl += (size_t)w;
+    }
+
+    char tmp[320];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { free(body); return 0; }
+    ssize_t w = (body && bl) ? write(out, body, bl) : 0;
+    fsync(out);
+    close(out);
+    free(body);
+    if (w < 0 || (size_t)w != bl) { unlink(tmp); return 0; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return 0; }
+    return 1;
+}
+
+static void bs_card_devid_local(void);          // 定义在后面（设备码生成）
+
+/// token 空自愈（动机与优先级见上面 bs_conf_set_key 的注释块）
+static void bs_token_selfheal(void) {
+    if (g_token[0]) return;                     // 已有 token：一行不改
+    char srl[64] = {0};
+    bs_sysctl_str("hw.serial", srl, sizeof(srl));
+    int hw_ok = (srl[0] && strcmp(srl, "unknown") != 0);
+    if (hw_ok) {
+        snprintf(g_token, sizeof(g_token), "%s", srl);
+    } else {
+        bs_card_devid_local();                  // 复用/生成 .bs_devid 32hex
+        if (g_card_devid[0])
+            snprintf(g_token, sizeof(g_token), "%s", g_card_devid);
+    }
+    if (!g_token[0]) {
+        bs_log("[id] token still empty after self-heal -> cloud will key by ip");
+        return;
+    }
+    bs_evt("[id] token empty -> adopted %.8s (src=%s) conf_write=%d",
+           g_token, hw_ok ? "hw.serial" : "local-gen",
+           bs_conf_set_key(PULL_CONF, "token", g_token));
+}
+
 static void bs_load_conf(void) {
     g_stat_vp_net = inet_addr(STAT_VENDOR_IP);   // ★ v6.23l：厂商统计 IP（固定常量）
     FILE *f = fopen(PULL_CONF, "r");
-    if (!f) return;
+    if (!f) {                                   // conf 缺失（异常）：仍要做 token 自愈，否则永远 ip: 记账
+        bs_log("[conf] bs_pull.conf missing -> defaults + token self-heal");
+        bs_token_selfheal();
+        return;
+    }
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         char *eq = strchr(line, '=');
@@ -2070,6 +2173,9 @@ static void bs_load_conf(void) {
     }
     fclose(f);
 
+    // ★★★ v6.29：token 为空自愈（必须在下面拼 g_qbuf 之前，否则首轮 /hb 仍是空 key）
+    bs_token_selfheal();
+
     // 拼 query string（纯 C）：有 token 就 "?key=xxx"，否则空串。
     // 拼好后 bs_pull_modules 直接 snprintf 进 URL，不必再碰 ObjC。
     if (g_token[0]) snprintf(g_qbuf, sizeof(g_qbuf), "?key=%s", g_token);
@@ -2111,7 +2217,104 @@ static void bs_load_conf(void) {
 //      EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS at 0x10
 //      thread: objc_msgSend <- bs_puller <- _pthread_start
 //    改成纯 POSIX（write + 手工拼时间戳），任何线程任何阶段都安全。
+// ---- ★ v6.29：日志尾部保留式轮转
+//
+// 现场取证（2026-10-21，8149PJ 装机约 8h）：
+//   bs_unlock.log  733 KB  ← 我们，[pull]/[hb]/[devlog] 每 tick 都写
+//   bs_evt.log      13 KB  ← 我们，只写决策级事件
+//   sjz.log        776 KB  ← 厂商
+//   sreen.log      705 KB  ← 厂商
+//   agent.log      120 KB  ← 厂商
+// bs_log / bs_evt 都是裸 O_APPEND，无上限无轮转 ⇒ 按当前速率 bs_unlock.log
+// ≈2.2 MB/天 ⇒ 一年 800 MB。iOS 的 /var/mobile/Media 会被拖死。
+//
+// ★ 只清我们自己那两个，厂商的三个一律不碰：
+//   agent.log 是崩溃扫描基线（cr_size[]），清空会让 [cr] 漏一次真崩溃；
+//   sjz.log 的 mtime 是 bs_file_age() 判「刚刚真在跑」的依据，清空会把 mtime
+//   刷成当前 ⇒ 被误判成刚跑过 ⇒ [ar] 误武装。sreen.log 与我们无关。
+//
+// 做法：不建 .1/.2 归档（iOS 上多文件更易漏清），只保留尾部；读尾 → 从第一个
+// 换行起对齐（不产生半行）→ 写 tmp → rename 原子替换，读侧永远看到完整文件。
+// 代价：每 60s 一次 stat()，可忽略。
+#define BS_LOG_MAX       (1024 * 1024)   // 1 MB 触发
+#define BS_LOG_KEEP      (512 * 1024)    // 保留尾部 512 KB
+#define BS_EVT_MAX       (512 * 1024)
+#define BS_EVT_KEEP      (256 * 1024)
+#define BS_ROT_CHK_SECS  60              // 每 60s 最多 stat 一次
+
+/// 裸写一行（带时间戳），供轮转自述用 —— 不走 bs_log，避免递归
+static void bs_raw_line(const char *path, const char *msg) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    char line[256];
+    int n = snprintf(line, sizeof(line), "[%ld.%03ld] %s\n",
+                     (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000), msg);
+    if (n <= 0) return;
+    if ((size_t)n > sizeof(line)) n = (int)sizeof(line);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        ssize_t w = write(fd, line, (size_t)n);
+        (void)w;
+        close(fd);
+    }
+}
+
+static void bs_log_rotate(const char *path, long maxsz, long keep) {
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    long sz = (long)st.st_size;
+    if (sz <= maxsz) return;
+
+    long off = sz - keep;
+    if (off < 0) off = 0;
+    int in = open(path, O_RDONLY);
+    if (in < 0) return;
+    char *buf = (char *)malloc((size_t)keep + 1);
+    if (!buf) { close(in); return; }
+    if (lseek(in, off, SEEK_SET) < 0) { free(buf); close(in); return; }
+    ssize_t gn = read(in, buf, (size_t)keep);
+    close(in);
+    if (gn <= 0) { free(buf); return; }
+
+    long s = 0;
+    if (off > 0) {                       // 丢掉可能被截半的首行
+        while (s < gn && buf[s] != '\n') s++;
+        if (s < gn) s++;
+    }
+    if (s >= gn) s = 0;                  // 整块无换行（超长单行）→ 宁可整块保留，别清成空
+
+    char tmp[320];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int out = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out >= 0) {
+        ssize_t w = write(out, buf + s, (size_t)(gn - s));
+        (void)w;
+        fsync(out);
+        close(out);
+        if (rename(tmp, path) == 0) {
+            char msg[224];
+            snprintf(msg, sizeof(msg), "[log] rotated %s (%ld -> ~%ld B)",
+                     path, sz, keep);
+            bs_raw_line(path, msg);
+        } else {
+            unlink(tmp);
+        }
+    }
+    free(buf);
+}
+
+/// 两个文件都查一遍（各自阈值不同）
+static void bs_log_rotate_tick(void) {
+    static time_t rot_chk = 0;
+    time_t nowt = time(NULL);
+    if (rot_chk && nowt - rot_chk < BS_ROT_CHK_SECS) return;
+    rot_chk = nowt;
+    bs_log_rotate(BS_LOG_PATH, BS_LOG_MAX, BS_LOG_KEEP);
+    bs_log_rotate(BS_EVT_PATH, BS_EVT_MAX, BS_EVT_KEEP);
+}
+
 static void bs_log(const char *fmt, ...) {
+    bs_log_rotate_tick();
     char buf[768];
     va_list ap;
     va_start(ap, fmt);
@@ -2193,8 +2396,10 @@ static void bs_so_state_write(int pending, const char *md5, long size) {
     rename(tmp, fin);
 }
 
-/// 读状态：返回 1=有记录；md5out/size/pend/applied 均可为 NULL
-static int bs_so_state_read(char *md5out, size_t mn, long *size, int *pend, long *applied) {
+/// 读状态：返回 1=有记录；md5out/size/pend/applied/disk 均可为 NULL
+/// ★ v6.29：新增 disk（落盘时刻）—— 用来判「pend=1 挂了多久还没生效」
+static int bs_so_state_read(char *md5out, size_t mn, long *size, int *pend,
+                            long *applied, long *disk) {
     FILE *f = fopen(BS_SO_STATE_PATH, "r");
     if (!f) return 0;
     char b[256] = {0};
@@ -2214,6 +2419,7 @@ static int bs_so_state_read(char *md5out, size_t mn, long *size, int *pend, long
     if (size)     { const char *q = strstr(b, "size=");    *size    = q ? atol(q + 5) : -1; }
     if (pend)     { const char *q = strstr(b, "pend=");    *pend    = q ? atoi(q + 5) : -1; }
     if (applied)  { const char *q = strstr(b, "applied="); *applied = q ? atol(q + 8) : 0;  }
+    if (disk)     { const char *q = strstr(b, "disk=");    *disk    = q ? atol(q + 5) : 0;  }
     return 1;
 }
 
@@ -4066,7 +4272,7 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
 ///   动机：全网 495 台里绝大多数不会在本次换包后立刻有动作，若状态缺失就一直
 ///   显示 so=unknown；补基线后远程能直接读到「这台盘上是 842cabc4 还是 c2ead84e」。
 static void bs_so_state_bootstrap(void) {
-    if (bs_so_state_read(NULL, 0, NULL, NULL, NULL)) return;
+    if (bs_so_state_read(NULL, 0, NULL, NULL, NULL, NULL)) return;
     FILE *f = fopen(DATA_DIR "/beta.so", "rb");
     if (!f) return;
     fseek(f, 0, SEEK_END);
@@ -4102,8 +4308,10 @@ static void bs_so_maybe_reload(const char *verhex, const unsigned char *buf, siz
 //   尺寸可能相同 → so_sync 只升不降永远不触发。这里在「版本一致」时
 //   主动体检：逐段查键（字典已有零开销；缺 → 云端 /key bypass 现查），
 //   存在字典+云端都无键的段 = 永久解不开 → 按当前版本号重拉覆盖。
-#define SO_REPAIR_COOLDOWN   3600    // 修复尝试冷却（秒），防下载打爆
+#define SO_REPAIR_COOLDOWN   3600    // 成功后的长冷却（秒），防下载打爆
+#define SO_REPAIR_RETRY        60    // ★ v6.29：失败后的短冷却 —— 见下
 static time_t g_so_repair_last = 0;
+static int    g_so_repair_cd   = SO_REPAIR_RETRY;   // ★ v6.29：当前生效的冷却档位
 
 /// 两个 32 位 hex 串大小写不敏感比较（云端 json 小写，本地自实现 md5 也小写，
 /// 保险起见仍按不敏感比）。相等返回 0。
@@ -4122,17 +4330,26 @@ static int bs_hexieq(const char *a, const char *b) {
 ///   want_md5 非空时 = md5 强制模式（v6.23o）：下载体 md5 必须命中云端 /ver
 ///   报的值才落盘 —— 防止中继缓存陈旧包与云端来回打架。
 ///   冷却在入口统一判（成功/干净由调用方复位）。
+/// ★ v6.29：repair 冷却两档 —— 失败 60s / 成功 3600s。
+///   旧写法（v6.23o~v6.28）在**下载之前**就打 `g_so_repair_last = now`，而后面
+///   三条失败分支（download failed / md5 != cloud / 键不到位）都不撤销这个点，
+///   只有写入成功才清。后果（2026-10-21 19:48 全网事故实锤）：
+///     云端换 fix5 的那一刻，全网 120s tick 同时触发 repair，中控 relay 还缓存
+///     着旧包 → md5 闸门 abort → 600+ 台一次性锁死 3600s，锁到 20:48，
+///     只有 239 台抢在前面拿到。中继慢、弱网抖动、密钥晚到都会重演同一幕。
+///   现在：入口先按「失败」记档（60s），只有 bs_write_file_atomic 成功才转长冷却。
 static void bs_so_repair_pull(const char *ip, int port, const char *verhex,
                               const char *want_md5) {
     time_t now = time(NULL);
-    if (g_so_repair_last && now - g_so_repair_last < SO_REPAIR_COOLDOWN) return;
+    if (g_so_repair_last && now - g_so_repair_last < g_so_repair_cd) return;
     g_so_repair_last = now;
+    g_so_repair_cd   = SO_REPAIR_RETRY;          // ★ v6.29：先按失败算档
 
     size_t sn = 0;
     unsigned char *so = bs_dl_beta_relay(ip, port, verhex, &sn);
     if (!so) {
-        bs_log("[so] repair: download failed -> keep local, cooldown %ds",
-               SO_REPAIR_COOLDOWN);
+        bs_log("[so] repair: download failed -> keep local, retry in %ds",
+               SO_REPAIR_RETRY);
         return;
     }
 
@@ -4182,7 +4399,10 @@ static void bs_so_repair_pull(const char *ip, int port, const char *verhex,
         else
             bs_evt("[so] ★★ container repaired: clean ver=%s (%lu B) written",
                    verhex, (unsigned long)sn);
-        g_so_repair_last = 0;
+        // ★ v6.29：成功后转长冷却（1h）—— 盘上已是云端当前版本，若厂商又把包换回去，
+        //   一小时内不重复下载 1.16MB，避免被反复触发打爆带宽。
+        g_so_repair_last = now;
+        g_so_repair_cd   = SO_REPAIR_COOLDOWN;
         bs_so_maybe_reload(verhex, so, sn);
     }
     free(so);
@@ -5119,7 +5339,7 @@ static void *bs_watchdog(void *arg) {
             char smd5[40] = {0};
             long ssz = 0;
             if (sja >= 0 && sja <= US_STOP_FRESH
-                && bs_so_state_read(smd5, sizeof(smd5), &ssz, &pend, NULL) && pend == 1) {
+                && bs_so_state_read(smd5, sizeof(smd5), &ssz, &pend, NULL, NULL) && pend == 1) {
                 bs_so_state_write(0, smd5, ssz);          // 保留 size，别写成 0
                 bs_evt("[so] new so applied (script started, md5=%.8s) -> pend=0", smd5);
             }
@@ -5354,14 +5574,27 @@ static void *bs_watchdog(void *arg) {
                     //   「盘上新的、内存旧的，还差一次手动运行」。这样远程一眼分得清
                     //   三种停摆：盘上旧的坏包 / 盘上新包但没重启脚本 / 新包已生效还停。
                     char smd5[40] = {0};
-                    long ssz = -1, sap = 0;
+                    long ssz = -1, sap = 0, sdk = 0;
                     int  spend = -1;
-                    if (!bs_so_state_read(smd5, sizeof(smd5), &ssz, &spend, &sap))
+                    if (!bs_so_state_read(smd5, sizeof(smd5), &ssz, &spend, &sap, &sdk))
                         snprintf(smd5, sizeof(smd5), "unknown");
                     bs_evt("[cr] stall scan: run=%u st=%p hb=%d rage=%ld mark=%ld sjz=%ld us=%d "
                            "so=%.8s pend=%d size=%ld ar=%d/%d/%d lst=%d",
                            (unsigned)run, (void *)st, g_hb_ok, rage, mage, sjz_age, us_stop,
                            smd5, spend, ssz, ar.armed, ar.att, ar_stop_kind, ar.lst);
+
+                    // ★ v6.29：pend 长期不收敛提醒 —— 「新包在盘上，但脚本一直没重启，
+                    //   内存里还是旧包」。旧包修不了新 bug，而远程只看 pend=1 无法判断
+                    //   它挂了多久。这里落盘时长 >24h 就发一条醒目事件（每次落盘只报一次）。
+                    if (spend == 1 && sdk > 0) {
+                        static long pend_warn_disk = 0;
+                        long hung = (long)nowt4 - sdk;
+                        if (hung >= 86400 && pend_warn_disk != sdk) {
+                            pend_warn_disk = sdk;
+                            bs_evt("[so] ★★ pend=1 for %ldh (so=%.8s on disk, MEMORY still old) "
+                                   "-> needs ONE script restart to take effect", hung / 3600, smd5);
+                        }
+                    }
                 }
             }
         }

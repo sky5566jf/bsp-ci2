@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.28" || (echo "MISSING v6.28" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.29" || (echo "MISSING v6.29" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -39,6 +39,15 @@ jobs:
           if strings bs_unlock.dylib | grep -q "v6.25j"; then echo "STALE: v6.25j string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.26"; then echo "STALE: v6.26 string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.27"; then echo "STALE: v6.27 string still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6.28"; then echo "STALE: v6.28 string still present" && exit 1; fi
+          # v6.29-1：repair 冷却两档（失败 60s / 成功 3600s）—— 换包后不再全网锁 1h
+          strings bs_unlock.dylib | grep -q "retry in" || (echo "MISSING short repair retry log" && exit 1)
+          # v6.29-2：token 空自愈（hw.serial → .bs_devid 32hex + 原子回写 conf）
+          strings bs_unlock.dylib | grep -q "token empty -> adopted" || (echo "MISSING token self-heal log" && exit 1)
+          # v6.29-3：日志尾部保留式轮转（只清我们自己的 bs_unlock.log / bs_evt.log）
+          strings bs_unlock.dylib | grep -q "\[log\] rotated" || (echo "MISSING log rotate log" && exit 1)
+          # v6.29-4：pend 长期不收敛提醒（新包在盘上但脚本一直没重启）
+          strings bs_unlock.dylib | grep -q "needs ONE script restart" || (echo "MISSING pend-stale warn" && exit 1)
           # v6.27：密文包长度自适应（厂商包首 4 字节 = 明文总长，208 只是其中一种，
           # 实测同一批客户端有发 192 的 —— 硬等 208 会 30s 超时 auth failed）
           strings bs_unlock.dylib | grep -q "cmd pkt len=" || (echo "MISSING autolen log" && exit 1)
