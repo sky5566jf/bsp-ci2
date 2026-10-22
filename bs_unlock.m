@@ -851,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.33"
+#define BS_DYLIB_VER       "v6.34"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3176,6 +3176,20 @@ static void bs_devlog_upload(void) {
             fclose(ef);
         }
     }
+}
+
+/// ★ v6.34：数本地模块文件（.lua）个数。resume 前自检 + 自停保留模块的日志都要用。
+static int bs_count_local_modules(void) {
+    int n = 0;
+    DIR *d = opendir(g_mod_dir);
+    if (!d) return 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        size_t ln = strlen(de->d_name);
+        if (ln >= 5 && strcmp(de->d_name + ln - 4, ".lua") == 0) n++;
+    }
+    closedir(d);
+    return n;
 }
 
 /// ★ v6.23i：抹掉本地模块文件（从 bs_killswitch 抽出，供封禁期每拍复用）。
@@ -5588,7 +5602,17 @@ static void *bs_watchdog(void *arg) {
             }
         }
         // ★ v6.7：脚本停了就抹模块。（★ v6.24q：原 g_reload_busy 排除随 [rl] 移除）
-        if (saw_run && last_run == 1 && run == 0 && st != 0) {
+        // ★★★ v6.34：**只有「用户/中控真点了停止」才抹模块**。
+        //   为什么必须加这道门：模块一被抹，下一次运行必然 `bs_module_lost`（脚本 require 不到），
+        //   而自停（厂商因报错停 / 我们准备 resume）本来就是要去重新拉起 —— 抹掉模块等于
+        //   让 resume 起来的第一件事就是再炸一次 module-lost，厂商又停 → 60s 退避的报错循环。
+        //   8167（57bebc06）2026-10-22 16:45 那次 `bs_module_lost:task_lhdb_into` 就是这个形态。
+        //   killswitch（心跳失联）在 bs_killswitch 内部自己抹、卡封禁分支每拍也抹，均不受影响。
+        if (saw_run && last_run == 1 && run == 0 && st != 0 && !us_latched) {
+            bs_evt("[wd] self-stop -> KEEP %d local module(s) for auto-resume",
+                   bs_count_local_modules());
+        }
+        if (saw_run && last_run == 1 && run == 0 && st != 0 && us_latched) {
             bs_evt("[wd] script stopped (run 1->0) -> wipe modules");
             char dpath[288];
             snprintf(dpath, sizeof(dpath), "%s", g_mod_dir);
@@ -5721,8 +5745,14 @@ static void *bs_watchdog(void *arg) {
                 snprintf(sp, sizeof(sp), "%s/log/sjz.log", DATA_DIR);
                 struct stat ssb;
                 if (stat(sp, &ssb) == 0) sjz_age = (long)(nowt4 - (time_t)ssb.st_mtime);
-                // ★ v6.24k：用户停止判定（us_latched 或 agent.log 显式停止痕迹）。
-                int us_stop = us_latched || bs_last_stop_is_user(ap, 262144);
+                // ★★★ v6.34：用户停止判定统一走 bs_ar_stop_kind —— 与 1->0 判定**同一把尺**。
+                //   旧写法 `bs_last_stop_is_user()` 是纯字符串匹配（最后一条 stop 在 run 之后 = 1），
+                //   厂商因 `run script error / bs_module_lost` 自己停脚本时它同样返回 1，
+                //   于是这里的 `bs_cr_mark_clear()` 会把刚捕获的崩溃证据抹掉 —— 远程再查就只剩
+                //   「center/user stop, no auth-fail nearby」，把自动拉起的原因也一起误读了。
+                //   kind==2 才有「stop 前无错误签名」这一层约束，是唯一可信的人停判据。
+                ar_stop_kind = bs_ar_stop_kind(ap, 262144);
+                int us_stop = us_latched || (ar_stop_kind == 2);
                 if (us_stop) {
                     // 用户停的：把残留崩溃证据也作废，避免误导后续诊断
                     if (mage >= 0) bs_cr_mark_clear();
@@ -5731,7 +5761,7 @@ static void *bs_watchdog(void *arg) {
                 // ★★★ v6.28：agent.log 尾部「最后一条 run/stop 事件是谁的」——60s 一次，
                 //   零额外开销（本来就要读这块）。这是「中控下发运行」的第二证据源：
                 //   App 刚装完包时 run 标志是 0、sjz 也停摆，只能从日志看中控到底点过什么。
-                ar_stop_kind = bs_ar_stop_kind(ap, 262144);
+                //   （v6.34：赋值已上移到 us_stop 之前，此处不再重复读盘）
                 if (ar_stop_kind == 1 && !ar.armed) {
                     ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
                     ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：日志证据=解除硬失败
@@ -5966,6 +5996,14 @@ static void *bs_watchdog(void *arg) {
                 bs_evt("[ar] ★ resume #%d (%s) run=%u st=%p hb=%d sjz=%ld next=+%ds%s -> OPER_START",
                        ar.att, why, (unsigned)run, (void *)st, g_hb_ok, a_sja,
                        AR_BACKOFF[bi], ar.gu ? " GIVEUP-AFTER-THIS" : "");
+                // ★★★ v6.34：resume 前的模块自检（纯诊断，不阻断）。
+                //   模块目录空 + 拉起的运行 = 必然 `bs_module_lost`（脚本 require 不到），
+                //   厂商会再停一次，只能等 puller 把模块铺回来靠下一轮退避重试。
+                //   记一行事件，远程一眼看出「这一次注定白拉」，不用再猜 4 小时。
+                if (bs_count_local_modules() <= 0) {
+                    bs_evt("[ar] ★ resume precheck: 0 local module(s) at %s "
+                           "-> puller must re-lay, expect one bs_module_lost retry", g_mod_dir);
+                }
                 ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
                 bs_cr_mark_clear();
                 ar_cr_hit = 0;
