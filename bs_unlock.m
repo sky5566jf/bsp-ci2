@@ -741,6 +741,14 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define WD_TICK_SECS    2
 #define WD_STALE_TICKS  5       // 5 * 2s = 10s 判定僵死
 
+// ★★★ v6.36：模块盘面同步限速（秒）。
+//   216 实证（2026-10-22 21:05:26）：state change 注入时盘上只有 2 个 lua
+//   （task_lhdb_into 正被改名成 .missing），注入 n=2；1 秒后真模块被 cp 回来，
+//   但 dict/st 指针都没再变 → 永远不会重注入 → 脚本缺模块白卡 302 秒才崩，
+//   崩完 resume 第二次才拿到 n=3。puller 补模块、用户手动丢模块同理。
+//   修法：注入后记住 n，每拍比对盘上 .lua 个数，盘面数字一变就补注一次。
+#define MOD_SYNC_SECS   10
+
 // ★ v6.7：落盘后自动重启的状态机相位与超时上限 —— ★ v6.24q 已随 [rl] 整体移除
 //   （新 so 只落盘，脚本手动运行时加载；conf autoreload= 键仍解析但无动作点）
 
@@ -851,7 +859,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.35"
+#define BS_DYLIB_VER       "v6.36"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -5440,6 +5448,13 @@ static void *bs_watchdog(void *arg) {
     time_t cr_stall_last = 0; // ★ v6.24p：上次停摆诊断扫描时刻
     int    us_latched = 0;    // ★ v6.24k：用户停止闸门在本进程内的缓存（配合 .bs_userstop）
 
+    // ★★★ v6.36：模块盘面同步 —— 解决「注入后盘上才补回模块，dict 永不刷新」
+    //   mod_last_n = 上次 bs_inject_modules 真正灌进去的条数
+    //   mod_try_n  = 上次「因盘面变化而重注入」时看到的盘上文件数（防同一盘面反复重试刷日志）
+    int    mod_last_n  = -1;
+    int    mod_try_n   = -1;
+    time_t mod_sync_at = 0;
+
     // ★ v6.28：[ar] 自动恢复运行时状态
     bs_ar_t ar;                      // 授权态（落盘 .bs_ar，重启后仍有效）
     bs_ar_read(&ar);
@@ -6030,9 +6045,16 @@ static void *bs_watchdog(void *arg) {
                 //   模块目录空 + 拉起的运行 = 必然 `bs_module_lost`（脚本 require 不到），
                 //   厂商会再停一次，只能等 puller 把模块铺回来靠下一轮退避重试。
                 //   记一行事件，远程一眼看出「这一次注定白拉」，不用再猜 4 小时。
-                if (bs_count_local_modules() <= 0) {
+                int pre_n = bs_count_local_modules();
+                if (pre_n <= 0) {
                     bs_evt("[ar] ★ resume precheck: 0 local module(s) at %s "
                            "-> puller must re-lay, expect one bs_module_lost retry", g_mod_dir);
+                } else if (pre_n != mod_last_n) {
+                    // ★ v6.36：盘上模块数与上次注入数不一致 —— 拉起后 st 一出现，
+                    //   下面的 [mod] resync 会在 10s 内补注，不必再白等一个 300s 周期。
+                    bs_evt("[ar] ★ resume precheck: disk=%d last-injected=%d "
+                           "-> resync will re-inject once state appears (v6.36)",
+                           pre_n, mod_last_n);
                 }
                 ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
                 bs_cr_mark_clear();
@@ -6091,8 +6113,8 @@ static void *bs_watchdog(void *arg) {
             } else {
             bs_log("[wd] need_inject set -> inject now (st=%p)", (void *)st);
             if (st != 0) {
-                bs_inject_modules(base);
-                bs_log("[wd] need_inject done");
+                mod_last_n = bs_inject_modules(base);
+                bs_log("[wd] need_inject done n=%d", mod_last_n);
             } else {
                 bs_log("[wd] need_inject but st==0, defer");
                 g_need_inject = 1;      // 还没到能注入的时机，留给下一轮
@@ -6111,14 +6133,40 @@ static void *bs_watchdog(void *arg) {
                     // ★ v6.20：卡密封禁 → 拒绝重灌模块
                     bs_log("[wd] inject skipped (card blocked)");
                 } else {
-                    bs_inject_modules(base);
-                    bs_log("[wd] inject returned");
+                    mod_last_n = bs_inject_modules(base);
+                    bs_log("[wd] inject returned n=%d", mod_last_n);
                 }
                 continue;               // 本轮不参与僵死判定
             }
         } else {
             last_state = (uint64_t)-1;
             last_dict  = NULL;
+        }
+
+        // --- ★★★ v6.36：模块盘面同步（「注入之后」盘上才补回模块的场合） ---
+        //   216 实证（2026-10-22 21:05:26）：resume 后 state change 注入时盘上只有 2 个
+        //   lua（task_lhdb_into 正被改成 .missing），注入 n=2；1 秒后真模块被 cp 回来，
+        //   但 dict / st 指针都没再变 → 上面那个分支永远不会再进 → 脚本缺模块白卡
+        //   302 秒才崩，崩完第二次 resume 才拿到 n=3。puller 补模块同理。
+        //   这里每 MOD_SYNC_SECS 比对一次「盘上 .lua 个数」与「上次注入条数」，
+        //   盘面数字一变就补注一次；mod_try_n 记住试过的盘面，防止同一状态反复刷日志。
+        //   只在 st 就绪时做 —— st==0 时字典还没建，bs_inject_modules 拿不到槽位。
+        if (st != 0 && !g_card_blocked) {
+            time_t nows = time(NULL);
+            // mod_sync_at==0 表示「本进程还没同步过」—— 首拍必须放行，
+            // 否则设备时钟异常（nows 很小）时会永远卡在限速分支里。
+            if (mod_sync_at == 0 || nows - mod_sync_at >= MOD_SYNC_SECS) {
+                // nows 可能是 0（时钟未同步），写成 0 会让下一拍又走「首拍放行」，
+                // 退化成每拍 opendir —— 记 1 把它变成正常时间戳。
+                mod_sync_at = nows ? nows : 1;
+                int cur = bs_count_local_modules();
+                if (cur != mod_last_n && cur != mod_try_n) {
+                    mod_try_n = cur;
+                    bs_log("[mod] resync: disk=%d last=%d -> re-inject", cur, mod_last_n);
+                    mod_last_n = bs_inject_modules(base);
+                    bs_log("[mod] resync done n=%d", mod_last_n);
+                }
+            }
         }
 
         // --- v3：僵死态自愈 ---
