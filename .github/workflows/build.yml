@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.32" || (echo "MISSING v6.32" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.33" || (echo "MISSING v6.33" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -63,8 +63,18 @@ jobs:
           strings bs_unlock.dylib | grep -q "resume BLOCKED: live agent.log says center/user stop" || (echo "MISSING v6.32 live stop gate" && exit 1)
           strings bs_unlock.dylib | grep -q "stop-log-live" || (echo "MISSING v6.32 live stop ar state" && exit 1)
           strings bs_unlock.dylib | grep -q "sjz=%lds sk=%d st=%p" || (echo "MISSING v6.32 sk in stop log" && exit 1)
-          strings bs_unlock.dylib | grep -q "run 1->0 sk=%d sjz=%lds" || (echo "MISSING v6.32 sk in self-stop log" && exit 1)
+          strings bs_unlock.dylib | grep -q "run 1->0 sk=%d(%s) sjz=%lds" || (echo "MISSING v6.33 sk class in self-stop log" && exit 1)
           strings bs_unlock.dylib | grep -q "sjz=%lds rk=%d" || (echo "MISSING v6.32 rk in arm log" && exit 1)
+          # ===== v6.33：厂商因脚本报错停脚本，不许被判成「用户停止」=====
+          # 216 历史实证（2026-10-21 21:54:31 agent.log 第 15625 行附近）：
+          #   run script error:[string "..."]:1: bs_module_lost:task_lhdb_into!
+          #   agent stop script
+          # v6.32 的 sk==2 会把这条判成用户停止 → .bs_userstop + disarmed → 永不拉起。
+          # 修法：stop 前 4KB 窗口内追加脚本层错误签名 → kind=4，且签名必须晚于最后一次 run。
+          strings bs_unlock.dylib | grep -q "vendor-error-stop" || (echo "MISSING v6.33 vendor-error-stop class" && exit 1)
+          strings bs_unlock.dylib | grep -q "bs_module_lost" || (echo "MISSING v6.33 bs_module_lost signature" && exit 1)
+          strings bs_unlock.dylib | grep -q "load snail module failed" || (echo "MISSING v6.33 loadfail signature" && exit 1)
+          strings bs_unlock.dylib | grep -q "can not find version key" || (echo "MISSING v6.33 versionkey signature" && exit 1)
           # v6.30：repair 成功档改「600s + 滚动预算」—— 修好后厂商再换包不再空窗 1h
           strings bs_unlock.dylib | grep -q "repair cooldown -> %ds" || (echo "MISSING v6.30 budget cooldown log" && exit 1)
           strings bs_unlock.dylib | grep -q "in %ds window" || (echo "MISSING v6.30 window log" && exit 1)

@@ -851,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.32"
+#define BS_DYLIB_VER       "v6.33"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -5160,12 +5160,38 @@ static int bs_ar_stop_kind(const char *path, long want) {
     } else if (ls) {
         char *w0 = (ls - buf > 4096) ? ls - 4096 : buf;
         char *p  = w0;
-        int   af = 0;
+        char *paf = NULL, *pse = NULL;
         while (p < ls) {
-            if (!strncmp(p, "recv auth failed", 16)) { af = 1; break; }
+            if (!paf && !strncmp(p, "recv auth failed", 16)) paf = p;
+            // ★★★ v6.33：脚本层错误签名 —— 这次 stop 是**厂商因脚本报错自动下发**的。
+            //   216 历史实证（2026-10-21 21:54:31，agent.log 第 15625 行附近）：
+            //     run script error:[string "..."]:1: bs_module_lost:task_lhdb_into!
+            //     send sync info msg success!
+            //     agent stop script
+            //     begin stop script
+            //     end stop script
+            //   v6.32 的 sk==2 会把这条判成「用户/中控停止」→ 落 .bs_userstop +
+            //   disarmed，于是「脚本报错停住要自动拉起」这条需求被彻底堵死。
+            //   kind=4 = 厂商因错停，必须走 self-stop 分支交给 [ar]。
+            if (!pse && !strncmp(p, "run script error", 16)) pse = p;
             ++p;
         }
-        kind = af ? 3 : 2;
+        if (!pse) {
+            // 少数版本只打 bs_module_lost / 加载期失败串，不带 run script error 前缀
+            p = w0;
+            while (p < ls) {
+                if (!strncmp(p, "bs_module_lost", 14) ||
+                    !strncmp(p, "load snail module failed", 24) ||
+                    !strncmp(p, "can not find version key", 24)) { pse = p; break; }
+                ++p;
+            }
+        }
+        // ★ v6.33 精度：只认「本次运行周期内」的错误 —— 签名必须晚于最后一次 run 事件。
+        //   否则窗口里上一轮遗留的 run script error 会把一次真·中控停止误判成厂商因错停，
+        //   进而让 [ar] 把用户刚停掉的脚本又拉起来（正是 14:58 那类事故的另一种形态）。
+        if (pse && lr && pse < lr) pse = NULL;
+        if (paf && lr && paf < lr) paf = NULL;
+        kind = paf ? 3 : (pse ? 4 : 2);
     } else if (lr) {
         kind = 1;
     }
@@ -5523,10 +5549,13 @@ static void *bs_watchdog(void *arg) {
                        (long)(nwk - g_kill_ts));
             } else if (sk == 2 || (sk == 0 && sa >= 0 && sa <= US_STOP_FRESH)) {
                 // ★★★ v6.32：停止归属改成「日志证据优先」，不再用 sjz 年龄当第一判据。
-                //   sk==2（agent.log 最后一条是 stop）→ 无条件认「人停的」，这是 216 14:58 的正解；
+                //   sk==2（agent.log 最后一条是 stop，且 stop 前 4KB 无错误/授权失败签名）
+                //   → 无条件认「人停的」，这是 216 14:58 的正解；
                 //   sk==0（尾部 256KB 里既无 run 也无 stop，只可能日志刚被轮转/清空）
                 //   → 退回 v6.24l 的 sjz 新鲜度判据兜底。
-                //   sk==1（最后一条是 run）直接落到下面的 else = 自停：脚本刚崩时 sjz 同样新鲜，
+                //   ★ v6.33：sk==4（厂商因 run script error / bs_module_lost 自动停）不再进这里，
+                //     已归入下面的 else = 自停；否则「报错停住要自动拉起」会被本分支吃掉。
+                //   sk==1（最后一条是 run）同样落 else = 自停：脚本刚崩时 sjz 也新鲜，
                 //   旧逻辑会把它当人停，导致「报错停住不自动拉起」—— 用户明确要求要拉起。
                 bs_us_mark_write("run 1->0");
                 us_latched = 1;
@@ -5547,7 +5576,15 @@ static void *bs_watchdog(void *arg) {
                 //   ★ v6.32：进来有两条路 —— ① sk==1（agent.log 最后一条是 run，没人点过停止）；
                 //   ② sk==0 且 sjz 早已停摆（无日志证据 + 日志文件也停摆）。两条都算自停，
                 //   包括「刚崩、sjz 还很新鲜」这种旧版杀不掉的场景。
-                bs_evt("[us] run 1->0 sk=%d sjz=%lds -> self-stop, ar will decide", sk, sa);
+                //   ★ v6.33：第三条 —— sk==4（stop 前 4KB 有 run script error / bs_module_lost
+                //   / 加载期失败串）= 厂商因脚本报错自己停的，用户要的正是这一条自动拉起。
+                //   sk==3（recv auth failed）也落这里，随后由 ar_fail_class 判 auth → 硬失败窗口。
+                bs_evt("[us] run 1->0 sk=%d(%s) sjz=%lds -> self-stop, ar will decide",
+                       sk,
+                       sk == 4 ? "vendor-error-stop" :
+                       sk == 3 ? "auth-fail" :
+                       sk == 1 ? "log-says-run" : "stale-sjz",
+                       sa);
             }
         }
         // ★ v6.7：脚本停了就抹模块。（★ v6.24q：原 g_reload_busy 排除随 [rl] 移除）
