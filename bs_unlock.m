@@ -851,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.34"
+#define BS_DYLIB_VER       "v6.35"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -5129,6 +5129,9 @@ static void bs_ar_write(const bs_ar_t *a, const char *why) {
 // 扫 agent.log 尾部，判断「最后一次 run / stop 事件是谁的」：
 //   0 = 无证据   1 = 最后是运行（中控点过运行）
 //   2 = 中控/用户停止              3 = 厂商停止（紧邻 recv auth failed 授权失败）
+//   4 = 厂商因脚本报错自动停（run script error / bs_module_lost / 加载期失败）
+// ★ v6.35：判定优先级 = 中控 operate 紧邻 stop（→2，最高） > auth-fail（→3） >
+//   报错签名（→4，取窗口内最后一条且须晚于最后一次 run） > 其余（→2）
 // 说明：`recv rep key failed` 每 ~2min 一次属正常尾巴，**不能**作为厂商判据；
 //       只有 `recv auth failed`（30s 等不到 80）才代表授权链路真的坏了。
 static int bs_ar_stop_kind(const char *path, long want) {
@@ -5175,8 +5178,26 @@ static int bs_ar_stop_kind(const char *path, long want) {
         char *w0 = (ls - buf > 4096) ? ls - 4096 : buf;
         char *p  = w0;
         char *paf = NULL, *pse = NULL;
+
+        // ★★★ v6.35：**中控停止优先于任何历史报错**（最高优先，命中即返回）。
+        //   两种 stop 在 agent.log 里的紧邻形态完全不同：
+        //     中控点停止 → "begin process operate script msg!" 紧接着 "agent stop script"
+        //     厂商因错停 → "run script error:..." + "send sync info msg" 之后才是 "agent stop script"
+        //   所以只要 stop 前 200 字节内出现中控 operate 消息，无论窗口里有多少条报错，
+        //   都必须判人停。否则「用户点了停止 + 窗口里恰好有一次旧报错」会被判成厂商错停
+        //   → [ar] 又把用户刚停的脚本拉起来（14:58 那类事故的另一个入口）。
+        {
+            char *o0 = (ls - buf > 200) ? ls - 200 : buf;
+            char *po = NULL, *pq = o0;
+            while (pq < ls) {
+                if (!strncmp(pq, "begin process operate script msg", 32)) po = pq;
+                ++pq;
+            }
+            if (po) { free(buf); return 2; }
+        }
+
         while (p < ls) {
-            if (!paf && !strncmp(p, "recv auth failed", 16)) paf = p;
+            if (!strncmp(p, "recv auth failed", 16)) paf = p;
             // ★★★ v6.33：脚本层错误签名 —— 这次 stop 是**厂商因脚本报错自动下发**的。
             //   216 历史实证（2026-10-21 21:54:31，agent.log 第 15625 行附近）：
             //     run script error:[string "..."]:1: bs_module_lost:task_lhdb_into!
@@ -5187,7 +5208,16 @@ static int bs_ar_stop_kind(const char *path, long want) {
             //   v6.32 的 sk==2 会把这条判成「用户/中控停止」→ 落 .bs_userstop +
             //   disarmed，于是「脚本报错停住要自动拉起」这条需求被彻底堵死。
             //   kind=4 = 厂商因错停，必须走 self-stop 分支交给 [ar]。
-            if (!pse && !strncmp(p, "run script error", 16)) pse = p;
+            // ★★★ v6.35 关键修正：**取窗口内最后一条报错，不能取第一条**。
+            //   216 真机实证（2026-10-22 20:48:54，v6.34 装机后第二次报错）：
+            //     窗口 4KB 从前往后扫，原 `if (!pse)` 只认第一条 → 撞到 20:43:51 留下的
+            //     那条旧报错（pse 偏移 28344）；它早于 20:43:51 的 `begin run script`
+            //     （lr 偏移 28731），被下面的精度约束丢弃 → pse=NULL → 判 sk=2 人停 →
+            //     disarmed，20:48:54 那条真报错根本没被看到，脚本躺着不恢复。
+            //     20:43:51 首轮之所以成功（sk=4），是因为当时 `begin run script` 还没落盘、
+            //     lr 仍是 20:38:48，旧报错恰好晚于它 —— 纯竞态运气，不是逻辑对。
+            //   ⇒ 只有「离 stop 最近的那条」才是本次停止的真实原因。
+            if (!strncmp(p, "run script error", 16)) pse = p;
             ++p;
         }
         if (!pse) {
@@ -5196,7 +5226,7 @@ static int bs_ar_stop_kind(const char *path, long want) {
             while (p < ls) {
                 if (!strncmp(p, "bs_module_lost", 14) ||
                     !strncmp(p, "load snail module failed", 24) ||
-                    !strncmp(p, "can not find version key", 24)) { pse = p; break; }
+                    !strncmp(p, "can not find version key", 24)) pse = p;
                 ++p;
             }
         }
