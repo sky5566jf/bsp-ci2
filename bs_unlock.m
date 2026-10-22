@@ -5521,9 +5521,13 @@ static void *bs_watchdog(void *arg) {
                 }
                 bs_evt("[us] run 1->0 from our killswitch (%lds ago) -> NOT a user stop, no gate",
                        (long)(nwk - g_kill_ts));
-            } else if (sk == 2 || (sa >= 0 && sa <= US_STOP_FRESH)) {
-                // ★★★ v6.32：sk==2（agent.log 里最后一条是 stop）→ 无条件认「人停的」，
-                //   不再要求 sjz.log 在 300s 内写过。这条是 216 14:58 事故的正解。
+            } else if (sk == 2 || (sk == 0 && sa >= 0 && sa <= US_STOP_FRESH)) {
+                // ★★★ v6.32：停止归属改成「日志证据优先」，不再用 sjz 年龄当第一判据。
+                //   sk==2（agent.log 最后一条是 stop）→ 无条件认「人停的」，这是 216 14:58 的正解；
+                //   sk==0（尾部 256KB 里既无 run 也无 stop，只可能日志刚被轮转/清空）
+                //   → 退回 v6.24l 的 sjz 新鲜度判据兜底。
+                //   sk==1（最后一条是 run）直接落到下面的 else = 自停：脚本刚崩时 sjz 同样新鲜，
+                //   旧逻辑会把它当人停，导致「报错停住不自动拉起」—— 用户明确要求要拉起。
                 bs_us_mark_write("run 1->0");
                 us_latched = 1;
                 bs_cr_mark_clear();          // 用户停了，旧的崩溃证据一并作废
@@ -5538,11 +5542,12 @@ static void *bs_watchdog(void *arg) {
                 bs_evt("[us] script stop observed (run 1->0, sjz=%lds sk=%d st=%p) -> auto-start gated until run=1",
                        sa, sk, (void *)st);
             } else {
-                // ★★★ v6.28 严格版：run 掉了但 sjz 早已停摆 = **不是人停的**（自己崩了 /
-                //   厂商杀的）。lst 保持 1，交给下面的 [ar] 块决定是否接上。
-                //   ★ v6.32：只有 sk!=2（agent.log 里没有更新的 stop 记录）才走这里。
-                bs_evt("[us] run 1->0 but sjz=%lds (>%ds) sk=%d -> self-stop, ar will decide",
-                       sa, US_STOP_FRESH, sk);
+                // ★★★ v6.28 严格版：这不是人停的（自己崩了 / 厂商杀的）。
+                //   lst 保持 1，交给下面的 [ar] 块决定是否接上。
+                //   ★ v6.32：进来有两条路 —— ① sk==1（agent.log 最后一条是 run，没人点过停止）；
+                //   ② sk==0 且 sjz 早已停摆（无日志证据 + 日志文件也停摆）。两条都算自停，
+                //   包括「刚崩、sjz 还很新鲜」这种旧版杀不掉的场景。
+                bs_evt("[us] run 1->0 sk=%d sjz=%lds -> self-stop, ar will decide", sk, sa);
             }
         }
         // ★ v6.7：脚本停了就抹模块。（★ v6.24q：原 g_reload_busy 排除随 [rl] 移除）

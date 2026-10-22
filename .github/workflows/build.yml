@@ -63,7 +63,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "resume BLOCKED: live agent.log says center/user stop" || (echo "MISSING v6.32 live stop gate" && exit 1)
           strings bs_unlock.dylib | grep -q "stop-log-live" || (echo "MISSING v6.32 live stop ar state" && exit 1)
           strings bs_unlock.dylib | grep -q "sjz=%lds sk=%d st=%p" || (echo "MISSING v6.32 sk in stop log" && exit 1)
-          strings bs_unlock.dylib | grep -q "sjz=%lds (>%ds) sk=%d" || (echo "MISSING v6.32 sk in self-stop log" && exit 1)
+          strings bs_unlock.dylib | grep -q "run 1->0 sk=%d sjz=%lds" || (echo "MISSING v6.32 sk in self-stop log" && exit 1)
           strings bs_unlock.dylib | grep -q "sjz=%lds rk=%d" || (echo "MISSING v6.32 rk in arm log" && exit 1)
           # v6.30：repair 成功档改「600s + 滚动预算」—— 修好后厂商再换包不再空窗 1h
           strings bs_unlock.dylib | grep -q "repair cooldown -> %ds" || (echo "MISSING v6.30 budget cooldown log" && exit 1)
