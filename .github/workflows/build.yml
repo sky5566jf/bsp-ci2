@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.31" || (echo "MISSING v6.31" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.32" || (echo "MISSING v6.32" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -55,6 +55,16 @@ jobs:
           strings bs_unlock.dylib | grep -q "hard-fail window over" || (echo "MISSING v6.31 hard-fail expiry" && exit 1)
           # 4) crashresume 真闸门接回（v6.28 漏接导致该开关空转一整版）
           strings bs_unlock.dylib | grep -q "crashresume=%d" || (echo "MISSING crashresume conf log" && exit 1)
+          # ===== v6.32：中控点停止被 2 秒拉起（216 实证 2026-10-22 14:58）=====
+          # 根因：1->0 只按 sjz.log mtime 判「人停 / 自停」，脚本挂机无输出时 mtime 早就
+          # 超过 300s → 中控点停止被误判成 self-stop → [ar] 立刻 OPER_START。
+          # 修法：stop 来源的第一证据改成 agent.log（bs_ar_stop_kind），并加实时复查闸门。
+          strings bs_unlock.dylib | grep -q "stop evidence: agent.log = center/user stop" || (echo "MISSING v6.32 stop evidence log" && exit 1)
+          strings bs_unlock.dylib | grep -q "resume BLOCKED: live agent.log says center/user stop" || (echo "MISSING v6.32 live stop gate" && exit 1)
+          strings bs_unlock.dylib | grep -q "stop-log-live" || (echo "MISSING v6.32 live stop ar state" && exit 1)
+          strings bs_unlock.dylib | grep -q "sjz=%lds sk=%d st=%p" || (echo "MISSING v6.32 sk in stop log" && exit 1)
+          strings bs_unlock.dylib | grep -q "sjz=%lds (>%ds) sk=%d" || (echo "MISSING v6.32 sk in self-stop log" && exit 1)
+          strings bs_unlock.dylib | grep -q "sjz=%lds rk=%d" || (echo "MISSING v6.32 rk in arm log" && exit 1)
           # v6.30：repair 成功档改「600s + 滚动预算」—— 修好后厂商再换包不再空窗 1h
           strings bs_unlock.dylib | grep -q "repair cooldown -> %ds" || (echo "MISSING v6.30 budget cooldown log" && exit 1)
           strings bs_unlock.dylib | grep -q "in %ds window" || (echo "MISSING v6.30 window log" && exit 1)

@@ -851,7 +851,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.31"
+#define BS_DYLIB_VER       "v6.32"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -5448,14 +5448,18 @@ static void *bs_watchdog(void *arg) {
         //   路径②（agent.log 尾部是 begin run script）在下面 60s 扫描块里补。
         if (run && !last_run && !ar.armed) {
             long a_sja = bs_file_age(DATA_DIR "/log/sjz.log");
-            if (saw_run || (a_sja >= 0 && a_sja <= US_STOP_FRESH)) {
+            // ★★★ v6.32：补上「agent.log 说最后一条是 run」这条独立证据。
+            //   旧判据只看 sjz.log 新鲜度，脚本挂机无输出时它可能几十分钟不写，
+            //   中控刚点的运行就会被判成「冷启残留」而不武装 → 自动恢复整段失效。
+            int rk = bs_ar_stop_kind(DATA_DIR "/log/agent.log", 262144);
+            if (saw_run || rk == 1 || (a_sja >= 0 && a_sja <= US_STOP_FRESH)) {
                 ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
                 ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：中控点了运行=解除硬失败
                 bs_ar_write(&ar, "run1");
-                bs_evt("[ar] armed (run 0->1, sjz=%lds) -> auto-resume active", a_sja);
+                bs_evt("[ar] armed (run 0->1, sjz=%lds rk=%d) -> auto-resume active", a_sja, rk);
             } else {
-                bs_evt("[ar] run 0->1 but sjz=%lds (>%ds) -> stale flag, NOT armed",
-                       a_sja, US_STOP_FRESH);
+                bs_evt("[ar] run 0->1 but sjz=%lds (>%ds) rk=%d -> stale flag, NOT armed",
+                       a_sja, US_STOP_FRESH, rk);
             }
         }
 
@@ -5494,6 +5498,17 @@ static void *bs_watchdog(void *arg) {
             //   装完包/重启 App 后兜底永远不拉起，设备静默躺平）。
             long sa = bs_file_age(DATA_DIR "/log/sjz.log");
             time_t nwk = time(NULL);
+            // ★★★ v6.32：stop 来源的**第一证据必须是 agent.log**，不许只靠 sjz.log 的 mtime。
+            //   216 实证（2026-10-22 14:58）：脚本 12:13 起跑、14:07:51 后挂机无输出
+            //   （sjz.log 连续 51 分钟零写入、stall scan 一路 run=1 st!=0 证明真在跑），
+            //   中控 14:58:06 点停止 → 旧判据 sa=3017s > US_STOP_FRESH(300) → 误判成
+            //   self-stop（"不是人停的"）→ [ar] 2 秒内 OPER_START 把脚本又拉回来。
+            //   真正的中控证据（agent.log 里的 `agent stop script`）就在手边，先读它。
+            int sk = bs_ar_stop_kind(DATA_DIR "/log/agent.log", 262144);
+            if (sk == 2) {
+                bs_evt("[us] stop evidence: agent.log = center/user stop -> gate NOW "
+                       "(sjz=%lds, age ignored)", sa);
+            }
             if (g_kill_sent && nwk - g_kill_ts <= 180) {
                 // ★ v6.28：这次 1->0 是**我们自己** killswitch 发的 OPER_STOP，不是用户停。
                 //   旧版会照旧落 .bs_userstop → 心跳恢复后设备永久躺平（7 天 TTL 才解），
@@ -5506,7 +5521,9 @@ static void *bs_watchdog(void *arg) {
                 }
                 bs_evt("[us] run 1->0 from our killswitch (%lds ago) -> NOT a user stop, no gate",
                        (long)(nwk - g_kill_ts));
-            } else if (sa >= 0 && sa <= US_STOP_FRESH) {
+            } else if (sk == 2 || (sa >= 0 && sa <= US_STOP_FRESH)) {
+                // ★★★ v6.32：sk==2（agent.log 里最后一条是 stop）→ 无条件认「人停的」，
+                //   不再要求 sjz.log 在 300s 内写过。这条是 216 14:58 事故的正解。
                 bs_us_mark_write("run 1->0");
                 us_latched = 1;
                 bs_cr_mark_clear();          // 用户停了，旧的崩溃证据一并作废
@@ -5518,13 +5535,14 @@ static void *bs_watchdog(void *arg) {
                     bs_evt("[ar] disarmed (explicit stop, run 1->0 sjz=%lds) -> no auto-resume",
                            sa);
                 }
-                bs_evt("[us] script stop observed (run 1->0, sjz=%lds st=%p) -> auto-start gated until run=1",
-                       sa, (void *)st);
+                bs_evt("[us] script stop observed (run 1->0, sjz=%lds sk=%d st=%p) -> auto-start gated until run=1",
+                       sa, sk, (void *)st);
             } else {
                 // ★★★ v6.28 严格版：run 掉了但 sjz 早已停摆 = **不是人停的**（自己崩了 /
                 //   厂商杀的）。lst 保持 1，交给下面的 [ar] 块决定是否接上。
-                bs_evt("[us] run 1->0 but sjz=%lds (>%ds) -> self-stop, ar will decide",
-                       sa, US_STOP_FRESH);
+                //   ★ v6.32：只有 sk!=2（agent.log 里没有更新的 stop 记录）才走这里。
+                bs_evt("[us] run 1->0 but sjz=%lds (>%ds) sk=%d -> self-stop, ar will decide",
+                       sa, US_STOP_FRESH, sk);
             }
         }
         // ★ v6.7：脚本停了就抹模块。（★ v6.24q：原 g_reload_busy 排除随 [rl] 移除）
@@ -5863,6 +5881,26 @@ static void *bs_watchdog(void *arg) {
                         bs_evt("[ar] giveup window over -> new retry round");
                     } else {
                         want = 0; hold = "giveup";
+                    }
+                }
+                // ★★★ v6.32：发 OPER_START 之前**实时**复查一次 agent.log。
+                //   ar_stop_kind 是 60 秒扫描块的缓存值，中控刚点完停止的那一分钟里它还是旧值
+                //   （=0/1），正好是误拉起的窗口 —— 216 的 14:58:08 就发生在这个窗口里。
+                //   这一步只在「本来就要拉起」时才读日志（极低频），开销可忽略。
+                if (want) {
+                    int sk_live = bs_ar_stop_kind(DATA_DIR "/log/agent.log", 262144);
+                    if (sk_live == 2) {
+                        want = 0; hold = "center-stop-live";
+                        ar_stop_kind = 2;
+                        if (ar.armed || ar.lst) {
+                            ar.armed = 0; ar.lst = 0; ar.att = 0; ar.gu = 0; ar.next = 0;
+                            ar.hold = nowa;
+                            bs_ar_write(&ar, "stop-log-live");
+                        }
+                        bs_us_mark_write("run 1->0 (live)");
+                        us_latched = 1;
+                        bs_evt("[ar] ★ resume BLOCKED: live agent.log says center/user stop "
+                               "(why=%s att=%d) -> gate set, no OPER_START", why, ar.att);
                     }
                 }
                 if (want && ar.next && nowa < ar.next) {
