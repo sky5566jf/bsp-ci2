@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.36" || (echo "MISSING v6.36" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.37" || (echo "MISSING v6.37" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -87,6 +87,15 @@ jobs:
           strings bs_unlock.dylib | grep -q "resync will re-inject once state appears (v6.36)" || (echo "MISSING v6.36 precheck hint" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.35"; then echo "STALE: v6.35 string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.33"; then echo "STALE: v6.33 string still present" && exit 1; fi
+          # ===== v6.37：probe 默认「只拉不传」（.98 上报 030102 顶飞全网 280+ 台驱动）=====
+          #   2026-10-22 23:44:22.599 .98 probe 报 030102 → 7ms 后云端落盘 → bs_so_sync
+          #   只升不降把全网顶到厂商原版（AUTO_HARDEN=False）→ 8105 func-nil 死亡循环。
+          #   修法：probe 上行默认关（conf probeupl=，缺省 0），只保留 GET /ver 跟版下载。
+          strings bs_unlock.dylib | grep -q "probeupl" || (echo "MISSING v6.37 probeupl conf key" && exit 1)
+          strings bs_unlock.dylib | grep -q "upload DISABLED (probeupl=0)" || (echo "MISSING v6.37 probe upload-off banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "upload off, local watch only" || (echo "MISSING v6.37 local version watch" && exit 1)
+          strings bs_unlock.dylib | grep -q "pull-only follow ON" || (echo "MISSING v6.37 probe pull-only follow" && exit 1)
+          strings bs_unlock.dylib | grep -q "follow disabled (fully passive)" || (echo "MISSING v6.37 passive branch" && exit 1)
           # v6.30：repair 成功档改「600s + 滚动预算」—— 修好后厂商再换包不再空窗 1h
           strings bs_unlock.dylib | grep -q "repair cooldown -> %ds" || (echo "MISSING v6.30 budget cooldown log" && exit 1)
           strings bs_unlock.dylib | grep -q "in %ds window" || (echo "MISSING v6.30 window log" && exit 1)

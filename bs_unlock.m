@@ -859,7 +859,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.36"
+#define BS_DYLIB_VER       "v6.37"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1074,6 +1074,17 @@ static void bs_s2_apply(const char *v, const char *src) {
 // ★ v6.6：主动跟版（conf sosync= / sotick=）
 static int           g_so_sync = 1;
 static int           g_so_tick = SO_SYNC_TICK_SECS;
+
+// ★★★ v6.37：probe 上行开关（conf probeupl=，**默认 0 = 不上传**）。
+//   背景（2026-10-22 / 10-23 事故）：.98 真卡机 probe 在 15:44:22.599 上报 030102，
+//   7ms 后云端落盘 beta_030102.so → 全网 280+ 台被 bs_so_sync「只升不降」顶到
+//   厂商原版（AUTO_HARDEN=False，不硬化），8105 等设备随即 func-nil 死亡循环。
+//   probe 的职责从此收窄为「只拉不传」：
+//     · 上传（BSPR 帧 = 密钥 + 1MB 包体）：默认关闭，一个字节都不发。
+//     · 跟版（GET /ver → /script/beta.so）：MODE_PROBE 下照跑，落盘后**不重启脚本**
+//       （bs_so_maybe_reload 自 v6.24q 起只写 pend=1，不做任何运行态改动）。
+//   要临时恢复上传：conf 写 probeupl=1（老行为，慎用）。
+static int           g_probe_upl = 0;
 
 // ================================================================
 // ★★★★ v6.25：真离线 —— 进程内接管 server2，一个字节都不发厂商
@@ -2079,6 +2090,11 @@ static void bs_load_conf(void) {
             // ★ v6.6：主动跟版开关（写 0 关掉；缺省开）
             g_so_sync = atoi(v) ? 1 : 0;
         }
+        else if (!strcmp(k, "probeupl")) {
+            // ★★★ v6.37：probe 上行开关（缺省/写 0 = 不上传；写 1 = 恢复老的
+            //   「密钥 + 1MB 包体」上报）。probe 的上传会把厂商原版顶到全网，慎开。
+            g_probe_upl = atoi(v) ? 1 : 0;
+        }
         else if (!strcmp(k, "autoreload")) {
             // ★ v6.7：落盘后自动重启开关（缺省开；写 0 关掉，只落盘不动脚本）
             g_autoreload = atoi(v) ? 1 : 0;
@@ -2202,12 +2218,12 @@ static void bs_load_conf(void) {
     // ★ v6.12：缓存 app.plist 的中控 ip —— beta.so 中继地址直接用它（见 so_sync 下载处）
     bs_pc_ip_of_plist(g_appip, sizeof(g_appip));
 
-    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d egress=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
+    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d probeupl=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d egress=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
            BS_DYLIB_VER,
            g_port, g_tick, g_enable, g_mode == MODE_PROBE ? "probe" : "unlock",
            g_token[0] ? "(set)" : "(none)",
            g_qbuf[0] ? g_qbuf : "(none)", g_mod_dir, g_hb_max,
-           g_so_sync, g_so_tick, g_offstall, g_autoreload,
+           g_so_sync, g_probe_upl, g_so_tick, g_offstall, g_autoreload,
            g_crashresume, g_block_vps, g_off_egress,
            g_cardcheck, g_cardgrace, g_cardtick,
            g_card_host, g_cardval[0] ? "(set)" : "(none)",
@@ -4613,9 +4629,28 @@ static void *bs_so_sync_thread(void *arg) {
 ///   幂等设计：与上次成功上报同版本则本轮静默（不重复传 1MB 包）。
 static void *bs_probe_thread(void *arg) {
     uintptr_t base = (uintptr_t)arg;
-    bs_log("[probe] ★ radar starting tick=%ds host=%s:%d prj=%s token=%s",
-           PROBE_TICK_SECS, g_host, g_port, BS_PRJ, g_token[0] ? "(set)" : "(none)");
+    bs_log("[probe] ★ radar starting tick=%ds host=%s:%d prj=%s token=%s upl=%d",
+           PROBE_TICK_SECS, g_host, g_port, BS_PRJ, g_token[0] ? "(set)" : "(none)",
+           g_probe_upl);
     sleep(PULL_FIRST_DELAY);
+
+    // ★★★ v6.37：默认「只拉不传」—— 上行全关，一个字节都不发云端。
+    //   事故背景：.98 在 2026-10-22 23:44:22.599 上报 030102，7ms 后云端落盘并
+    //   被 bs_so_sync 顶到全网 280+ 台（只升不降 + AUTO_HARDEN=False）。
+    //   probe 从此只保留**纯本地**版本观测：厂商换包时记一行 evt，用于事后取证
+    //   （哪天换的、换到哪个版本），进程内不产生任何上行流量。
+    if (!g_probe_upl) {
+        char lastwatch[8] = {0};
+        bs_log("[probe] ★★ upload DISABLED (probeupl=0) -> pull-only, nothing sent to cloud");
+        for (;;) {
+            char wv[8] = {0};
+            if (bs_read_beta_ver(wv, sizeof(wv)) && strcmp(wv, lastwatch) != 0) {
+                bs_evt("[probe] local beta.so ver=%s (upload off, local watch only)", wv);
+                snprintf(lastwatch, sizeof(lastwatch), "%s", wv);
+            }
+            sleep(PROBE_TICK_SECS);
+        }
+    }
 
     char last_ver[8] = {0};
     int  last_ok = 0;
@@ -7417,6 +7452,23 @@ static void *bs_bootstrap(void *arg) {
         //    真机业务零改变，只多一个只读上报线程。
         if (g_mode == MODE_PROBE) {
             bs_log("★★★ PROBE mode: inject/watchdog/pull ALL skipped (read-only radar)");
+            // ★★★ v6.37：probe 也「跟版」—— 只 GET /ver 拉最新 beta.so 落盘，不上传。
+            //   · 落盘不重启：bs_so_maybe_reload 自 v6.24q 起只写 pend=1，不动运行态
+            //     ⇒ 真卡机业务零改变（脚本下次手动运行时才自然加载新包）
+            //   · key gate 走完整逻辑：包内每段版本键都要能取到才落盘，防「切了包没键
+            //     → can not find version key!!」
+            if (g_so_sync) {
+                pthread_t tso;
+                if (pthread_create(&tso, NULL, bs_so_sync_thread, NULL) == 0) {
+                    pthread_detach(tso);
+                    bs_log("[probe] pull-only follow ON: sotick=%ds first=%ds (no upload)",
+                           g_so_tick, SO_SYNC_FIRST_DELAY);
+                } else {
+                    bs_log("probe so_sync thread create failed");
+                }
+            } else {
+                bs_log("[probe] sosync=0 -> follow disabled (fully passive)");
+            }
             pthread_t tpr;
             if (pthread_create(&tpr, NULL, bs_probe_thread, (void *)g_base) == 0) {
                 pthread_detach(tpr);
