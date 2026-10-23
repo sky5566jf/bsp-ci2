@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.37" || (echo "MISSING v6.37" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.38" || (echo "MISSING v6.38" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -96,6 +96,13 @@ jobs:
           strings bs_unlock.dylib | grep -q "upload off, local watch only" || (echo "MISSING v6.37 local version watch" && exit 1)
           strings bs_unlock.dylib | grep -q "pull-only follow ON" || (echo "MISSING v6.37 probe pull-only follow" && exit 1)
           strings bs_unlock.dylib | grep -q "follow disabled (fully passive)" || (echo "MISSING v6.37 passive branch" && exit 1)
+
+          # ===== v6.38：「加载运行库出错」自愈三件套（1055/1056 新机批量实证驱动）=====
+          strings bs_unlock.dylib | grep -q "local beta.so MISSING/unreadable -> force full sync (self-heal)" || (echo "MISSING v6.38 missing-so milestone" && exit 1)
+          strings bs_unlock.dylib | grep -q "self-heal: no local beta.so -> download ver=" || (echo "MISSING v6.38 force-download branch" && exit 1)
+          strings bs_unlock.dylib | grep -q "post-write keys ready:" || (echo "MISSING v6.38 post-write key warmup" && exit 1)
+          strings bs_unlock.dylib | grep -q "pid=%d (suppress 300s)" || (echo "MISSING v6.38 errno log dedup" && exit 1)
+          if strings bs_unlock.dylib | grep -q "local beta.so unreadable -> skip sync"; then echo "STALE: v6.37 skip-sync branch still present" && exit 1; fi
           # v6.30：repair 成功档改「600s + 滚动预算」—— 修好后厂商再换包不再空窗 1h
           strings bs_unlock.dylib | grep -q "repair cooldown -> %ds" || (echo "MISSING v6.30 budget cooldown log" && exit 1)
           strings bs_unlock.dylib | grep -q "in %ds window" || (echo "MISSING v6.30 window log" && exit 1)

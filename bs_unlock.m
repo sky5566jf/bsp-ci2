@@ -858,8 +858,21 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 // ★ v6.6：主动跟版（免卡密机从我们云端取脚本包本体）
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
+// ★★★ v6.38（2026-10-23）：「加载运行库出错」自愈三件套
+//   现象：中控点「运行」→ 厂商 agent 打 `begin load script` → `load snail module failed`
+//         → 中控界面显示「加载运行库出错」，且之后每一次运行都复现，永不好转。
+//   根因（34 台新机实证，1055=f7d0d6ee / 1056=56b5542c）：
+//     ① bs_so_sync_once 读到本地 beta.so 不可用就 `return` —— 完全不拉包；
+//     ② bs_refresh_so_vers 在 stat 失败时把版本集合清零 —— verwatch 一把键都不补；
+//     ③ 于是盘上没包、字典没键，App 重新 load 必然失败，形成永久死锁。
+//   修法：
+//     ① 本地读不到 → 里程碑日志 + 直接走「云端 /ver → has_key → 逐版本键闸门 → 下载落盘」；
+//     ② stat 失败保留上次版本集合（不清零），键注入不中断；
+//     ③ 落盘后立刻重扫 + 补齐全部版本键（把「换包」到「可加载」的窗口压到 0）；
+//     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
+//        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.37"
+#define BS_DYLIB_VER       "v6.38"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -3271,7 +3284,19 @@ static void bs_killswitch(uintptr_t base, const char *why) {
 static int bs_read_beta_ver(char *out, size_t outsz) {
     int fd = open(DATA_DIR "/beta.so", O_RDONLY);
     if (fd < 0) {
-        bs_log("[mh] open beta.so failed errno=%d", errno);
+        // ★ v6.38：去抖。verwatch 每 3s 调一次，旧写法把 8KB 设备日志窗口刷满
+        //   `errno=2`，远端完全看不到 [so]/[pull]/[off] 的真日志（10-23 排障实锤）。
+        //   现在同一状态 300s 只打一条，并带上 pid —— 便于区分是哪个进程的视图
+        //   （App 进程 vs Agent 进程）看不到文件。
+        static time_t last_ts = 0;
+        static int    last_err = 0;
+        static int    seen = 0;
+        int e = errno;
+        time_t now = time(NULL);
+        if (!seen || e != last_err || now - last_ts >= 300) {
+            bs_log("[mh] open beta.so failed errno=%d pid=%d (suppress 300s)", e, (int)getpid());
+            seen = 1; last_err = e; last_ts = now;
+        }
         return 0;
     }
     unsigned char h[4];
@@ -3668,7 +3693,15 @@ static int bs_scan_so_vers(const unsigned char *b, size_t n,
 static int bs_read_file(const char *path, unsigned char **out, size_t *outlen);   // 定义在 probe 段（v6.4）
 static int bs_refresh_so_vers(void) {
     struct stat st;
-    if (stat(DATA_DIR "/beta.so", &st) != 0) { g_ek_nver = 0; return 0; }
+    if (stat(DATA_DIR "/beta.so", &st) != 0) {
+        // ★ v6.38：文件暂时不可读 → **保留上次扫描到的版本集合**，不要清零。
+        //   清零的后果（10-23 1055/1056 实锤）：verwatch 每 3s 扫一次都拿 0，
+        //   于是它一把版本键都不补；脚本一重启，App 解不开容器就直接
+        //   `load snail module failed` → 中控「加载运行库出错」。
+        //   保留旧集合至少能让字典里已有的键继续常驻，不至于一停电全丢。
+        if (g_ek_nver > 0) return g_ek_nver;
+        return 0;
+    }
     long long mt = (long long)st.st_mtimespec.tv_sec;
     if ((off_t)st.st_size == g_ek_scan_size && mt == g_ek_scan_mtime && g_ek_scan_size >= 0)
         return g_ek_nver;                       // 文件没变：沿用缓存
@@ -4498,10 +4531,19 @@ static void bs_so_repair_if_dirty(const char *ip, int port, const char *verhex) 
 /// 单轮跟版检查。无变化/够不着云端时静默返回（只在真正动作时打日志）。
 static void bs_so_sync_once(void) {
     char lver[8] = {0};
-    if (!bs_read_beta_ver(lver, sizeof(lver))) {
-        bs_log("[so] local beta.so unreadable -> skip sync");
-        return;
-    }
+    int have_local = bs_read_beta_ver(lver, sizeof(lver));
+    // ★★★ v6.38：本地 beta.so 读不到（缺失/权限/视图差异）**不再直接放弃**。
+    //   旧写法是 `return`，于是设备进入「自愈真空」：
+    //     厂商 App 在「停止 → 运行」时会重建本地运行库（snail module），
+    //     若那次重建失败/被清掉，盘上就再也没有 beta.so；
+    //     而 bs_refresh_so_vers() 又把版本集合清零 ⇒ verwatch 一把版本键都不补
+    //     ⇒ 脚本一重启就 `load snail module failed`（中控显示「加载运行库出错」）。
+    //   10-23 实测：14:13 新装的那批 34 台**全部**处于该状态（0 台有过一次成功的
+    //   盘上扫描），其中 1055(f7d0d6ee)/1056(56b5542c) 中控点运行当场报错。
+    //   现在：读不到就按「无本地包」处理 —— 直接向云端要正式包、过键闸门、落盘，
+    //   落盘后立刻重扫版本集合并补齐全部版本键。
+    if (!have_local)
+        bs_evt("[so] local beta.so MISSING/unreadable -> force full sync (self-heal)");
     char ip[128] = {0};
     if (!bs_get_host_c(ip, sizeof(ip))) {
         bs_log("[so] no host -> skip sync");
@@ -4529,6 +4571,18 @@ static void bs_so_sync_once(void) {
     free(b);
 
     if (!have_ver) { bs_log("[so] /ver parse failed -> skip"); return; }
+
+    // ★ v6.38：无本地包 → 跳过全部「版本比对」分支，直接进下载（仍走 has_key 闸门）。
+    //   这是「加载运行库出错」唯一能自动恢复的路径，绝不能因为读不到本地版本就退出。
+    if (!have_local) {
+        if (!has_key) {
+            bs_evt("[so] cloud %s has NO key yet -> self-heal blocked, wait", cver);
+            return;
+        }
+        bs_evt("[so] ★ self-heal: no local beta.so -> download ver=%s (%s)",
+               cver, wmd5[0] ? wmd5 : "no-md5");
+        goto SO_DL;
+    }
     if (strcmp(cver, lver) == 0) {                    // 已是最新
         // ★ v6.23o：md5 强制比对 —— 厂商通道/App 会在同版本号下整包换载荷
         //   （1005 实锤：人工覆盖干净包 2h 内又被换回变体；变体可全键但
@@ -4560,7 +4614,9 @@ static void bs_so_sync_once(void) {
         return;
     }
 
-    bs_evt("[so] cloud %s > local %s -> downloading", cver, lver);
+SO_DL:
+    bs_evt("[so] cloud %s > local %s -> downloading", cver,
+           have_local ? lver : "(none)");
     // ★ v6.23n：下载逻辑抽到 bs_dl_beta_relay（中继优先→云端回退→体积校验），
     //   与容器修复共用同一条路；app.plist 现读/sohost 覆盖/长超时都在 helper 里。
     size_t sn = 0;
@@ -4605,7 +4661,23 @@ static void bs_so_sync_once(void) {
     }
 
     if (bs_write_file_atomic(DATA_DIR "/beta.so", so, sn)) {
-        bs_evt("[so] ★ beta.so updated %s -> %s (%lu B)", lver, cver, (unsigned long)sn);
+        bs_evt("[so] ★ beta.so updated %s -> %s (%lu B)",
+               have_local ? lver : "(none)", cver, (unsigned long)sn);
+        // ★ v6.38：落盘后立刻重扫版本集合并补齐每把版本键。
+        //   理由：键字典是「进程内内存态」，脚本一重启就要重新解密；若此刻盘上
+        //   文件刚换、verwatch 还没来得及扫（或扫描被打断），下一次「运行」就会
+        //   `load snail module failed`。这里当场补完，等于把窗口压到 0。
+        g_ek_scan_size = -1;                      // 使缓存失效，强制重扫
+        int nv2 = bs_refresh_so_vers();
+        int keyed = 0;
+        for (int i = 0; i < nv2; i++) {
+            char vh[8];
+            snprintf(vh, sizeof(vh), "%02x%02x%02x",
+                     g_ek_vers[i][0], g_ek_vers[i][1], g_ek_vers[i][2]);
+            if (bs_ensure_extra_key(g_base, vh, 1)) keyed++;
+        }
+        if (nv2 > 0)
+            bs_evt("[so] post-write keys ready: %d/%d vers keyed", keyed, nv2);
         // ★ v6.7 在跑→重启 / 没在跑→只落盘；v6.23n 抽到 bs_so_maybe_reload 复用
         bs_so_maybe_reload(cver, so, sn);
     }
