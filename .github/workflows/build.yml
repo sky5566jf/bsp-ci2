@@ -21,6 +21,11 @@ jobs:
             -install_name @rpath/bs_test.dylib \
             bs_test.m -o bs_test.dylib
           codesign -f -s - bs_test.dylib
+      # ★ v6.39：断网恢复自启的状态机回归（不依赖真机，纯逻辑仿真）
+      #   断言：断网 3min/10min/1h 恢复后 [ar] 都能自己接上；
+      #         v6.38 基线必须复现「永不恢复」，证明本次改的就是这条 bug。
+      - name: Netloss resume state machine test
+        run: python3 _netloss_test.py
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
