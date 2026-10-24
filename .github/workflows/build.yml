@@ -24,7 +24,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.38" || (echo "MISSING v6.38" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.39" || (echo "MISSING v6.39" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -103,6 +103,22 @@ jobs:
           strings bs_unlock.dylib | grep -q "post-write keys ready:" || (echo "MISSING v6.38 post-write key warmup" && exit 1)
           strings bs_unlock.dylib | grep -q "pid=%d (suppress 300s)" || (echo "MISSING v6.38 errno log dedup" && exit 1)
           if strings bs_unlock.dylib | grep -q "local beta.so unreadable -> skip sync"; then echo "STALE: v6.37 skip-sync branch still present" && exit 1; fi
+
+          # ===== v6.39：断网恢复后脚本不自启（2026-10-24 断网事故根因，四条链路）=====
+          #   ① puller tick=60 + hbmiss=3 → 断网 3 分钟就 killswitch；
+          #   ② killswitch 无条件抹模块 → 恢复后撞 bs_module_lost 二次躺平；
+          #   ③ run 1->0 无条件清 ar.lst → [ar] 入口 ar.armed && ar.lst 永不成立；
+          #   ④ AR_KILL_COOL=600s 再压 10 分钟。
+          #   修法：kill 按 why 分级 + 保留 lst + 网络冷却 90s + 未达阈值 20s 快速重试。
+          strings bs_unlock.dylib | grep -q "keep modules" || (echo "MISSING v6.39 net-loss keep-modules banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "transient net loss, will auto-resume" || (echo "MISSING v6.39 keep-modules reason" && exit 1)
+          strings bs_unlock.dylib | grep -q "resumable=%d, lst=%d" || (echo "MISSING v6.39 resumable+lst log" && exit 1)
+          strings bs_unlock.dylib | grep -q "killswitch-stop-resumable" || (echo "MISSING v6.39 resumable ar state" && exit 1)
+          strings bs_unlock.dylib | grep -q "kill-cool-net" || (echo "MISSING v6.39 net kill cooldown state" && exit 1)
+          strings bs_unlock.dylib | grep -q "tolerate, keep modules" || (echo "MISSING v6.39 tolerance log" && exit 1)
+          strings bs_unlock.dylib | grep -q "tick=%ds fast=%ds" || (echo "MISSING v6.39 puller tick banner" && exit 1)
+          # 反回归：网络类 kill 不许再带 wipe
+          if strings bs_unlock.dylib | grep -q "TRIGGERED (%s) miss=%d -> stop script + wipe always"; then echo "FORBIDDEN: unconditional wipe banner" && exit 1; fi
           # v6.30：repair 成功档改「600s + 滚动预算」—— 修好后厂商再换包不再空窗 1h
           strings bs_unlock.dylib | grep -q "repair cooldown -> %ds" || (echo "MISSING v6.30 budget cooldown log" && exit 1)
           strings bs_unlock.dylib | grep -q "in %ds window" || (echo "MISSING v6.30 window log" && exit 1)

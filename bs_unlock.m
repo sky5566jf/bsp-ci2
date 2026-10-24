@@ -797,6 +797,9 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 
 // ---- v5：路线 A（PC 拉取）
 #define PULL_TICK_SECS   300    // 每 5 分钟检查一次更新
+// ★★★ v6.39：网络失联后的快速重试（断网恢复能被更快发现）
+#define HB_FAST_SECS     20     // 快速重试间隔
+#define HB_FAST_RETRY    6      // 最多快速重试几次（6×20s=2min），之后退回 g_tick
 #define PULL_FIRST_DELAY 3      // 启动 3s 后第一次拉（调试期缩短，便于快速观察）
 #define PULL_TIMEOUT     6      // 单请求超时（秒）
 #define PULL_PORT_DEF    8080   // PC 端 bs-module-server 默认端口
@@ -858,7 +861,22 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 // ★ v6.6：主动跟版（免卡密机从我们云端取脚本包本体）
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
-// ★★★ v6.38（2026-10-23）：「加载运行库出错」自愈三件套
+// ★★★ v6.39（2026-10-24）：断网恢复后脚本不自启 —— 四条链路一起修
+//   现象：bspath 设备断网数分钟→恢复网络→脚本停在停态，必须中控点「运行」。
+//   根因链（五步）：
+//     ① puller tick=60 + hbmiss=3 → **断网 3 分钟**就 `heartbeat lost` 触发 killswitch；
+//     ② killswitch 无条件 `bs_wipe_local_modules()` → 模块全删（断网不是模块坏了）；
+//     ③ run 1->0 分支无条件 `ar.lst = 0` → [ar] 入口条件 `ar.armed && ar.lst` 直接不成立；
+//     ④ [ar] 抑制矩阵 `!g_hb_ok → hb-not-ok` + `AR_KILL_COOL=600s` → 再压 10 分钟；
+//     ⑤ 恢复后模块得重新下载，下载失败又撞 `bs_module_lost` → 二次躺平。
+//   修法：
+//     ① killswitch 按 why 区分：`denied`(授权拒绝) 才抹模块，`lost`(网络失联) 保留；
+//     ② 新增 `g_kill_resumable`：网络类 kill 保留 `ar.lst`，允许 [ar] 自动接上；
+//     ③ 网络类 kill 冷却 `AR_KILL_COOL_NET=90s`（一个半 tick），封禁仍吃满 600s；
+//     ④ 未达阈值期间 puller 用 `HB_FAST_SECS=20s` 快速重试（最多 6 次≈2min），
+//        断网恢复能被 20s 内发现，而不是再等 60s；
+//     ⑤ 心跳恢复即清 `g_hb_miss`/快速重试计数，回到正常 tick。
+// ★ v6.38（2026-10-23）：「加载运行库出错」自愈三件套
 //   现象：中控点「运行」→ 厂商 agent 打 `begin load script` → `load snail module failed`
 //         → 中控界面显示「加载运行库出错」，且之后每一次运行都复现，永不好转。
 //   根因（34 台新机实证，1055=f7d0d6ee / 1056=56b5542c）：
@@ -872,7 +890,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.38"
+#define BS_DYLIB_VER       "v6.39"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -934,6 +952,10 @@ static int           g_hb_max   = HB_MISS_MAX_DEF;  // ★ v6.1 运行时阈值�
 //   并落盘 .bs_userstop → 心跳恢复后设备永久躺平。有此标志即可排除。
 static volatile int  g_kill_sent = 0;
 static volatile long g_kill_ts   = 0;
+// ★★★ v6.39：本次 killswitch 是否"可恢复"（1=网络类失联，只停脚本、保留模块、允许 [ar] 接上；
+//   0=授权拒绝/封禁，必须清模块且不许自动拉起）。
+//   断网事故根因：旧版两者一律清模块 + 清 ar.lst → 断网 3 分钟就永久躺平。
+static volatile int  g_kill_resumable = 0;
 
 // 拼好的 query string（"?key=xxx&nm=..&md=..&ov=.." 或 ""）——纯 C 拼接，供 URL 构造直接 snprintf 用
 static char   g_qbuf[512] = {0};
@@ -3251,30 +3273,52 @@ static int bs_wipe_local_modules(void) {
     return wiped;
 }
 
-/// 死亡开关：停脚本 + 抹掉本地模块。
+/// 死亡开关：停脚本 +（按需）抹掉本地模块。
 ///
-/// ★ 只做两件**不可逆且立刻生效**的事：
+/// ★ 只做**不可逆且立刻生效**的事：
 ///   1) 调产品自己的 `_set_user_script_operate(1)` 停脚本；
-///   2) unlink 模块目录下所有 *.lua（下轮即使有人跑 BSModuleServer，
-///      也要等 puller 重新下载才恢复 —— 也就是「必须运行 PC 服务才一切正常」）。
+///   2) 视触发原因决定是否 unlink 模块目录下所有 *.lua。
+///
+/// ★★★ v6.39：**心跳「网络类失联」不再删模块**（2026-10-24 断网事故根因）：
+///   旧版一律 `bs_wipe_local_modules()`，于是「断网 3 分钟」（tick=60 × hbmiss=3）
+///   就把模块清空。而断网是**瞬时故障**，模块本身没坏 —— 清空只是让恢复后
+///   必然撞 `bs_module_lost`，[ar] 就算接上也立刻再炸一次，形成「断网即躺平」。
+///   新规则：
+///     · 授权类拒绝（`heartbeat denied` / 卡封禁）→ 仍然清空（这是真判决，必须断能力）
+///     · 网络类失联（`heartbeat lost`）→ **只停脚本，保留模块**
+///   保留模块后，网络一恢复 puller 心跳通过 → [ar] 可在下一拍直接 OPER_START 接上，
+///   不用等模块重新下载（也避免了下载失败导致的二次卡死）。
 ///
 /// ★ 不删 dylib / 不删 beta.so / 不删 Agent：那是补丁本体，删了反而暴露意图，
 ///   而且会让「重新连上服务后自动恢复」这条链路断掉。
+///
+/// why 取值约定：含 "denied" = 授权拒绝（要抹）；含 "lost" = 网络失联（不抹）。
 static void bs_killswitch(uintptr_t base, const char *why) {
-    bs_log("[kill] TRIGGERED (%s) miss=%d -> stop script + wipe modules",
-           why ? why : "?", g_hb_miss);
+    // ★ v6.39：先判「这次要不要抹模块」，日志一并带上，便于事后取证
+    int wipe = 1;
+    if (why && strstr(why, "lost")) wipe = 0;      // 网络类失联 → 保留模块
+    if (why && strstr(why, "denied")) wipe = 1;    // 授权拒绝 → 必抹（覆盖顺序保证）
+
+    bs_log("[kill] TRIGGERED (%s) miss=%d -> stop script%s",
+           why ? why : "?", g_hb_miss, wipe ? " + wipe modules" : " (keep modules)");
 
     // 1) 停脚本（产品内部函数，必须从非裸线程调用路径进入 → watchdog 线程已就绪）
     if (base) {
         g_kill_sent = 1;                 // ★ v6.28：标记「这次停是我们自己干的」
         g_kill_ts   = (long)time(NULL);
+        g_kill_resumable = wipe ? 0 : 1; // ★ v6.39：网络失联 = 可恢复，允许 [ar] 接上
         ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
-        bs_log("[kill] OPER_STOP issued");
+        bs_log("[kill] OPER_STOP issued (resumable=%d)", g_kill_resumable);
     }
 
-    // 2) 抹掉模块文件（纯 POSIX，任何线程安全）
-    int wiped = bs_wipe_local_modules();
-    bs_log("[kill] wiped %d module file(s) at %s", wiped, g_mod_dir);
+    // 2) 按需抹掉模块文件（纯 POSIX，任何线程安全）
+    if (wipe) {
+        int wiped = bs_wipe_local_modules();
+        bs_log("[kill] wiped %d module file(s) at %s", wiped, g_mod_dir);
+    } else {
+        bs_log("[kill] KEEP %d module file(s) at %s (transient net loss, will auto-resume)",
+               bs_count_local_modules(), g_mod_dir);
+    }
 }
 
 /// ★ v6.3：读本地 beta.so 的版本号。
@@ -4959,10 +5003,13 @@ static int bs_pull_modules(uintptr_t base) {
 
 static void *bs_puller(void *arg) {
     uintptr_t base = (uintptr_t)arg;
-    bs_log("[pull] puller thread start, base=%p first_delay=%ds tick=%ds",
-           (void *)base, PULL_FIRST_DELAY, g_tick);
+    bs_log("[pull] puller thread start, base=%p first_delay=%ds tick=%ds fast=%ds",
+           (void *)base, PULL_FIRST_DELAY, g_tick, HB_FAST_SECS);
     sleep(PULL_FIRST_DELAY);
     bs_log("[pull] delay over, entering loop (enable=%d)", g_enable);
+    // ★ v6.39：快速重试状态（仅本线程用）
+    //   hb_fast=1 表示上一拍是「网络类失败但未达阈值」，下一拍用 HB_FAST_SECS 而不是 g_tick。
+    int hb_fast = 0, hb_fast_n = 0;
     for (;;) {
         bs_log("[pull] loop tick begin");
         @autoreleasepool {
@@ -4975,6 +5022,8 @@ static void *bs_puller(void *arg) {
                 if (alive == 1) {
                     // --- (b) 心跳通过 → 正常拉模块 ---
                     //     ★ v6.20：卡密封禁 → 不拉模块（已注入的也被 watchdog 拒灌）
+                    //     ★ v6.39：心跳恢复 → 快速重试状态清零，回到正常 tick
+                    hb_fast = 0; hb_fast_n = 0;
                     if (g_card_blocked) {
                         bs_log("[pull] skip modules (card blocked)");
                         int r = 0;
@@ -4993,21 +5042,36 @@ static void *bs_puller(void *arg) {
                     // ★ 网络类失败（连不上/超时/5xx）：计数容忍，抖动不误杀
                     int m = ++g_hb_miss;
                     if (m >= g_hb_max) {
-                        bs_log("[pull] hb lost %d/%d -> kill", m, g_hb_max);
+                        bs_log("[pull] hb lost %d/%d -> kill (keep modules, resumable)", m, g_hb_max);
                         g_hb_ok = 0;
+                        // ★ v6.39：网络失联只停脚本、保留模块、允许 [ar] 接上（见 bs_killswitch）
                         bs_killswitch(base, "heartbeat lost (max misses)");
                         // 保持 g_hb_miss 在阈值，避免死亡期间反复触发 OPER_STOP；
                         // 恢复时由 bs_hb_ping 的成功分支清零。
+                        hb_fast = 0;        // 已经躺下了，退回正常节奏，别猛刷
                     } else {
                         bs_log("[pull] hb miss %d/%d -> tolerate, keep modules",
                                m, g_hb_max);
+                        // ★★★ v6.39：网络失联期间**快速重试**，不等满 tick。
+                        //   断网恢复后最多等 HB_FAST_SECS(20s) 就能发现，而不是 60s。
+                        //   仅网络类失败、且未达阈值时启用；一旦通过立刻回到 g_tick。
+                        hb_fast = 1;
                     }
                 }
             } else {
                 bs_log("[pull] disabled, skip");
             }
         }
-        sleep(g_tick);
+        // ★ v6.39：网络抖动期的快速重试节奏（HB_FAST_RETRY 次后仍失败则退回落 tick，
+        //   避免长时间断网时每 20s 打一次日志/建连）。
+        if (hb_fast && hb_fast_n < HB_FAST_RETRY) {
+            hb_fast_n++;
+            sleep(HB_FAST_SECS);
+            if (!hb_fast) hb_fast_n = 0;      // 期间成功了 → 计数归零
+        } else {
+            hb_fast = 0; hb_fast_n = 0;
+            sleep(g_tick);
+        }
     }
     return NULL;
 }
@@ -5148,6 +5212,9 @@ static int bs_us_mark_exists(void) {
 #define AR_OK_STABLE    300     // 拉起后稳定跑满该秒数才清失败计数（防崩拉循环）
 #define AR_VENDOR_COOL  900     // 厂商杀脚本后冷却（授权没恢复，拉了也会被杀）
 #define AR_KILL_COOL    600     // 本进程 killswitch 后冷却
+// ★★★ v6.39：网络类失联的 kill 冷却。断网恢复后只需等一个 tick 就能接上，
+//   不能吃 600s —— 那会让「断网 3 分钟 + 恢复」变成「停 13 分钟以上」。
+#define AR_KILL_COOL_NET 90
 #define AR_GIVEUP_N     5       // 连续失败上限
 #define AR_GIVEUP_HOLD  1800    // 放弃后静默多久再给一轮机会（防永久躺平）
 static const int AR_BACKOFF[AR_GIVEUP_N] = { 60, 120, 300, 600, 1200 };
@@ -5705,14 +5772,23 @@ static void *bs_watchdog(void *arg) {
                 // ★ v6.28：这次 1->0 是**我们自己** killswitch 发的 OPER_STOP，不是用户停。
                 //   旧版会照旧落 .bs_userstop → 心跳恢复后设备永久躺平（7 天 TTL 才解），
                 //   这是历史上「停了就再也不动」的一条隐蔽成因，必须排除。
-                //   ★ 严格版：killswitch 的停也不许被 [ar] 接上（卡封禁期间拉起就是白拉），
-                //   直接把 lst 清 0，只留 AR_KILL_COOL 冷却。
-                if (ar.lst) {
+                //   ★ 严格版：killswitch 的停也不许被 [ar] 接上（卡封禁期间拉起就是白拉）。
+                //   ★★★ v6.39 拆分（断网事故根因）：
+                //     · 授权拒绝/封禁（g_kill_resumable==0）→ 照旧清 lst，只留 AR_KILL_COOL。
+                //     · 网络类失联（g_kill_resumable==1）→ **保留 lst**，只记 hold 时刻挡住
+                //       st 滞后带来的重武装；等心跳恢复后由 [ar] 正常接上。
+                //       旧版一律清 lst → 网络一恢复 [ar] 入口条件 `ar.armed && ar.lst`
+                //       直接不成立，脚本永远停着等人点运行（断网设备的典型症状）。
+                if (ar.lst && !g_kill_resumable) {
                     ar.lst = 0; ar.hold = nwk;
                     bs_ar_write(&ar, "killswitch-stop");
+                } else if (ar.lst) {
+                    ar.hold = nwk;      // 只挡 3 分钟，不动 lst → 允许自动接上
+                    bs_ar_write(&ar, "killswitch-stop-resumable");
                 }
-                bs_evt("[us] run 1->0 from our killswitch (%lds ago) -> NOT a user stop, no gate",
-                       (long)(nwk - g_kill_ts));
+                bs_evt("[us] run 1->0 from our killswitch (%lds ago) -> NOT a user stop, "
+                       "no gate (resumable=%d, lst=%d)",
+                       (long)(nwk - g_kill_ts), g_kill_resumable, ar.lst);
             } else if (sk == 2 || (sk == 0 && sa >= 0 && sa <= US_STOP_FRESH)) {
                 // ★★★ v6.32：停止归属改成「日志证据优先」，不再用 sjz 年龄当第一判据。
                 //   sk==2（agent.log 最后一条是 stop，且 stop 前 4KB 无错误/授权失败签名）
@@ -6088,13 +6164,19 @@ static void *bs_watchdog(void *arg) {
                 if (g_card_blocked) {
                     want = 0; hold = "card-blocked";
                 } else if (!g_hb_ok) {
+                    // ★ v6.39：网络类 kill 之后 puller 发现心跳恢复即置 g_hb_ok=1，
+                    //   [ar] 下一拍就能接上（最坏 AR_KILL_COOL_NET=90s）。
+                    //   删掉这条就等于「断网恢复后必须人工点运行」，这就是事故本体。
                     want = 0; hold = "hb-not-ok";
                 } else if (us_latched || bs_us_mark_exists()) {
                     want = 0; hold = "user-stop";
                 } else if (ar_stop_kind == 2) {
                     want = 0; hold = "center-stop";
-                } else if (g_kill_sent && nowa - g_kill_ts < AR_KILL_COOL) {
-                    want = 0; hold = "kill-cool";
+                } else if (g_kill_sent && nowa - g_kill_ts <
+                           (g_kill_resumable ? AR_KILL_COOL_NET : AR_KILL_COOL)) {
+                    // ★ v6.39：网络失联的 kill 冷却只留一个 tick（AR_KILL_COOL_NET），
+                    //   否则「保留模块」也白搭 —— 还得再等 10 分钟才肯接。封禁才吃满 600s。
+                    want = 0; hold = g_kill_resumable ? "kill-cool-net" : "kill-cool";
                 } else if (ar_vendor_ts && nowa - ar_vendor_ts < AR_VENDOR_COOL) {
                     want = 0; hold = "vendor-cool";
                 } else if (ar.hv && nowa - ar.hv < AR_HARD_HOLD) {

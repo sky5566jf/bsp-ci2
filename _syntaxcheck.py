@@ -84,7 +84,10 @@ need = ['bs_hb_ping', 'bs_killswitch', 'bs_http_get_ex', 'g_hb_ok', 'g_hb_miss',
         'bs_mh_count', 'g_mh_kk', 'g_mh_vv', 'g_mh_cached', 're-inject from cache',
         # ★ v6.15 beta.so 多记录容器 ⇒ 补注「载荷记录版本 020909」密钥
         'bs_ensure_payload_key', 'g_pay_vv', 'g_pay_cached', 'g_pay_miss', 'g_pay_try',
-        'payload cloud key OK', 'payload key injected']
+        'payload cloud key OK', 'payload key injected',
+        # ★ v6.39 断网恢复自启四件套
+        'HB_FAST_SECS', 'HB_FAST_RETRY', 'AR_KILL_COOL_NET', 'g_kill_resumable',
+        'heartbeat lost (max misses)', 'kill-cool-net', 'hb_fast']
 print('---- symbols ----')
 for k in need:
     c = src.count(k)
