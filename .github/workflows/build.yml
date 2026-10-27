@@ -21,15 +21,16 @@ jobs:
             -install_name @rpath/bs_test.dylib \
             bs_test.m -o bs_test.dylib
           codesign -f -s - bs_test.dylib
-      # ★ v6.39：断网恢复自启的状态机回归（不依赖真机，纯逻辑仿真）
-      #   断言：断网 3min/10min/1h 恢复后 [ar] 都能自己接上；
-      #         v6.38 基线必须复现「永不恢复」，证明本次改的就是这条 bug。
+      # ★ v6.40：断网恢复自启的状态机回归（不依赖真机，纯逻辑仿真）
+      #   断言 A 组：断网 3min/10min/1h 恢复后 [ar] 都能自己接上（含 disarm 链路）
+      #   断言 B 组：v6.38 与 v6.39 必须都复现「永不恢复」，证明这条 bug 真存在
+      #   断言 C 组：人停 / 封禁 / 超窗 三种情况必须仍然 gate（防「修完变成人停也拉」）
       - name: Netloss resume state machine test
         run: python3 _netloss_test.py
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.39" || (echo "MISSING v6.39" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.40" || (echo "MISSING v6.40" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -122,6 +123,18 @@ jobs:
           strings bs_unlock.dylib | grep -q "kill-cool-net" || (echo "MISSING v6.39 net kill cooldown state" && exit 1)
           strings bs_unlock.dylib | grep -q "tolerate, keep modules" || (echo "MISSING v6.39 tolerance log" && exit 1)
           strings bs_unlock.dylib | grep -q "tick=%ds fast=%ds" || (echo "MISSING v6.39 puller tick banner" && exit 1)
+          # ===== v6.40（2026-10-27）：disarm 没认自己人 → 断网恢复仍不自启 =====
+          #   216 真机：v6.39 前三条链路全生效，第四条被 :5998 的兜底 kind=2 抹掉。
+          #   修法：拆 kind=6（网络故障停）+ 三处加 g_kill_sent/g_kill_resumable 自我认领。
+          strings bs_unlock.dylib | grep -q "stop evidence = OUR killswitch" || (echo "MISSING v6.40 self-kill claim in stall scan" && exit 1)
+          strings bs_unlock.dylib | grep -q "skip disarm (keep armed=" || (echo "MISSING v6.40 skip-disarm action" && exit 1)
+          strings bs_unlock.dylib | grep -q "network failure (kind=6)" || (echo "MISSING v6.40 kind=6 network-fail class" && exit 1)
+          strings bs_unlock.dylib | grep -q "center-stop is OUR killswitch" || (echo "MISSING v6.40 matrix self-kill bypass" && exit 1)
+          strings bs_unlock.dylib | grep -q "NOT gating, proceed" || (echo "MISSING v6.40 live-check self-kill bypass" && exit 1)
+          strings bs_unlock.dylib | grep -q "tcp connect server timeout" || (echo "MISSING v6.40 net-fail signature" && exit 1)
+          # 反回归：v6.40 之后 disarm 那两个分支必须仍然存在（人停照样要 gate）
+          strings bs_unlock.dylib | grep -q "auto-resume OFF until next Run" || (echo "MISSING center-stop disarm (regressed!)" && exit 1)
+          strings bs_unlock.dylib | grep -q "resume BLOCKED: live agent.log says center/user stop" || (echo "MISSING live center-stop gate (regressed!)" && exit 1)
           # 反回归：网络类 kill 不许再带 wipe
           if strings bs_unlock.dylib | grep -q "TRIGGERED (%s) miss=%d -> stop script + wipe always"; then echo "FORBIDDEN: unconditional wipe banner" && exit 1; fi
           # v6.30：repair 成功档改「600s + 滚动预算」—— 修好后厂商再换包不再空窗 1h

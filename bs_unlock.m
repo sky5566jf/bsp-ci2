@@ -861,6 +861,30 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 // ★ v6.6：主动跟版（免卡密机从我们云端取脚本包本体）
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
+// ★★★★ v6.40（2026-10-27）：**断网恢复仍不自启的真正元凶：disarm 没认自己人**
+//   216 真机复现（13:42:47 中控点运行 → 13:43 断网 → 13:49:40 网络恢复 → 脚本永久空闲）：
+//   v6.39 四条链路里**前三条全部生效**，第四条（允许 [ar] 接上）被自己抹掉：
+//     13:45:26  [kill] TRIGGERED (heartbeat lost max misses) -> OPER_STOP (resumable=1, KEEP 模块)
+//     13:45:35  agent.log: tcp connect server timeout / connect remote server3 failed
+//                          / agent stop script        ← 厂商执行我们的停，无 operate 前缀
+//     13:46:26  g_kill_resumable = 1
+//     13:46:28  [ar] disarmed (center/user stop, no auth-fail nearby) -> lst 被清 0  ← 功亏一篑
+//     13:49:40  网络恢复、心跳 200 全绿，但 .bs_ar = armed=0 lst=0 → 永不接
+//   根因：`bs_ar_stop_kind` 的**兜底 kind=2**。它只在「无任何错误签名」时才触发，
+//   而 `tcp connect server timeout` / `connect remote server3 failed` 根本不在签名表里，
+//   于是「我们自己 killswitch 发的停」被判定成「用户在 App 里点的停」。
+//   同一份证据有**两条判定入口，一条有保护一条没有**（与 pit-crresume 同型的漏迁）：
+//     · :5771 的 run 1->0 判定 → 有 `g_kill_sent && now-g_kill_ts<=180` 保护 ✓
+//     · :5998 的 stall scan      → **完全没引用 g_kill_sent / g_kill_resumable** ✗
+//     · :6173 / :6198 的 [ar] 抑制矩阵 → 同样只认 kind==2 ✗
+//   修法（双层，互为保险）：
+//     ① **拆 kind（本质修）**：兜底再分一层 —— 窗口内出现网络故障签名（且无 operate 前缀、
+//        无错误签名）→ `kind=6`（自停，归属不明但确定不是人点的），交给 [ar] 按 self-stop 处理。
+//        真·中控/人停因 `begin process operate script msg` 在 :5378 提前 return 2，完全不受影响。
+//     ② **加自我标记保护（保险）**：5998/6173/6198 三处，只要
+//        `g_kill_sent && g_kill_resumable && now-g_kill_ts <= AR_KILL_SELF_WIN` 就直接放行。
+//        ★ 必须配时间窗：`g_kill_resumable` 一旦置 1 永不主动清零（只有下一次 kill 才改），
+//          单拿它当判据会把用户真点停止也放行。
 // ★★★ v6.39（2026-10-24）：断网恢复后脚本不自启 —— 四条链路一起修
 //   现象：bspath 设备断网数分钟→恢复网络→脚本停在停态，必须中控点「运行」。
 //   根因链（五步）：
@@ -890,7 +914,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.39"
+#define BS_DYLIB_VER       "v6.40"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -5215,6 +5239,12 @@ static int bs_us_mark_exists(void) {
 // ★★★ v6.39：网络类失联的 kill 冷却。断网恢复后只需等一个 tick 就能接上，
 //   不能吃 600s —— 那会让「断网 3 分钟 + 恢复」变成「停 13 分钟以上」。
 #define AR_KILL_COOL_NET 90
+// ★★★★ v6.40：killswitch 自己发的停，在 agent.log 里留下的 `agent stop script`
+//   **永远不会过期** —— 每次扫 256KB 都能再看到同一条，所以不能靠「日志里有没有」
+//   判断归属，必须靠「我们 kill 过、且在窗口内」。窗口取 900s：覆盖
+//   「断网 3 分钟(180s) + kill 冷却 90s + 恢复后 [ar] 一拍 60s」的最坏叠加，
+//   同时远小于一次真人操作周期，避免把用户后来真点的停止也放行。
+#define AR_KILL_SELF_WIN 900
 #define AR_GIVEUP_N     5       // 连续失败上限
 #define AR_GIVEUP_HOLD  1800    // 放弃后静默多久再给一轮机会（防永久躺平）
 static const int AR_BACKOFF[AR_GIVEUP_N] = { 60, 120, 300, 600, 1200 };
@@ -5417,7 +5447,34 @@ static int bs_ar_stop_kind(const char *path, long want) {
         //   进而让 [ar] 把用户刚停掉的脚本又拉起来（正是 14:58 那类事故的另一种形态）。
         if (pse && lr && pse < lr) pse = NULL;
         if (paf && lr && paf < lr) paf = NULL;
-        kind = paf ? 3 : (pse ? 4 : 2);
+        if (paf) {
+            kind = 3;                          // 授权失败后被厂商杀
+        } else if (pse) {
+            kind = 4;                          // 厂商因脚本/模块报错自动停
+        } else {
+            // ★★★★ v6.40：兜底 kind=2 再拆一层（断网恢复不自启的真正元凶）。
+            //   stop 前 4KB 里如果有**网络故障签名**，这次停极可能是「我们 killswitch 发
+            //   OPER_STOP → 厂商 agent 执行时正好在重连授权服」留下的，绝不能判人停：
+            //     [kill] TRIGGERED (heartbeat lost) -> OPER_STOP        ← 我们发的
+            //     tcp connect server timeout!                            ← 断网症状
+            //     connect remote server3 failed!                         ← 断网症状
+            //     agent stop script                                      ← 厂商执行
+            //   判成 2 → 5998 disarm 清 lst → 网络恢复后 armed=0 lst=0 永不接（216 实证）。
+            //   拆出 kind=6 = 自停（归属不明但确定不是人点的），[ar] 按 self-stop 走。
+            //   ★ 真·中控/人停不受影响：它带 `begin process operate script msg`，
+            //     已在上面 :5408 提前 return 2。App 内手动停止也是同一条消息通道。
+            int netfail = 0;
+            p = w0;
+            while (p < ls) {
+                if (!strncmp(p, "tcp connect server timeout", 26) ||
+                    !strncmp(p, "connect remote server", 21) ||
+                    !strncmp(p, "connect server failed", 21) ||
+                    !strncmp(p, "tcp connect failed", 18) ||
+                    !strncmp(p, "no network", 10)) { netfail = 1; break; }
+                ++p;
+            }
+            kind = netfail ? 6 : 2;
+        }
     } else if (lr) {
         kind = 1;
     }
@@ -5996,15 +6053,33 @@ static void *bs_watchdog(void *arg) {
                     bs_ar_write(&ar, "run-log");
                     bs_evt("[ar] armed (agent.log: last event = begin run script)");
                 } else if (ar_stop_kind == 2) {
-                    // ★ 严格版：中控（或用户在 App 里）下发停止 → 两个凭据都清，
-                    //   之后无论脚本停多久、重启多少次，都不许自动接上。
-                    if (ar.armed || ar.lst) {
+                    // ★★★★ v6.40（断网事故根因点①）：这条 stop 极可能是**我们自己**
+                    //   killswitch 发的。OPER_STOP 走 `FN_SET_OPER(OPER_STOP)` 直接调 App
+                    //   内部函数，不经中控消息通道 → agent.log 只留厂商执行的
+                    //   `agent stop script`，形态与人工点停止完全一样，kind 判不出区别。
+                    //   判据：kill 过 + 可恢复 + 落在自我窗口内 → 自己人，绝不能 disarm。
+                    //   ★ 时间窗不可省：g_kill_resumable 置 1 后永不主动清零。
+                    long kage = g_kill_ts ? (long)nowt4 - g_kill_ts : -1;
+                    if (g_kill_sent && g_kill_resumable && kage >= 0 &&
+                        kage <= AR_KILL_SELF_WIN) {
+                        bs_evt("[ar] stop evidence = OUR killswitch (%lds ago, resumable) "
+                               "-> skip disarm (keep armed=%d lst=%d)", kage, ar.armed, ar.lst);
+                    } else if (ar.armed || ar.lst) {
+                        // ★ 严格版：中控（或用户在 App 里）下发停止 → 两个凭据都清，
+                        //   之后无论脚本停多久、重启多少次，都不许自动接上。
                         ar.armed = 0; ar.lst = 0; ar.att = 0; ar.gu = 0; ar.next = 0;
                     ar.hold = time(NULL);   // 记录停止时刻，挡住 st 滞后带来的重武装
                         bs_ar_write(&ar, "stop-log");
                         bs_evt("[ar] disarmed (agent.log: center/user stop, no auth-fail nearby) "
                                "-> auto-resume OFF until next Run");
                     }
+                } else if (ar_stop_kind == 6) {
+                    // ★★★★ v6.40（断网事故根因点②）：stop 前 4KB 有网络故障签名，
+                    //   且无 operate 前缀、无错误签名 → 归属不明但确定不是人点的
+                    //   （典型：killswitch 发停 + 厂商 agent 恰好在此刻重连授权服失败）。
+                    //   按 self-stop 处理：**不动 armed/lst**，等心跳恢复后 [ar] 自己接上。
+                    bs_evt("[ar] stop evidence = network failure (kind=6) -> treat as self-stop, "
+                           "keep armed=%d lst=%d", ar.armed, ar.lst);
                 } else if (ar_stop_kind == 3) {
                     // 厂商杀脚本（授权坏了）：不是「自己空转」，拉了也会被杀 → 清 lst + 冷却。
                     ar_vendor_ts = nowt4;
@@ -6171,7 +6246,19 @@ static void *bs_watchdog(void *arg) {
                 } else if (us_latched || bs_us_mark_exists()) {
                     want = 0; hold = "user-stop";
                 } else if (ar_stop_kind == 2) {
-                    want = 0; hold = "center-stop";
+                    // ★★★★ v6.40：先认自己人。网络类 kill 发的 OPER_STOP 在 agent.log
+                    //   里就是一条裸 `agent stop script`，与本矩阵里的 "center-stop"
+                    //   完全同形 —— 旧版因此把「我们自己的停」当成「人停」，网络恢复后
+                    //   永远 want=0。判据同上：kill 过 + 可恢复 + 自我窗口内。
+                    //   命中时**不在这里拦**，往下落到 kill-cool-net 的节奏控制即可。
+                    long kage3 = g_kill_ts ? (long)nowa - g_kill_ts : -1;
+                    if (g_kill_sent && g_kill_resumable && kage3 >= 0 &&
+                        kage3 <= AR_KILL_SELF_WIN) {
+                        bs_evt("[ar] matrix: center-stop is OUR killswitch (%lds ago) "
+                               "-> not blocking", kage3);
+                    } else {
+                        want = 0; hold = "center-stop";
+                    }
                 } else if (g_kill_sent && nowa - g_kill_ts <
                            (g_kill_resumable ? AR_KILL_COOL_NET : AR_KILL_COOL)) {
                     // ★ v6.39：网络失联的 kill 冷却只留一个 tick（AR_KILL_COOL_NET），
@@ -6195,7 +6282,19 @@ static void *bs_watchdog(void *arg) {
                 //   这一步只在「本来就要拉起」时才读日志（极低频），开销可忽略。
                 if (want) {
                     int sk_live = bs_ar_stop_kind(DATA_DIR "/log/agent.log", 262144);
-                    if (sk_live == 2) {
+                    // ★★★★ v6.40：这里是**最狠的一处**（断网事故的第三道封锁）。
+                    //   网络恢复后 [ar] 想接，实时复查看到残留的那条 `agent stop script`
+                    //   就清 lst + 写 .bs_userstop + us_latched=1 —— 这不是"下次再试"，
+                    //   是**永久闸门**（只有中控再点运行才解），比 6040 的 disarm 更绝。
+                    //   ★ 那条 stop 是我们在 90~900 秒前自己发的，永远不会从日志里消失
+                    //     （窗口按 256KB 滚，除非日志翻页），所以只能靠自我窗口认领。
+                    long kage4 = g_kill_ts ? (long)nowa - g_kill_ts : -1;
+                    int ours = (g_kill_sent && g_kill_resumable && kage4 >= 0 &&
+                                kage4 <= AR_KILL_SELF_WIN);
+                    if (sk_live == 2 && ours) {
+                        bs_evt("[ar] live check: center/user stop is OUR killswitch "
+                               "(%lds ago, resumable) -> NOT gating, proceed", kage4);
+                    } else if (sk_live == 2) {
                         want = 0; hold = "center-stop-live";
                         ar_stop_kind = 2;
                         if (ar.armed || ar.lst) {
