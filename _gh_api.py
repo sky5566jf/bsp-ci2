@@ -95,7 +95,7 @@ def cmd_wait(timeout=900, sha=None):
                       % (r['id'], r.get('conclusion'), (r['head_sha'] or '')[:8]))
                 return r['id'], r.get('conclusion')
         time.sleep(10)
-    print('TIMEOUT last=%s' % (seen and (seen['id'], seen['status'])))
+    print('TIMEOUT last=%s' % ((seen and (seen['id'], seen['status'])),))
     return None, None
 
 

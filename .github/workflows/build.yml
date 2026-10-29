@@ -30,7 +30,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.42" || (echo "MISSING v6.42" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.44" || (echo "MISSING v6.44" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.41"; then echo "STALE: v6.41 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
