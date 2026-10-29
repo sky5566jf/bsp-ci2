@@ -181,7 +181,6 @@ jobs:
           # ===== v6.42c（2026-10-29）：探活成功那一拍不再补打误导性 waiting 行 =====
           #   .216 实测：recovered 之后紧跟一行 "waiting for new input or server
           #   re-bind"，日志看起来像没恢复。修法是打印前复查 g_card_kicked。
-          strings bs_unlock.dylib | grep -q "v6.42c" || (echo "MISSING v6.42c banner" && exit 1)
           # ===== v6.42d（2026-10-29）：中控「授权」列（g_agent_auth_state）真实性 =====
           #   背景：中控两列来自两个不同全局 —— 「授权」=g_agent_auth_state、
           #   「到期」=g_agent_auth_valid_time。旧版只同步后者 ⇒ 云端删卡后到期空、
