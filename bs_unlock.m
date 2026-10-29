@@ -948,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.42f"
+#define BS_DYLIB_VER       "v6.42g"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7692,8 +7692,25 @@ static long bs_card_login(const char *card, int act_new) {
 
     if (rc == 0) {
         if (exp > 0) g_card_expire = (long)exp;
-        g_card_lastok = (long)time(NULL);
-        bs_log("[card] login OK expire=%ld (%.20s...)", g_card_expire, card);
+        // ★★★★ v6.42g：服务端返回 code=0 但 expires_ts 已在过去时，**不能**把
+        //   lastok 记成 now。否则闸门的宽限判定
+        //     `now < lastok + cardgrace*3600` → verdict_ok=1
+        //   会把「已过期」的卡判成「已授权」整整 1 小时 ——
+        //   中控上表现为 `已授权 | 2026/10/26 15:33`（一个已经过去的时间），
+        //   比原先的空白更难解释。2026-10-29 桩测实测到这一拍
+        //   （`re-authorized (expire=1793000000) -> gates open` 紧跟在
+        //     `login OK expire=1793000000` 后面）。
+        //   真实触发场景：服务端与设备时钟有偏差、或卡恰好在两次心跳之间到期、
+        //   或运维手工把 expires_at 调早。宽限的本意只是「网络抖动别误停」，
+        //   不该给一张已经到期的卡续命。
+        long nowsec = (long)time(NULL);
+        if (exp > 0) {
+            g_card_lastok = ((long)exp > nowsec) ? nowsec : 0;
+        } else {
+            g_card_lastok = nowsec;       // 没带 expires_ts（续期类应答）按正常处理
+        }
+        bs_log("[card] login OK expire=%ld lastok=%ld (%.20s...)",
+               g_card_expire, g_card_lastok, card);
         bs_sync_vendor_expire();          // ★ v6.22：激活即同步中控显示
     } else {
         bs_log("[card] login FAIL code=%ld msg=%s (http=%ld)", rc, msg, code);
