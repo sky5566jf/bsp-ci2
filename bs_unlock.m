@@ -861,6 +861,27 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 // ★ v6.6：主动跟版（免卡密机从我们云端取脚本包本体）
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
+// ★★★★ v6.41（2026-10-29）：**设备码单一真源 —— 卸载/重装/覆盖都不再变号**
+//   现象（2026-10-27 现场 15f9da…）：换机后同一张卡绑在旧机号上，新机被拒（code=7）；
+//   中控「自建卡密到期」列空白；重装一次设备号就换一个，卡库绑定全部失配。
+//   根因：设备号有**四套取值 + 一个随机兜底**
+//     hw.serial（iOS 恒返回字面量 "unknown"）→ token → .bs_devid 随机 32hex → "unknown"
+//   任何一环取不到就 md5(序号|时间|pid|栈|clock) 现生成一个 ⇒ 天生漂移。
+//   逆向结论（Agent 二进制）：APP 上显示的那串真值是 `_g_script_dev_id`
+//     （NSString*，vmaddr 0x100053028，导出符号 `g_script_dev_id`），
+//     由 Agent 从服务端配置 TLV(type=0x0a) 收下后写入（全二进制唯一写入点
+//     0x1000142cc，位于配置分发器 _bb_RPFBXL3V9G）。服务端按硬件指纹认机，
+//     同一台设备每次回同一个号 ⇒ **真值本身不依赖本地任何存储**。
+//   修法（三动作，零回退）：
+//     ① 读：dlsym("get_script_dev_id") —— 走 Agent 自己的 pthread_mutex；
+//        符号不在（APP 进程）就返回"无值"，不猜。
+//     ② 钉盘：/var/mobile/Media/.bsdeveid —— prerm 只删 .bsp/bs_modules/bs_pull.conf，
+//        卸载 APP 只删沙盒，覆盖 bspath 不涉及 ⇒ 三个场景都留得住。
+//     ③ 回填：Agent 尚未收到 TLV 的冷启窗口内，把钉盘值 set 回 _g_script_dev_id，
+//        让 APP 显示 / 中控上报 / 卡密绑定从第一秒起就是同一个号。
+//   结构性保证：钉盘丢了也不会漂移 —— Agent 连上后重新收到同一个号自动重建。
+//   同步：`bs_identity_tick()` 每拍把真值回填 token + 重拼 ?key=（旧版 conf 只拼一次，
+//     启动即空 ⇒ 云端只能按 ip: 记账，s2/离线/deny 全失效）。
 // ★★★★ v6.40（2026-10-27）：**断网恢复仍不自启的真正元凶：disarm 没认自己人**
 //   216 真机复现（13:42:47 中控点运行 → 13:43 断网 → 13:49:40 网络恢复 → 脚本永久空闲）：
 //   v6.39 四条链路里**前三条全部生效**，第四条（允许 [ar] 接上）被自己抹掉：
@@ -914,7 +935,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.40"
+#define BS_DYLIB_VER       "v6.41"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -2079,25 +2100,23 @@ static int bs_conf_set_key(const char *path, const char *key, const char *val) {
 static void bs_card_devid_local(void);          // 定义在后面（设备码生成）
 
 /// token 空自愈（动机与优先级见上面 bs_conf_set_key 的注释块）
+/// ★★★★ v6.41：**单一真源**。旧版三级回退（hw.serial → .bs_devid 随机 → 空）
+///   就是设备号漂移的根源 —— hw.serial 在 iOS 上恒为字面量 "unknown"，
+///   一退就退到 md5(时间|pid|栈) 随机 32hex，卸载/覆盖一次换一个号，
+///   卡库绑定全部失配（2026-10-27 现场复现）。
+///   现在：真源没就位就**什么都不做**，等 bs_identity_tick() 下一拍再取。
+///   不生成、不猜、不回退。来源语义见 bs_deveid_resolve() 注释块。
 static void bs_token_selfheal(void) {
     if (g_token[0]) return;                     // 已有 token：一行不改
-    char srl[64] = {0};
-    bs_sysctl_str("hw.serial", srl, sizeof(srl));
-    int hw_ok = (srl[0] && strcmp(srl, "unknown") != 0);
-    if (hw_ok) {
-        snprintf(g_token, sizeof(g_token), "%s", srl);
-    } else {
-        bs_card_devid_local();                  // 复用/生成 .bs_devid 32hex
-        if (g_card_devid[0])
-            snprintf(g_token, sizeof(g_token), "%s", g_card_devid);
-    }
-    if (!g_token[0]) {
-        bs_log("[id] token still empty after self-heal -> cloud will key by ip");
+    bs_card_devid_local();                      // 唯一来源（内部 = bs_deveid_resolve）
+    if (!g_card_devid[0]) {
+        bs_log("[id] token empty: dev_id not ready -> defer "
+               "(no hw.serial, no random, no fallback)");
         return;
     }
-    bs_evt("[id] token empty -> adopted %.8s (src=%s) conf_write=%d",
-           g_token, hw_ok ? "hw.serial" : "local-gen",
-           bs_conf_set_key(PULL_CONF, "token", g_token));
+    snprintf(g_token, sizeof(g_token), "%s", g_card_devid);
+    bs_evt("[id] token adopted %.8s (src=agent.dev_id) conf_write=%d",
+           g_token, bs_conf_set_key(PULL_CONF, "token", g_token));
 }
 
 static void bs_load_conf(void) {
@@ -2289,6 +2308,29 @@ static void bs_load_conf(void) {
            g_sohost[0] ? g_sohost : "(none)", g_soport,
            g_appip[0] ? g_appip : "(none)",
            g_stat_ip[0] ? g_stat_ip : "(off->appip)");
+}
+
+/// ★★★★ v6.41：设备身份落定（每拍调用，幂等，代价 = 一次 dlsym 缓存 + 一次读内存）
+///
+/// 动机：conf 的 `token=` 与 `?key=` 在 bs_load_conf 里**只拼一次**，而那一刻
+///   Agent 往往还没收到服务端下发的设备码 —— 冷启顺序是「dylib 先跑，Agent 后连」。
+///   旧版因此整会话 /hb 无 key，云端只能按 `ip:<addr>` 记账，
+///   devid 匹配的 s2 改道 / 离线开关 / deny 规则全失效。
+/// 现在：真源一就位就回填 token + 重拼 query + 落 conf，
+///   从此心跳 key 与卡密 device_id **恒等**（同一台设备永远同一个号）。
+static void bs_identity_tick(void) {
+    if (g_token[0]) return;                     // 已落定：一行不改
+    bs_card_devid_local();                      // 唯一来源
+    if (!g_card_devid[0]) return;               // 真源未就位：等下一拍，不猜
+    snprintf(g_token, sizeof(g_token), "%s", g_card_devid);
+    int n = snprintf(g_qbuf, sizeof(g_qbuf), "?key=%s", g_token);
+    char q[384] = {0};
+    bs_devinfo_query(q, sizeof(q));
+    if (q[0] && n > 0 && (size_t)n + strlen(q) < sizeof(g_qbuf))
+        memcpy(g_qbuf + n, q, strlen(q) + 1);
+    int w = bs_conf_set_key(PULL_CONF, "token", g_token);
+    bs_evt("[id] token settled %.8s (src=agent.dev_id) conf_write=%d", g_token, w);
+    bs_log("[id] identity settled devid=%.32s q=%s", g_token, g_qbuf);
 }
 
 // ---- 日志（提前定义，供 bs_load_conf 使用）
@@ -5035,6 +5077,10 @@ static void *bs_puller(void *arg) {
     //   hb_fast=1 表示上一拍是「网络类失败但未达阈值」，下一拍用 HB_FAST_SECS 而不是 g_tick。
     int hb_fast = 0, hb_fast_n = 0;
     for (;;) {
+        // ★★★★ v6.41：先落定设备身份 —— Agent 收到服务端设备码的时刻晚于 dylib 启动，
+        //   conf 的 ?key= 若在那一刻拼空，整会话心跳都无 key（云端只能按 ip 记账）。
+        //   幂等：拿到一次后 g_token[0] 非空直接返回，零开销。
+        bs_identity_tick();
         bs_log("[pull] loop tick begin");
         @autoreleasepool {
             if (g_enable) {
@@ -7141,62 +7187,239 @@ static void bs_card_cache_load(void) {
 ///   ⇒ device_id 全变字面量 "unknown" ⇒ 同网/多机共享同一虚拟设备 ID，服务端按
 ///   device 判定换卡 ⇒ 互相顶卡，每顶一次写一条 auto-unbind（实测 4973 条）。
 ///   这里生成 32hex 落盘复用，保证每台设备有稳定且互不相同的 device_id。
-static void bs_card_devid_local(void) {
-    unsigned char *b = NULL;
-    size_t bl = 0;
-    if (bs_read_file(DATA_DIR "/.bs_devid", &b, &bl)) {
-        if (b && bl >= 32) {
-            char t[40] = {0};
-            memcpy(t, b, 32);
-            t[32] = 0;
-            if (off_is_hex32(t)) {
-                memcpy(g_card_devid, t, 32);
-                g_card_devid[32] = 0;
-                free(b);
-                bs_log("[card] devid=%.32s (src=.bs_devid)", t);
-                return;
-            }
-        }
-        if (b) free(b);
-    }
-    // 生成：md5(序号|时间|pid|栈地址|clock|hw.machine) → 32 hex，落盘长期复用
-    char mach[64] = {0};
-    bs_sysctl_str("hw.machine", mach, sizeof(mach));
-    static unsigned s_seq = 0;
-    char ent[192] = {0};
-    snprintf(ent, sizeof(ent), "%u|%ld|%d|%p|%lu|%s",
-             ++s_seq, (long)time(NULL), (int)getpid(), (void *)&b,
-             (unsigned long)clock(), mach);
-    char hex[40] = {0};
-    bs_md5_buf((const unsigned char *)ent, strlen(ent), hex, sizeof(hex));
-    if (!off_is_hex32(hex)) return;
-    memcpy(g_card_devid, hex, 32);
-    g_card_devid[32] = 0;
-    mkdir(DATA_DIR, 0755);
-    bs_write_file_atomic(DATA_DIR "/.bs_devid", (const unsigned char *)hex, 32);
-    bs_log("[card] devid=%.32s (src=local-gen)", hex);
+// ============================================================================
+// ★★★★ v6.41：设备码「单一真源」—— 全项目只认一个值，零备用分支
+//
+// 【真值是什么】
+//   Agent 进程内的 _g_script_dev_id（NSString*，符号 vmaddr 0x100053028）。
+//   它**就是贝塔 APP 界面上显示的那一串**：Agent 从服务端配置 TLV(type=0x0a)
+//   收下后写进这个全局（全二进制唯一写入点 0x1000142cc，位于配置分发器
+//   _bb_RPFBXL3V9G 内），APP 只是通过 agent.sock 向 Agent 要这个值。
+//
+// 【为什么不自己算】
+//   服务端按硬件指纹（MGCopyAnswer 的 SerialNumber / UniqueChipID / ProductType /
+//   UniqueDeviceID / WifiAddress / ModelNumber… 拼串后 CC_MD5）认机，
+//   同一台机每次回同一个号。指纹算法在服务端，客户端复现不了
+//   ⇒ 我们**不生成**，只忠实取原值。
+//
+// 【三个动作，仅此三个】
+//   ① 读：dlsym("get_script_dev_id") —— 走 Agent 自己的 pthread_mutex，线程安全；
+//      符号不存在（APP 进程）直接返回"无值"，不做任何猜测。
+//   ② 钉盘：/var/mobile/Media/.bsdeveid
+//      —— 卸载 deb（prerm 只删 .bsp / bs_modules / bs_pull.conf）、
+//         卸载重装 APP、覆盖 bspath，都不会碰这个路径。
+//   ③ 回填：Agent 尚未收到 TLV 的冷启窗口内，把钉盘值 set 回 _g_script_dev_id，
+//      使 APP 显示 / 中控上报 / 卡密绑定从第一秒起就是同一个号。
+//
+// 【结构性保证】
+//   真值**不依赖我们的存储**：Agent 每次启动都会重新收到同一个号（服务端按硬件认机）。
+//   钉盘只是"尽早可用"的缓存，丢了也会在 Agent 连上后自动重建
+//   ⇒ 结构上不存在"两份数据不一致"的可能。
+//
+// 【旧实现已删（漂移元凶）】
+//   · md5(序号|时间|pid|栈|clock|hw.machine) 随机 32hex
+//   · hw.serial 优先（iOS 上恒为字面量 "unknown"，等于第一条的触发器）
+//   · token / "unknown" 兜底
+// ============================================================================
+#define DEV_SYM_GET     "get_script_dev_id"      // id  (void)：pthread_mutex + objc_retain
+#define DEV_SYM_SET     "set_script_dev_id"      // void (id)
+#define DEV_SYM_GLOBAL  "g_script_dev_id"        // NSString* —— getter 读的同一块内存
+#define DEV_PIN_FILE    "/var/mobile/Media/.bsdeveid"
+#define DEV_PIN_MAGIC   "bsp-deveid-v1"
+
+typedef id   (*bs_dev_get_fn)(void);
+typedef void (*bs_dev_set_fn)(id);
+
+static void bs_dev_lower(char *s, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (s[i] >= 'A' && s[i] <= 'F') s[i] = (char)(s[i] - 'A' + 'a');
 }
 
-/// device_id：优先硬件序列号（卸载重装不变），回退 token。
-/// ★ v6.23j：hw.serial 在部分机型/环境返回**字面量 "unknown"**（非空字符串），
-///   旧写法直接采信 → device_id="unknown" 存进绑定字段；且所有此类设备
-///   共享同一 id，绑定比对 unknown==unknown 恒过 ⇒ 一张卡可被多台设备共享！
-///   现把 "unknown" 当无效 → 回退 g_token（postinst 每机唯一）；
-///   两者皆无才退到 "unknown"（最后兜底，正常不会走到）。
-static void bs_card_device_id(void) {
-    char srl[64] = {0};
+/// 在任意文本里找第一段连续的 32 位十六进制（大小写不限），小写归一化写入 out[40]。
+static int bs_dev_find_hex32(const char *s, char out[40]) {
+    if (!s) return 0;
+    for (const char *p = s; *p; p++) {
+        if (!isxdigit((unsigned char)*p)) continue;
+        const char *q = p;
+        int i = 0;
+        char t[34];
+        while (*q && i < 33 && isxdigit((unsigned char)*q)) t[i++] = *q++;
+        if (i == 32 && !isxdigit((unsigned char)*q)) {
+            t[32] = 0;
+            bs_dev_lower(t, 32);
+            memcpy(out, t, 33);
+            return 1;
+        }
+        p = q - 1;
+    }
+    return 0;
+}
+
+/// 读 Agent 进程内的真值。返回 1 = 拿到合法 32hex。
+///
+/// 两条通道指向**同一个符号的真值**，不是两套取值：
+///   ① `get_script_dev_id()` —— 走 Agent 自己的 pthread_mutex + objc_retain，首选；
+///   ② `g_script_dev_id` 变量槽位 —— 万一函数被内联/未导出，直接读同一块内存。
+/// 二者都在 export trie 里（已用 _patched/mo_export_trie.py 验证：
+///   _g_script_dev_id off=0x53028 / _get_script_dev_id off=0x4470）。
+/// 无论走哪条，读到的都是**服务端下发的那一个号**，不存在第二个值。
+static int bs_dev_read_live(char out[40]) {
+    out[0] = 0;
+    static bs_dev_get_fn s_get = NULL;
+    static id *s_slot = NULL;
+    static int s_init = 0;
+    if (!s_init) {
+        s_init = 1;
+        s_get  = (bs_dev_get_fn)dlsym(RTLD_DEFAULT, DEV_SYM_GET);
+        s_slot = (id *)dlsym(RTLD_DEFAULT, DEV_SYM_GLOBAL);
+        bs_log("[deveid] agent symbols getter=%s slot=%s",
+               s_get ? "yes" : "no", s_slot ? "yes" : "no");
+    }
+    if (s_get) {
+        @autoreleasepool {
+            // getter 反汇编：ldr x0,[g+0x28] → objc_retain → unlock → return x20
+            // ⇒ 返回 +1 引用，所有权交给 ARC（__bridge_transfer）
+            NSString *s = (__bridge_transfer NSString *)s_get();
+            if (s) {
+                const char *u = [s UTF8String];
+                if (u && bs_dev_find_hex32(u, out)) return 1;
+            }
+        }
+    }
+    if (s_slot) {
+        @autoreleasepool {
+            void *raw = __atomic_load_n((void *volatile *)s_slot, __ATOMIC_ACQUIRE);
+            if (!raw) return 0;
+            const char *u = [(__bridge NSString *)raw UTF8String];
+            return u ? bs_dev_find_hex32(u, out) : 0;
+        }
+    }
+    return 0;
+}
+
+/// 把值写回 Agent 的真值全局（仅冷启窗口使用）。返回 1 = 已下发。
+static int bs_dev_write_live(const char *v) {
+    static bs_dev_set_fn s_set = NULL;
+    static int s_init = 0;
+    if (!s_init) {
+        s_init = 1;
+        s_set  = (bs_dev_set_fn)dlsym(RTLD_DEFAULT, DEV_SYM_SET);
+    }
+    if (!s_set || !v || !v[0]) return 0;
+    NSString *ns = [NSString stringWithUTF8String:v];
+    if (!ns) return 0;
+    s_set(ns);                                   // setter 内部 retain，我们不持有
+    return 1;
+}
+
+/// 读钉盘（唯一持久化副本）。
+static int bs_dev_pin_read(char out[40]) {
+    out[0] = 0;
+    unsigned char *b = NULL;
+    size_t bl = 0;
+    if (!bs_read_file(DEV_PIN_FILE, &b, &bl)) return 0;
+    int ok = 0;
+    if (b && bl) {
+        char t[160] = {0};
+        size_t cp = bl < sizeof(t) - 1 ? bl : sizeof(t) - 1;
+        memcpy(t, b, cp);
+        ok = bs_dev_find_hex32(t, out);
+    }
+    if (b) free(b);
+    return ok;
+}
+
+/// 写钉盘（原子替换；值没变就不落盘，避免无谓 IO）。
+static void bs_dev_pin_write(const char *v, const char *why) {
+    char cur[40] = {0};
+    if (bs_dev_pin_read(cur) && strcmp(cur, v) == 0) return;
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%s %s\n", DEV_PIN_MAGIC, v);
+    int w = bs_write_file_atomic(DEV_PIN_FILE, (const unsigned char *)buf, (size_t)n);
+    if (w) chmod(DEV_PIN_FILE, 0644);
+    if (cur[0]) bs_evt("[deveid] pin %s -> %s (agent authoritative, %s)", cur, v, why);
+    else        bs_log("[deveid] pin created %.32s (%s) write=%d", v, why, w);
+}
+
+/// **唯一决策点**：全项目所有"设备号"都必须经过这里。
+/// 返回进程内静态缓冲区；空串 = 真源尚未就位（调用方必须跳过绑定）。
+static const char *bs_deveid_resolve(void) {
+    static char s_val[40] = {0};
+
+    char live[40] = {0};
+    char pin[40]  = {0};
+    int has_live  = bs_dev_read_live(live);
+    int has_pin   = bs_dev_pin_read(pin);
+
+    if (has_live) {
+        // 真源有值 = 权威。钉盘跟随（换机/刷机导致号变了也自动跟上）
+        if (!has_pin || strcmp(pin, live) != 0)
+            bs_dev_pin_write(live, has_pin ? "drift adopted" : "seed");
+        if (!s_val[0] || strcmp(s_val, live) != 0) {
+            snprintf(s_val, sizeof(s_val), "%s", live);
+            bs_log("[deveid] authoritative=%.32s (src=agent, pin=%s)", live,
+                   !has_pin ? "created" : (strcmp(pin, live) ? "updated" : "same"));
+        }
+        return s_val;
+    }
+
+    if (has_pin) {
+        // Agent 还没收到服务端下发：回填钉盘值，让下游从第一秒就一致
+        if (strcmp(s_val, pin) != 0) {
+            static int s_rb_fail = 0;
+            if (bs_dev_write_live(pin))
+                bs_evt("[deveid] restore %.32s -> agent (ahead of server TLV)", pin);
+            else if (s_rb_fail < 3) {
+                s_rb_fail++;
+                bs_log("[deveid] restore skipped (setter unavailable) pin=%.32s", pin);
+            }
+            snprintf(s_val, sizeof(s_val), "%s", pin);
+        }
+        return s_val;
+    }
+
+    // 两边都没有：绝不生成
+    if (!s_val[0]) {
+        // ★ 可观测性：静默失败最难查。首次 + 每 5 分钟一条，带已等待时长，
+        //   中控/云端 devlog 一眼能看出「是设备号没下来」而不是「卡坏了」。
+        static long s_first = 0;
+        static long s_last_warn = 0;
+        long now = (long)time(NULL);
+        if (!s_first) s_first = now;
+        if (!s_last_warn || now - s_last_warn >= 300) {
+            s_last_warn = now;
+            bs_evt("[deveid] PENDING %lds: agent has no dev_id yet & pin empty "
+                   "-> refuse to invent (card bind & heartbeat key deferred)", now - s_first);
+        }
+    }
+    return s_val;
+}
+
+/// 兼容旧名：只填 g_card_devid，不做任何回退。
+static void bs_card_devid_local(void) {
     memset(g_card_devid, 0, sizeof(g_card_devid));
-    bs_sysctl_str("hw.serial", srl, sizeof(srl));
-    if (srl[0] && strcmp(srl, "unknown") != 0)
-        snprintf(g_card_devid, sizeof(g_card_devid), "%s", srl);
-    if (!g_card_devid[0] && g_token[0])
-        snprintf(g_card_devid, sizeof(g_card_devid), "%s", g_token);
-    if (!g_card_devid[0])
-        bs_card_devid_local();      // ★ v6.26：本地 32hex 兜底，杜绝字面量 unknown
-    if (!g_card_devid[0])
-        snprintf(g_card_devid, sizeof(g_card_devid), "unknown");
-    bs_log("[card] device_id=%.24s (serial=%s)", g_card_devid,
-           srl[0] ? srl : "(empty)");
+    const char *v = bs_deveid_resolve();
+    if (v && v[0]) snprintf(g_card_devid, sizeof(g_card_devid), "%s", v);
+}
+
+/// device_id —— 与 /hb 的 key、APP 显示值恒等（同一个真源）。
+static void bs_card_device_id(void) {
+    char prev[64] = {0};
+    snprintf(prev, sizeof(prev), "%s", g_card_devid);
+    memset(g_card_devid, 0, sizeof(g_card_devid));
+    const char *v = bs_deveid_resolve();
+    if (v && v[0]) {
+        snprintf(g_card_devid, sizeof(g_card_devid), "%s", v);
+        if (strcmp(prev, g_card_devid) != 0)
+            bs_log("[card] device_id=%.32s (src=agent.dev_id)", g_card_devid);
+        return;
+    }
+    if (prev[0]) {                                  // 曾有值：进程内不回退成空（防抖动）
+        snprintf(g_card_devid, sizeof(g_card_devid), "%s", prev);
+        return;
+    }
+    // 首次 PENDING 不再逐拍打日志 —— bs_deveid_resolve() 已按 5 分钟限流报了
+    // [deveid] PENDING，这里重复打会把 8KB 设备日志窗口刷满（v6.38 踩过的坑）。
 }
 
 /// 解析 /api/client/login 响应：只认 body 的 code（HTTP 状态码不可靠，文档 §9.1）。
@@ -7343,6 +7566,14 @@ static void bs_wipe_onion_dict(uintptr_t base) {
 
 /// 返回 0=ok（g_card_expire 已更新）；-1=网络失败；业务码原值返回。
 static long bs_card_login(const char *card, int act_new) {
+    // ★★★★ v6.41：设备号未就位时**绝不上报**。旧版会发 `"device_id":""`，
+    //   服务端按空 device 记账；等真值到位后整台机在库里看起来像换了设备
+    //   （2026-10-27 那台 15f9da… 的冲突就是这么记进去的）。
+    //   返回 -1（网络类）：调用方对 rc<0 不做任何封禁/清卡，等下一拍重试。
+    if (!g_card_devid[0]) {
+        bs_log("[card] login skipped: device_id pending (agent dev_id not ready)");
+        return -1;
+    }
     char url[256];
     snprintf(url, sizeof(url), "http://%s%s", g_card_host, CARD_PATH);
 
@@ -7409,6 +7640,9 @@ static void *bs_cardwatch(void *arg) {
 
     for (;;) {
         sleep(3);
+        // ★★★★ v6.41：每拍复核设备码 —— 启动时 Agent 可能还没收到服务端设备码，
+        //   真源一就位立即生效（失败时保持上一次值，不会退回空/不会换号）。
+        bs_card_device_id();
         long now = (long)time(NULL);
 
         // ---- v6.21 ①：agent.log 捕获中控输入的卡密（主通道，尾部扫描自愈版） ----

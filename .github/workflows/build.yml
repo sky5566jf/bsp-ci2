@@ -30,7 +30,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.40" || (echo "MISSING v6.40" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.41" || (echo "MISSING v6.41" && exit 1)
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -142,8 +142,9 @@ jobs:
           strings bs_unlock.dylib | grep -q "in %ds window" || (echo "MISSING v6.30 window log" && exit 1)
           # v6.29-1：repair 冷却两档（失败 60s / 成功 3600s）—— 换包后不再全网锁 1h
           strings bs_unlock.dylib | grep -q "retry in" || (echo "MISSING short repair retry log" && exit 1)
-          # v6.29-2：token 空自愈（hw.serial → .bs_devid 32hex + 原子回写 conf）
-          strings bs_unlock.dylib | grep -q "token empty -> adopted" || (echo "MISSING token self-heal log" && exit 1)
+          # v6.29-2：token 空自愈 —— v6.41 起改为「设备码未就位就 defer」，
+          #   不再按 hw.serial/随机数造号（造号是 v6.41 明确废除的做法）
+          strings bs_unlock.dylib | grep -q "token empty: dev_id not ready -> defer" || (echo "MISSING v6.41 token-defer log" && exit 1)
           # v6.29-3：日志尾部保留式轮转（只清我们自己的 bs_unlock.log / bs_evt.log）
           strings bs_unlock.dylib | grep -q "\[log\] rotated" || (echo "MISSING log rotate log" && exit 1)
           # v6.29-4：pend 长期不收敛提醒（新包在盘上但脚本一直没重启）
@@ -152,9 +153,20 @@ jobs:
           # 实测同一批客户端有发 192 的 —— 硬等 208 会 30s 超时 auth failed）
           strings bs_unlock.dylib | grep -q "cmd pkt len=" || (echo "MISSING autolen log" && exit 1)
           strings bs_unlock.dylib | grep -q "hdr probe fail" || (echo "MISSING probe-fail log" && exit 1)
-          # v6.26：设备码本地持久化兜底（杜绝字面量 unknown 造成多机共享 ID）
-          strings bs_unlock.dylib | grep -q ".bs_devid" || (echo "MISSING bs_devid path" && exit 1)
-          strings bs_unlock.dylib | grep -q "src=local-gen" || (echo "MISSING local-gen devid" && exit 1)
+          # ===== v6.41（2026-10-29）：设备码单一真源 —— 卸载/重装/覆盖 bspath 都不变号 =====
+          #   旧版三级回退（hw.serial→.bs_devid 随机→token→"unknown"）全部删除。
+          #   新链路：dlsym(g_script_dev_id/get_script_dev_id) 取 Agent 权威值
+          #          → 钉盘 /var/mobile/Media/.bsdeveid → 冷启窗口 set 回 Agent。
+          #   取不到就 PENDING 不绑卡不上报（宁可没号，绝不自己造号）。
+          strings bs_unlock.dylib | grep -q "bsp-deveid-v1" || (echo "MISSING v6.41 pin file magic" && exit 1)
+          strings bs_unlock.dylib | grep -q "refuse to invent" || (echo "MISSING v6.41 refuse-to-invent guard" && exit 1)
+          strings bs_unlock.dylib | grep -q "\[deveid\] PENDING" || (echo "MISSING v6.41 pending banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "authoritative=%.32s (src=agent, pin=%s)" || (echo "MISSING v6.41 authoritative resolve log" && exit 1)
+          strings bs_unlock.dylib | grep -q "src=agent.dev_id) conf_write=%d" || (echo "MISSING v6.41 identity tick conf write" && exit 1)
+          strings bs_unlock.dylib | grep -q "restore skipped (setter unavailable)" || (echo "MISSING v6.41 setter-absent path" && exit 1)
+          # 反回归：v6.41 之后不许再出现任何"本地造号"痕迹
+          if strings bs_unlock.dylib | grep -q "src=local-gen"; then echo "FORBIDDEN: v6.41 local-gen devid still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q ".bs_devid"; then echo "FORBIDDEN: v6.41 legacy .bs_devid path still present" && exit 1; fi
           # v6.25j：消费式缓冲修复的特征串（粘包尾巴不再被整块丢弃）
           strings bs_unlock.dylib | grep -q "conn pkts=\[" || (echo "MISSING conn-pkts" && exit 1)
           strings bs_unlock.dylib | grep -q "rx buffer full" || (echo "MISSING rx-buffer-full" && exit 1)
