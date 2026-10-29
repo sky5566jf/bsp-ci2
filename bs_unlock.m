@@ -949,7 +949,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.49"
+#define BS_DYLIB_VER       "v6.50"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1080,6 +1080,9 @@ static long          g_note_cf_ts       = 0;   // 该次冲突时刻
 static long          g_note_cf_evt      = 0;   // 该次冲突对应的「输入事件」时间戳（agent.log 行首）
 static int           g_note_cf_sent     = 0;   // 该次冲突是否已上报过（用户要求只报一次）
 static int           g_note_force       = 0;   // 状态切换 → 15s 内强制重推一次（覆盖旧备注）
+// ★★★★★ v6.50：记住上次推送时包里的「运行状态位」[7] —— 该位一变就必须补推一包，
+//   否则中控「运行」列会停在旧值（原厂状态包并不是每次运行状态变化都发）。
+static int           g_note_lastrun     = -1;  // -1 = 还没推过
 static volatile int  g_card_blocked   = 0;     // 1=封禁（未激活/过期/冻结/绑他机/宽限耗尽）
 static volatile long g_card_expire    = 0;     // 到期 unix ts（0=未知）
 static volatile long g_card_lastok    = 0;     // 最近一次校验成功时间
@@ -7804,6 +7807,27 @@ static int bs_center_find_sock(const char *ip, int port) {
     return -1;
 }
 
+/// ★★★★★ v6.50：状态包 [7] 位必须跟随 App 真实的「脚本运行中」标志。
+///
+/// 事故（2026-10-30 04:14，.216）：中控下发「运行」后脚本确实在跑（run=1、
+/// sjz.log 每秒在写），但 BBCenter 设备列表「运行」列一直显示「空闲」。
+/// 反汇编 BBCenter 定位到解析函数（RVA 0xb184 起）：
+///     movzx ecx, byte ptr [rax + 6]  →  mov [rdi + 0xf0], ecx
+///     movzx ecx, byte ptr [rax + 7]  →  mov [rdi + 0xb8], ecx   ← ★ 就是这一位
+///     mov     eax, dword ptr [rax+8] →  到期（0 则清空 [rdi+0xc0]）
+///     cmp rax,0x15 → 备注 → [rdi+0x118]
+/// 填表函数（RVA 0x29ad0）再把 dev+0xb8 原样搬到表格列 +0x80。
+/// 而 v6.45~v6.49 这里写的是死值 **0x00**（当时注释还写着「只借备注，不干扰原厂判定」——
+/// 想当然）。中控把 0 当「空闲」，于是每推一次备注就把运行列刷成一次空闲；
+/// 而原厂状态包只在状态变化时发，不会来纠正 ⇒ 运行列永久卡在「空闲」。
+///
+/// 现在跟真实值走：脚本在跑 → 1，没跑 → 0。这样备注包带的就是中控该显示的态。
+static int bs_center_run_flag(void) {
+    if (!g_base) return 0;
+    volatile uint8_t *runp = (volatile uint8_t *)(g_base + OFF_RUN);
+    return (*runp) ? 1 : 0;
+}
+
 static int bs_center_note_send(const char *ip, const char *note) {
     if (!ip || !ip[0]) return -1;
     size_t nl = note ? strlen(note) : 0;
@@ -7816,7 +7840,7 @@ static int bs_center_note_send(const char *ip, const char *note) {
     memcpy(pkt, &t, 4);                       // [0:4] 总长 —— ★ 改备注必须同步改这里
     pkt[4] = 0x07; pkt[5] = 0x00;             // [4:6] 命令：状态上报
     pkt[6] = 0x01;                            // [6]   版本
-    pkt[7] = 0x00;                            // [7]   状态位：只借备注，不干扰原厂判定
+    pkt[7] = (unsigned char)bs_center_run_flag(); // ★ v6.50：真实运行态（1=运行 0=空闲）
     uint32_t exp = (uint32_t)(g_card_expire > 0 ? g_card_expire : 0);
     memcpy(pkt + 8, &exp, 4);                 // [8:12] 授权到期
     pkt[12] = 0x01; pkt[13] = 0x02;           // [12][13] 固定
@@ -7911,6 +7935,10 @@ static int bs_note_verdict_ok(long now) {
 ///   ③ **同文案不发**，只每 300s 幂等保底重推一次（防原厂状态包把备注冲成空），
 ///      日志只在文案变化时打一条 —— 这就是用户要的「卡密冲突只上报一次」：
 ///      中控上那条文案是稳定的，不会每 45s 刷新一遍。
+/// ★ v6.50 追加（用户 2026-10-30 04:20）：
+///   ④ **不得干扰原厂「运行」列**：包 [7] 从死值 0 改为真实运行态（见 bs_center_run_flag）；
+///   ⑤ **不得反复覆盖原厂自己的备注**：正常态去掉 300s 保底重推，只在文案变化 /
+///      运行态翻转 / force 时推；异常态才保底重推。
 static void bs_center_note_tick(void) {
     char ip[64] = "";
     bs_pc_ip_of_plist(ip, sizeof(ip));
@@ -7960,16 +7988,29 @@ static void bs_center_note_tick(void) {
         snprintf(note, sizeof(note), "未授权 %s", BS_DYLIB_VER);
     }
 
+    int runnow  = bs_center_run_flag();
+    int runchg  = (g_note_lastrun != runnow);     // ★ v6.50：运行态翻转必须补推
     int changed = strcmp(note, g_note_last) != 0;
     int forced  = g_note_force;
-    if (!changed && !forced && (now - g_note_ts) < 300) return;
+    if (!changed && !forced && !runchg) {
+        /* ★★★★★ v6.50（用户 2026-10-30 04:20 拍板，取代 v6.49 的 300s 无脑保底）：
+         *   · **正常态永不周期重推**。备注如果被原厂状态包冲掉也无所谓 ——
+         *     「已授权 + 到期」两列本来就由 bs_sync_vendor_* 维护，信息不丢；
+         *     而周期重推会反复覆盖原厂自己写进备注的内容（原厂在报错时会写，
+         *     例如「卡密不存在！」），也会凭空多发 07 包。
+         *   · **异常态（冲突/接管/过期/未授权）保留 300s 保底重推** ——
+         *     这类文案才是运维一眼要看到的，被冲掉必须补回来。 */
+        if (valid) return;
+        if ((now - g_note_ts) < 300) return;
+    }
     int rc = bs_center_note_send(ip, note);
     if (rc == 0) {
         snprintf(g_note_last, sizeof(g_note_last), "%s", note);
         g_note_ts    = now;
         g_note_force = 0;
-        if (changed || forced)
-            bs_log("[note] -> %s:%d  %s", ip, g_noteport, note);
+        g_note_lastrun = runnow;
+        if (changed || forced || runchg)
+            bs_log("[note] -> %s:%d  %s (run=%d)", ip, g_noteport, note, runnow);
     } else if ((now - g_note_ts) > 30) {
         /* 发送失败也必须重试：旧版只在 120s 后重试一次就放弃，
            .98 那次「卡恢复了、备注还挂着接管」就是这里丢的。 */

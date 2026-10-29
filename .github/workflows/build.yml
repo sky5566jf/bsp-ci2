@@ -30,7 +30,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.49" || (echo "MISSING v6.49" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.50" || (echo "MISSING v6.50" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.41"; then echo "STALE: v6.41 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
@@ -252,7 +252,18 @@ jobs:
           if strings bs_unlock.dylib | grep -q "v6\.46"; then echo "FORBIDDEN: stale v6.46 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.47"; then echo "FORBIDDEN: stale v6.47 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.48"; then echo "FORBIDDEN: stale v6.48 banner still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6\.49"; then echo "FORBIDDEN: stale v6.49 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.44"; then echo "FORBIDDEN: stale v6.44 banner still present" && exit 1; fi
+
+          # ===== v6.50（2026-10-30 04:20）：备注上报不得干扰原厂「运行」列 =====
+          #   用户报障（.216）：中控下发运行、脚本确实在跑，但 BBCenter「运行」列一直「空闲」。
+          #   根因（反汇编 BBCenter 实证）：解析函数 RVA 0xb184 起
+          #       movzx ecx,[rax+7] → mov [rdi+0xb8],ecx ；填表 RVA 0x29ad0 再搬到列 +0x80。
+          #   而我们 v6.45~v6.49 把 pkt[7] 写成死值 0x00 → 每推一次备注就把运行列刷成空闲。
+          #   修法：① pkt[7] = bs_center_run_flag()（OFF_RUN 实时值），运行态翻转即补推；
+          #         ② 正常态去掉 300s 无脑保底重推（只在文案变化/运行态翻转/force 时发），
+          #            避免反复覆盖原厂自己写进备注的内容；异常态保留 300s 保底。
+          strings bs_unlock.dylib | grep -q "run=%d" || (echo "MISSING v6.50 note run-state log" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6\.42h"; then echo "FORBIDDEN: stale v6.42h banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42g"; then echo "FORBIDDEN: stale v6.42g banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42f"; then echo "FORBIDDEN: stale v6.42f banner still present" && exit 1; fi
