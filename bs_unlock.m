@@ -949,7 +949,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.46"
+#define BS_DYLIB_VER       "v6.47"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1069,6 +1069,8 @@ static int           g_cardtick       = 120;   // 心跳间隔（秒）★ v6.23
 static int           g_noteport       = 34878; // ★ v6.45：BBCenter 中控「备注」上报端口（conf: noteport）
 static char          g_note_last[256] = {0};   // ★ v6.45：上次成功写入中控的备注文案（去重用）
 static long          g_note_ts        = 0;     // ★ v6.45：上次成功写入中控的时间
+static int           g_note_conflict_sent = 0; // ★ v6.47：本轮冲突文案已经报过一次（不重复刷）
+static int           g_note_force         = 0; // ★ v6.47：状态切换 → 15s 内强制重推一次（覆盖旧备注）
 static volatile int  g_card_blocked   = 0;     // 1=封禁（未激活/过期/冻结/绑他机/宽限耗尽）
 static volatile long g_card_expire    = 0;     // 到期 unix ts（0=未知）
 static volatile long g_card_lastok    = 0;     // 最近一次校验成功时间
@@ -7752,6 +7754,14 @@ static long bs_card_login(const char *card, int act_new) {
  *      v6.45 独立建连失败的真因就在这里，不是格式问题。
  *   ③ 一条连接**不要连发两个包** —— 原厂时序是「心跳 9B → 状态 21B」，我们只插状态包。
  *   ④ 备注是「当前值」不是流水，原厂状态变化时会覆盖 → cardwatch 定期重刷。
+ *
+ * ★ v6.47 补充（用户拍板，2026-10-30）：
+ *   ⑤ 卡密冲突**只报一次**。备注定格显示的是「当前值」，同一条冲突每 45s 重推毫无
+ *      意义；更要命的是会一直挂在中控上误导判断。→ g_note_conflict_sent 记忆已报，
+ *      只有撞的卡号换了（新一轮冲突）才允许再报一次。
+ *   ⑥ 冲突**解除后必须主动覆盖**。A 机撞冲突 → 运营改输一张没人绑定的卡（激活成功）
+ *      → 中控备注不会自己恢复，必须 g_note_force=1 走 15s 快通道推一次当前真实状态。
+ *      同理：真输入解除拉黑、探活恢复、重输本机原卡、心跳发现被接管，都要 force。
  */
 static int bs_center_find_sock(const char *ip, int port) {
     if (!ip || !ip[0] || port <= 0) return -1;
@@ -7853,7 +7863,15 @@ static int bs_center_note_send(const char *ip, const char *note) {
     return (w == (ssize_t)total) ? 0 : -4;
 }
 
-/// 组装当前状态文案并推给中控；同内容 60 秒内不重发
+/// 组装当前状态文案并推给中控
+/// ★ v6.47 两条规则（用户拍板）：
+///   ① **卡密冲突只报一次** —— 中控备注列是「当前值」不是流水，同一条冲突反复推
+///      只会每 45s 把运营正在看的信息冲掉。冲突期间静默，等下一张卡撞出**新**冲突
+///      （卡号变了）才允许再报一次。
+///   ② **冲突解除必须主动覆盖** —— 运营在 A 机撞了冲突之后又输了一张没人绑定的卡
+///      （激活成功），中控备注里那条冲突文案**不会自己消失**，会一直挂着误导判断。
+///      所以激活成功/拉黑解除/探活恢复这三处都要 `g_note_force=1`，15 秒内把备注
+///      改回当前真实状态（正常/过期/未授权）。
 static void bs_center_note_tick(void) {
     char ip[64] = "";
     bs_pc_ip_of_plist(ip, sizeof(ip));
@@ -7874,7 +7892,9 @@ static void bs_center_note_tick(void) {
     int conflict = g_card_kicked[0] && (now - g_card_kickts) < 1800;
 
     char note[256] = "";
+    int  is_conflict = 0;
     if (conflict && g_card_cur[0]) {
+        is_conflict = 1;
         snprintf(note, sizeof(note),
                  "卡密冲突:%.16s 已被其他设备占用,已拒绝(本机不受影响)", g_card_kicked);
     } else if (g_card_kicked[0] && !g_card_cur[0]) {
@@ -7887,16 +7907,26 @@ static void bs_center_note_tick(void) {
         snprintf(note, sizeof(note), "未授权 %s", BS_DYLIB_VER);
     }
 
-    if (!strcmp(note, g_note_last) && (now - g_note_ts) < 60) return;
+    // ★ v6.47 ①：冲突文案报过就不再刷（force 由「冲突解除」方向设置，冲突期间不需要）
+    if (is_conflict && g_note_conflict_sent) {
+        g_note_force = 0;                     // 该推的已经推过，别让 15s 快通道空转
+        return;
+    }
+
+    if (!g_note_force && !strcmp(note, g_note_last) && (now - g_note_ts) < 60) return;
     int rc = bs_center_note_send(ip, note);
     if (rc == 0) {
         snprintf(g_note_last, sizeof(g_note_last), "%s", note);
-        g_note_ts = now;
+        g_note_ts   = now;
+        g_note_force = 0;
+        if (is_conflict) g_note_conflict_sent = 1;   // 本轮冲突已上报，静默
+        else             g_note_conflict_sent = 0;   // 非冲突内容写进去了 → 下一轮冲突可再报
         bs_log("[note] -> %s:%d  %s", ip, g_noteport, note);
-    } else if ((now - g_note_ts) > 120) {
+    } else if (!g_note_force && (now - g_note_ts) > 120) {
         g_note_ts = now;
         bs_log("[note] -> %s:%d failed rc=%d（中控未开或端口不对）", ip, g_noteport, rc);
     }
+    // 失败且 g_note_force=1：保留 force，15s 后再试（中控刚开机 / 连接还没建立的场景）
 }
 
 static void *bs_cardwatch(void *arg) {
@@ -7922,11 +7952,20 @@ static void *bs_cardwatch(void *arg) {
     long last_check  = 0;
     long pend_since  = 0;    // ★ v6.42：设备码 PENDING 起始时刻（判决用）
     int  note_tick   = 14;   // ★ v6.45：中控备注刷新计数（首拍即推一次，之后每 45s）
+    int  note_ftick  = 0;    // ★ v6.47：强制推送计数（g_note_force 时 15s 一次，用于尽快覆盖旧备注）
 
     for (;;) {
         sleep(3);
         // ★ v6.45：把卡状态 / 卡密冲突写进 BBCenter 设备列表的「备注」列
-        if (++note_tick >= 15) { note_tick = 0; bs_center_note_tick(); }
+        // ★ v6.47：状态切换（冲突解除/激活成功）走 15s 快通道，常规仍 45s 刷一次
+        int  note_due = 0;
+        if (++note_tick >= 15) { note_tick = 0; note_due = 1; }
+        if (g_note_force) {
+            if (++note_ftick >= 5) { note_ftick = 0; note_due = 1; }
+        } else {
+            note_ftick = 0;
+        }
+        if (note_due) bs_center_note_tick();
         // ★★★★ v6.41：每拍复核设备码 —— 启动时 Agent 可能还没收到服务端设备码，
         //   真源一就位立即生效（失败时保持上一次值，不会退回空/不会换号）。
         bs_card_device_id();
@@ -8051,6 +8090,22 @@ static void *bs_cardwatch(void *arg) {
         // ---- 卡密变化 → 立即激活（幂等；失败同卡 60s 节流重试） ----
         static char last_fail[80] = {0};
         static long last_try      = 0;
+        // ★★★★ v6.47：运营**重新输入了本机当前那张卡**（卡值没变，进不了下面的
+        //   「卡变化」分支）也要算冲突翻篇 —— .216 现场就是这样：撞了别人的卡留下
+        //   冲突备注，运营改输回自己原来那张卡，中控备注却一直挂着「卡密冲突」。
+        //   判据同样要 real_input（日志激活事件时间戳晚于撞卡时刻），日志残留不算。
+        if (have_card && g_card_kicked[0] && g_card_cur[0] && !strcmp(card, g_card_cur)) {
+            int own_reinput = (lg_card[0] && strcmp(card, lg_card) == 0 &&
+                               lg_ts > 0 && lg_ts > g_card_kickts);
+            if (own_reinput) {
+                bs_log("[note] own card re-input after conflict -> clear flag on center");
+                g_card_kicked[0]     = 0;
+                g_card_kickts        = 0;
+                g_note_conflict_sent = 0;
+                g_note_force         = 1;
+                bs_card_cache_save();
+            }
+        }
         if (have_card && strcmp(card, g_card_cur) != 0) {
             // ★ v6.23t：是否「真重新输入」—— 卡值来自日志捕获、且该激活事件的时间戳
             //   晚于被踢时刻。日志残留（旧行）时间戳必 ≤ kickts，不算真输入。
@@ -8075,6 +8130,7 @@ static void *bs_cardwatch(void *arg) {
             if (real_input && g_card_kicked[0] && strcmp(card, g_card_kicked) == 0) {
                 g_card_kicked[0] = 0;               // ★ v6.23t 真输入 → 解除拉黑
                 g_card_kickts    = 0;
+                g_note_force     = 1;               // ★ v6.47 冲突已翻篇，尽快覆盖中控备注
                 bs_log("[card] newer input seen after kick -> unblock %.20s...", card);
             }
             int throttled = (last_fail[0] && !strcmp(card, last_fail) && now - last_try < 60);
@@ -8086,6 +8142,13 @@ static void *bs_cardwatch(void *arg) {
                     last_fail[0] = 0;
                     g_card_kicked[0] = 0;           // ★ v6.23s 激活成功清拉黑
                     g_card_kickts    = 0;           // ★ v6.23t
+                    // ★★★★ v6.47（用户拍板）：A 机撞过卡密冲突后，运营又输了一张
+                    //   **没人绑定的卡** → 激活成功。中控备注里那条
+                    //   「卡密冲突:xxx 已被其他设备占用」不会自己消失，必须立刻覆盖，
+                    //   否则运营一直以为这台机还在冲突状态里，影响判断。
+                    g_note_conflict_sent = 0;       // 解除后允许下次冲突再报一次
+                    g_note_force         = 1;       // 15s 内把备注改成当前真实状态
+                    bs_log("[note] conflict cleared by new card -> repush center note");
                     last_check       = now;         // ★ v6.42h 刚激活过，本拍不必再心跳
                     bs_card_cache_save();
                 } else if (rc > 0) {
@@ -8110,6 +8173,14 @@ static void *bs_cardwatch(void *arg) {
                         //       （那种情况归下方心跳分支的 code=7 处理）
                         //     · 否则本机当前卡始终有效 → 原样保留，心跳照跑
                         //   一句话：抢别人的卡失败，不该把自己的卡弄丢。
+                        // ★ v6.47：只有「撞的是另一张卡」才算新一轮冲突 → 允许再报一次；
+                        //   同一张卡被 60s 节流反复重试时不再刷中控备注（用户要求只报一次）。
+                        if (strcmp(g_card_kicked, card) != 0) {
+                            g_note_conflict_sent = 0;
+                            g_note_force         = 1;
+                        } else if (!g_note_conflict_sent) {
+                            g_note_force         = 1;     // 第一次撞上（比如进程重启后）
+                        }
                         snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", card);
                         g_card_kickts = now;                    // ★ v6.23t 记录被抢时刻
                         int was_current = (g_card_cur[0] && !strcmp(card, g_card_cur));
@@ -8172,6 +8243,7 @@ static void *bs_cardwatch(void *arg) {
                 if (rc == 7) {
                     snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", g_card_cur);
                     g_card_kickts = now;                    // ★ v6.23t 记录被踢时刻
+                    g_note_force  = 1;                      // ★ v6.47 状态突变，尽快反映到中控备注
                     bs_log("[card] taken over by another device, "
                            "blocked: %.20s...", g_card_cur);
                     g_card_cur[0] = 0;
@@ -8236,6 +8308,8 @@ static void *bs_cardwatch(void *arg) {
                     snprintf(g_card_cur, sizeof(g_card_cur), "%s", g_card_kicked);
                     g_card_kicked[0] = 0;
                     g_card_kickts    = 0;
+                    g_note_conflict_sent = 0;   // ★ v6.47 冲突解除 → 允许下轮再报
+                    g_note_force         = 1;   // ★ v6.47 尽快把中控备注改回真实状态
                     bs_card_cache_save();
                     bs_log("[card] blacklisted card re-bound on server -> "
                            "recovered %.20s...", g_card_cur);
