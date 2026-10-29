@@ -30,7 +30,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.45" || (echo "MISSING v6.45" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.46" || (echo "MISSING v6.46" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.41"; then echo "STALE: v6.41 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
@@ -185,7 +185,7 @@ jobs:
           #   背景：中控两列来自两个不同全局 —— 「授权」=g_agent_auth_state、
           #   「到期」=g_agent_auth_valid_time。旧版只同步后者 ⇒ 云端删卡后到期空、
           #   授权仍「已授权」（21:06 .216 实测）。v6.42d 每拍按 verdict_ok 写前者。
-          strings bs_unlock.dylib | grep -q "v6.45" || (echo "MISSING v6.45 banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.46" || (echo "MISSING v6.46 banner" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state found, now=%d" || (echo "MISSING auth_state dlsym log" && exit 1)
           strings bs_unlock.dylib | grep -q "auth_state %d -> %d (verdict=%s -> center auth column)" || (echo "MISSING auth_state sync log" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state symbol NOT found" || (echo "MISSING auth_state fallback log" && exit 1)
@@ -213,12 +213,13 @@ jobs:
           #   修法：仅当 card == g_card_cur 时才清（那种归心跳 code=7 分支）。
           strings bs_unlock.dylib | grep -q "already activated on another device, refused (no auto-rebind)" || (echo "MISSING v6.44 refuse-no-rebind log" && exit 1)
           strings bs_unlock.dylib | grep -q "keep current card, heartbeat unaffected" || (echo "MISSING v6.44 keep-current-card log" && exit 1)
-          # ===== v6.45（2026-10-30）：把状态/卡密冲突直接写进 BBCenter 中控「备注」列 =====
+          # ===== v6.46（2026-10-30）：把状态/卡密冲突直接写进 BBCenter 中控「备注」列 =====
           #   协议实测：总长4B | 07 00 | 01 | 状态位1B | 到期4B | 01 02 0000 | 指纹4B | 01
           #             | 备注 UTF-8。中控 RVA 0xb2a4 cmp rax,0x15，>21 取 [0x15:] 进备注列。
           #   ① 中控按源 IP 归属设备，指纹 4B 不校验；② 一个连接只处理第一个包；
           #   ③ 非阻塞 connect(select 2s) 防卡住 cardwatch；④ 必须 SO_NOSIGPIPE。
-          strings bs_unlock.dylib | grep -q "note] -> %s:%d" || (echo "MISSING v6.45 center-note log" && exit 1)
+          strings bs_unlock.dylib | grep -q "note] -> %s:%d" || (echo "MISSING v6.46 center-note log" && exit 1)
+          strings bs_unlock.dylib | grep -q "note] reused app socket fd=%d" || (echo "MISSING v6.46 reuse-app-socket log" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6\.44"; then echo "FORBIDDEN: stale v6.44 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42h"; then echo "FORBIDDEN: stale v6.42h banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42g"; then echo "FORBIDDEN: stale v6.42g banner still present" && exit 1; fi

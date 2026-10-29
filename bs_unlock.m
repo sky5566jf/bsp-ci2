@@ -949,7 +949,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.45"
+#define BS_DYLIB_VER       "v6.46"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7728,7 +7728,7 @@ static long bs_card_login(const char *card, int act_new) {
 }
 
 /// 卡密状态机主循环。3s 一拍：读卡密 → 变更即激活 → cardtick 到点心跳 → 维护封禁态。
-/* ================= ★★★★★ v6.45：向 BBCenter 中控写设备「备注」 =================
+/* ================= ★★★★★ v6.46：向 BBCenter 中控写设备「备注」 =================
  * 需求：卡密冲突 / 卡状态不再只能翻 BSModuleServer.exe 的运行日志，
  *       直接显示在 BBCenter.exe 设备列表的「备注」列上（运维一眼就看到）。
  *
@@ -7744,13 +7744,37 @@ static long bs_card_login(const char *card, int act_new) {
  * BBCenter 侧证据：RVA 0xb2a4  cmp rax,0x15 → <=21 清空备注，>21 取 [0x15:]
  *                  转 QString 写 dev+0x118；填表 RVA 0x29ad0 写 dev+0xE0（备注列）。
  *
- * 三条硬实测结论：
- *   ① 中控按**源 IP** 归属设备 —— 设备自己连上去就落到自己那一行；
- *      [16:20] 那 4 字节「设备指纹」实测**不校验**（全 0 也照样接收）。
- *   ② 一个 TCP 连接只处理**第一个包** —— 每次上报单独建连、只发一个包；
- *      发 9B 握手再发正文 = 正文丢失（踩过）。
- *   ③ 备注是「当前值」不是流水，原厂状态变化时会覆盖 → cardwatch 定期重刷。
+ * 四条硬实测结论：
+ *   ① 中控按**源 IP** 归属设备；[16:20] 那 4 字节「设备指纹」每次都是随机 nonce，不校验。
+ *   ② ★★★★★ **必须复用 App 自己那条持久连接**。新开的 TCP 连接即使源 IP 正确、
+ *      包格式完全正确，中控 recv 收到后也会丢弃（实测：0xb2a4 解析点零命中、备注列不动）。
+ *      只有 App 自己的那条连接（连上后先发 9B 心跳、由中控建立设备上下文）才被认。
+ *      v6.45 独立建连失败的真因就在这里，不是格式问题。
+ *   ③ 一条连接**不要连发两个包** —— 原厂时序是「心跳 9B → 状态 21B」，我们只插状态包。
+ *   ④ 备注是「当前值」不是流水，原厂状态变化时会覆盖 → cardwatch 定期重刷。
  */
+static int bs_center_find_sock(const char *ip, int port) {
+    if (!ip || !ip[0] || port <= 0) return -1;
+    struct sockaddr_in want;
+    memset(&want, 0, sizeof(want));
+    want.sin_family = AF_INET;
+    want.sin_port   = htons((uint16_t)port);
+    want.sin_addr.s_addr = inet_addr(ip);
+    if (want.sin_addr.s_addr == INADDR_NONE) return -1;
+    /* 在本进程（App）里找那条已连上中控的 socket —— getpeername 逐个探，3..1024 足够 */
+    for (int f = 3; f < 1024; f++) {
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        if (getpeername(f, (struct sockaddr *)&sa, &sl) != 0) continue;
+        if (sa.sin_family != AF_INET) continue;
+        if (sa.sin_port != want.sin_port) continue;
+        if (sa.sin_addr.s_addr != want.sin_addr.s_addr) continue;
+        return f;
+    }
+    return -1;
+}
+
 static int bs_center_note_send(const char *ip, const char *note) {
     if (!ip || !ip[0]) return -1;
     size_t nl = note ? strlen(note) : 0;
@@ -7769,6 +7793,25 @@ static int bs_center_note_send(const char *ip, const char *note) {
     pkt[12] = 0x01; pkt[13] = 0x02;           // [12][13] 固定
     pkt[20] = 0x01;                           // [20]   固定
     if (nl) memcpy(pkt + 21, note, nl);       // [21:]  备注
+
+    /* ★★★★★ 优先复用 App 自己到中控的持久连接（唯一被中控认可的那条） */
+    int efd = bs_center_find_sock(ip, g_noteport);
+    if (efd >= 0) {
+        int one = 1;
+        setsockopt(efd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        struct timeval stv;
+        stv.tv_sec = 2; stv.tv_usec = 0;
+        setsockopt(efd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
+        ssize_t ew = send(efd, pkt, total, 0);
+        if (ew == (ssize_t)total) {
+            static int s_lastfd = -1;
+            if (efd != s_lastfd) {
+                s_lastfd = efd;
+                bs_log("[note] reused app socket fd=%d", efd);
+            }
+            return 0;
+        }
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -2;
