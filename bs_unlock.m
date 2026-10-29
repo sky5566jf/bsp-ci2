@@ -7785,40 +7785,18 @@ static void *bs_cardwatch(void *arg) {
                               lg_ts > 0 && lg_ts > g_card_kickts);
             if (g_card_kicked[0] && strcmp(card, g_card_kicked) == 0 && !real_input) {
                 // ★ v6.23s：被接管卡本地拉黑 —— 自动重试会以 act=new 抢回，
-                //   与接管方 60s 心跳互踢振荡；静默等真输入（换卡或重启 App）
+                //   与接管方 60s 心跳互踢振荡；静默等真输入（换卡或重启 App）。
                 //
-                // ★★★★ v6.42：黑名单**冷却探活**（旧版永久静默的自愈盲点）。
-                //   场景：卡在 A 机手上 → B 机输同卡act=new接管 → A 收 code=7 拉黑。
-                //   之后管理员在云端把这张卡改绑回 A（或把 B 机换走），A 机因为
-                //   拉黑着**一次都不再试**，只能人工换卡或重装 App 才活 —— 现场
-                //   表现为「明明绑回来了，设备还是死不跑」。
-                //   修法：每 cardtick×5（默认 10 分钟）发一次**不带 act 的探活心跳**：
-                //     · 不带 act ⇒ 服务端不会改绑、不会与持有方互踢（bsmod v3.10 语义）
-                //     · 仍 code=7 就继续拉黑（服务端只多一条 bind_conflict 留痕）
-                //     · code=0 ⇒ 绑定已回到本机，就地解除拉黑恢复运行
+                // ★★★★ v6.42：**探活已移到下方独立段落**（见「拉黑冷却探活」）。
+                //   为什么不能放这里：code=7 时 g_card_cur 与缓存卡号一起被清空，
+                //   若厂商 getter 也返回空（假卡机 / 从未人工输卡的机），下一拍
+                //   have_card=0，本整个「卡变化」分支根本不进 —— 探活挂在这里
+                //   等于永远不触发（2026-10-29 .216 实测踩到，10 分钟零请求）。
                 static long last_kick_log = 0;
-                static long last_probe    = 0;
-                long probe_gap = (long)g_cardtick * 5;
-                if (probe_gap < 600) probe_gap = 600;
-                if (now - last_probe >= probe_gap) {
-                    last_probe = now;
-                    long prc = bs_card_login(card, 0);   // ★ 不带 act：只探不改绑
-                    if (prc == 0) {
-                        snprintf(g_card_cur, sizeof(g_card_cur), "%s", card);
-                        g_card_kicked[0] = 0;
-                        g_card_kickts    = 0;
-                        last_fail[0]     = 0;
-                        bs_card_cache_save();
-                        bs_log("[card] blacklisted card re-bound on server -> "
-                               "recovered %.20s...", card);
-                        last_check = now;
-                    }
-                }
                 if (now - last_kick_log >= 300) {
                     last_kick_log = now;
                     bs_log("[card] taken over card %.20s... blacklisted, "
-                           "waiting for new input or server re-bind (probe %lds)",
-                           card, probe_gap);
+                           "waiting for new input", card);
                 }
             } else {
             if (real_input && g_card_kicked[0] && strcmp(card, g_card_kicked) == 0) {
@@ -7884,6 +7862,43 @@ static void *bs_cardwatch(void *arg) {
                 bs_card_cache_save();
             }
             last_check = now;
+        }
+
+        // ---- ★★★★ v6.42：拉黑冷却探活（**独立段落，不依赖 card 来源**） ----
+        //   场景：卡在 A 机手上 → B 机输同卡 act=new 接管 → A 收 code=7 拉黑。
+        //   之后管理员在云端把卡改绑回 A（或把 B 机换走），旧版 A 机因为拉黑着
+        //   **一次都不再试**，只能人工换卡 / 重装 App 才活 —— 现场表现为
+        //   「明明绑回来了，设备还是死不跑」。
+        //   修法：每 cardtick×5（默认 ≥600s）发一次**不带 act 的探活心跳**：
+        //     · 不带 act ⇒ 服务端不会改绑、不会与持有方互踢（bsmod v3.10 语义）
+        //     · 仍 code=7 就继续拉黑（服务端只多一条 bind_conflict 留痕）
+        //     · code=0 ⇒ 绑定已回到本机，就地解除拉黑恢复运行
+        //   ★ 必须独立：code=7 会把 g_card_cur 与缓存卡号一起清空，若厂商 getter
+        //     也返回空（假卡机 / 从未人工输卡的机），下一拍 have_card=0，上面的
+        //     「卡变化」分支根本不进 —— 探活挂在那里等于永不触发（.216 实测）。
+        if (g_card_kicked[0] && !g_card_cur[0]) {
+            static long last_probe = 0;
+            static long probe_log  = 0;
+            long probe_gap = (long)g_cardtick * 5;
+            if (probe_gap < 600) probe_gap = 600;
+            if (now - last_probe >= probe_gap) {
+                last_probe = now;
+                long prc = bs_card_login(g_card_kicked, 0);   // ★ 不带 act：只探不改绑
+                if (prc == 0) {
+                    snprintf(g_card_cur, sizeof(g_card_cur), "%s", g_card_kicked);
+                    g_card_kicked[0] = 0;
+                    g_card_kickts    = 0;
+                    bs_card_cache_save();
+                    bs_log("[card] blacklisted card re-bound on server -> "
+                           "recovered %.20s...", g_card_cur);
+                    last_check = now;
+                }
+            }
+            if (now - probe_log >= 300) {
+                probe_log = now;
+                bs_log("[card] blacklisted %.20s... waiting for new input or server re-bind (probe %lds)",
+                       g_card_kicked, probe_gap);
+            }
         }
 
         // ---- 判决 ----
