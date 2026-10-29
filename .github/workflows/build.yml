@@ -30,7 +30,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.51" || (echo "MISSING v6.51" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.52" || (echo "MISSING v6.52" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.41"; then echo "STALE: v6.41 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
@@ -185,7 +185,7 @@ jobs:
           #   背景：中控两列来自两个不同全局 —— 「授权」=g_agent_auth_state、
           #   「到期」=g_agent_auth_valid_time。旧版只同步后者 ⇒ 云端删卡后到期空、
           #   授权仍「已授权」（21:06 .216 实测）。v6.42d 每拍按 verdict_ok 写前者。
-          strings bs_unlock.dylib | grep -q "v6.51" || (echo "MISSING v6.51 banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.52" || (echo "MISSING v6.52 banner" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state found, now=%d" || (echo "MISSING auth_state dlsym log" && exit 1)
           strings bs_unlock.dylib | grep -q "auth_state %d -> %d (verdict=%s -> center auth column)" || (echo "MISSING auth_state sync log" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state symbol NOT found" || (echo "MISSING auth_state fallback log" && exit 1)
@@ -240,7 +240,8 @@ jobs:
           #     整段丢掉；而且 run 脚本里的中文字面量在 macOS runner 上还有编码风险
           #     （2026-10-30 03:50 run 40941411263 / 03:56 run 40941600888 连续两次栽在这，
           #      编译与功能全过，只挂断言）。
-          strings bs_unlock.dylib | grep -q "conflict tag applied on valid card" || (echo "MISSING v6.49 valid-conflict marker" && exit 1)
+          # v6.52 起「备注只报冲突」，v6.49 的 valid-conflict 标记文案已随分支删除
+          strings bs_unlock.dylib | grep -q "already activated on another device" || (echo "MISSING v6.44 refuse-no-rebind whole-line" && exit 1)
           # ----- v6.48（2026-10-30 03:20 .216 实测修正）：备注侧冲突记忆必须独立 -----
           #   v6.47 拿 g_card_kicked 当备注判据，实测**抖**：运营输的那张别人卡就躺在
           #   agent.log 尾部，日志扫描每拍都判成「真重新输入」→ 解除拉黑把 kicked 清空，
@@ -254,6 +255,7 @@ jobs:
           if strings bs_unlock.dylib | grep -q "v6\.48"; then echo "FORBIDDEN: stale v6.48 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.49"; then echo "FORBIDDEN: stale v6.49 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.50"; then echo "FORBIDDEN: stale v6.50 banner still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6\.51"; then echo "FORBIDDEN: stale v6.51 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.44"; then echo "FORBIDDEN: stale v6.44 banner still present" && exit 1; fi
 
           # ===== v6.50（2026-10-30 04:20）：备注上报不得干扰原厂「运行」列 =====
@@ -265,6 +267,8 @@ jobs:
           #         ② 正常态去掉 300s 无脑保底重推（只在文案变化/运行态翻转/force 时发），
           #            避免反复覆盖原厂自己写进备注的内容；异常态保留 300s 保底。
           strings bs_unlock.dylib | grep -q "run=%d" || (echo "MISSING v6.50 note run-state log" && exit 1)
+          # ===== v6.52（2026-10-30 04:35）：备注只报卡密冲突，非冲突态零发包 =====
+          strings bs_unlock.dylib | grep -q "(clear remark)" || (echo "MISSING v6.52 note clear-remark log" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6\.42h"; then echo "FORBIDDEN: stale v6.42h banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42g"; then echo "FORBIDDEN: stale v6.42g banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42f"; then echo "FORBIDDEN: stale v6.42f banner still present" && exit 1; fi

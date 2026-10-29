@@ -949,7 +949,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.51"
+#define BS_DYLIB_VER       "v6.52"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1080,6 +1080,12 @@ static long          g_note_cf_ts       = 0;   // 该次冲突时刻
 static long          g_note_cf_evt      = 0;   // 该次冲突对应的「输入事件」时间戳（agent.log 行首）
 static int           g_note_cf_sent     = 0;   // 该次冲突是否已上报过（用户要求只报一次）
 static int           g_note_force       = 0;   // 状态切换 → 15s 内强制重推一次（覆盖旧备注）
+// ★★★★★ v6.52：本次进程启动后是否已做过「清场」。
+//   为什么必须有：新方案只在「上一拍挂着冲突文案」时才发空备注清除，
+//   而 g_note_last 是内存变量，**进程一重启就归空** —— 中控上残留的上一个版本
+//   写进去的「正常 v6.50 到期…」就再也没人去清，会永久挂在备注列。
+//   所以启动后第一拍无条件发一个 21 字节空备注包，把历史残留抹掉，再进入静默。
+static int           g_note_boot        = 0;   // 0=本次启动还没清过场
 // ★★★★★ v6.50：记住上次推送时包里的「运行状态位」[7] —— 该位一变就必须补推一包，
 //   否则中控「运行」列会停在旧值（原厂状态包并不是每次运行状态变化都发）。
 static int           g_note_lastrun     = -1;  // -1 = 还没推过
@@ -7920,7 +7926,9 @@ static int bs_center_note_send(const char *ip, const char *note) {
 ///
 /// 现在：valid 与 verdict_ok 完全同源 —— valid=1 时备注只可能是「正常 …」，
 /// 「接管 / 冲突」这类负面文案**只允许出现在 valid=0 时**。
-static int bs_note_verdict_ok(long now) {
+/// ★ v6.52：本函数在「备注只报冲突」方案下不再参与判定，仅保留作判据参考，
+///   避免 -Wunused-function 告警。
+static int __attribute__((unused)) bs_note_verdict_ok(long now) {
     if (g_card_cur[0] && g_card_expire > 0 && now < g_card_expire) return 1;
     if (g_card_expire > 0 && g_card_lastok > 0 &&
         now < g_card_lastok + (long)g_cardgrace * 3600) return 1;
@@ -7928,17 +7936,20 @@ static int bs_note_verdict_ok(long now) {
 }
 
 /// 组装当前状态文案并推给中控
-/// ★ v6.49 三条规则（用户 2026-10-30 拍板）：
-///   ① **文案与授权列同源** —— 永不出现「已授权 + 本机卡密已被其他设备接管」；
-///   ② **状态一变立刻覆盖** —— 卡恢复 / 冲突解除后 3 秒内就把旧文案换掉，
-///      不再等 45s 轮询位（.98 实测：旧版恢复后中控上还挂着「已被接管」十几分钟）；
-///   ③ **同文案不发**，只每 300s 幂等保底重推一次（防原厂状态包把备注冲成空），
-///      日志只在文案变化时打一条 —— 这就是用户要的「卡密冲突只上报一次」：
-///      中控上那条文案是稳定的，不会每 45s 刷新一遍。
-/// ★ v6.50 追加（用户 2026-10-30 04:20）：
-///   ④ **不得干扰原厂「运行」列**：包 [7] 从死值 0 改为真实运行态（见 bs_center_run_flag）；
-///   ⑤ **不得反复覆盖原厂自己的备注**：正常态去掉 300s 保底重推，只在文案变化 /
-///      运行态翻转 / force 时推；异常态才保底重推。
+/// ★★★★★ v6.52（用户 2026-10-30 04:35 定案，彻底取代 v6.45~v6.51 的「全状态上报」）：
+///   备注列**只承载一件事 —— 卡密冲突**。
+///   场景唯一定义：设备当前没有可用卡，绑定过程中输入了一张已被其他设备绑定的卡。
+///   ① **非冲突态：一个包都不发。** 正常 / 过期 / 未授权都不再写备注列 ⇒
+///      中控上不会再出现「正常 v6.50 到期…」这种占着备注列的信息噪声；
+///      平时零发包 ⇒ 对原厂「运行 / 连接」两列**零干扰**（这是 v6.50 [7] 修好之后
+///      的进一步收敛：干脆不发，就没有任何覆盖风险）。
+///   ② **冲突态：文案变化立即发，同文案每 300s 幂等重推一次。**
+///      ★ 必须重推：BBCenter `0xb2a4 cmp rax,0x15; jbe clear_remark` ——
+///        原厂自己每发一个 ≤21 字节的 07 包就会把备注清空，只发一次活不过一分钟。
+///   ③ **冲突解除：发一个 21 字节空备注包主动清场，然后回到完全静默。**
+///      解除点只有三个（都已存在）：绑定成功可用的卡 / 重输本机原卡 / 探活恢复。
+///      用户原话：「备注留着就一直留着可以不管他，如果绑定可用的再清空也可以」。
+///   ④ 包 [7] 始终填真实运行态（bs_center_run_flag），不干扰运行列。
 static void bs_center_note_tick(void) {
     char ip[64] = "";
     bs_pc_ip_of_plist(ip, sizeof(ip));
@@ -7946,73 +7957,40 @@ static void bs_center_note_tick(void) {
     if (!ip[0]) return;                       // 没配中控地址，什么都不做
 
     long now = (long)time(NULL);
-    char exp[24] = "";
-    if (g_card_expire > 0) {
-        time_t t = (time_t)g_card_expire;
-        struct tm tmv;
-        if (localtime_r(&t, &tmv) != NULL)
-            snprintf(exp, sizeof(exp), "%02d-%02d", tmv.tm_mon + 1, tmv.tm_mday);
-    }
 
-    int valid    = bs_note_verdict_ok(now);
-    int conflict = g_note_cf_card[0] && (now - g_note_cf_ts) < 1800;
-    if (valid && conflict) {
-        /* ★ v6.49：本机卡有效、但又撞了别人已绑的卡。以前这种组合会被写成
-           「本机卡密已被其他设备接管」，跟授权列的「已授权」直接打架。
-           现在只在「正常 …」尾部加 (他卡被拒)，并留一条英文日志便于现场核对。 */
-        static int vc_logged = 0;
-        if (!vc_logged) {
-            vc_logged = 1;
-            bs_log("[note] conflict tag applied on valid card (own card unaffected)");
-        }
-    }
-
+    /* ★ v6.52：唯一的文案来源 = 冲突记忆。g_note_cf_card 非空 ⇒ 还在冲突态，
+       它的三个清除点就是「解除」，不需要再看 30 分钟窗口，也不需要 verdict_ok。 */
     char note[256] = "";
-    if (valid) {
-        /* 有效卡：主状态永远是「正常」。刚误输别人的卡时只在尾部补个短标记，
-           既保留告警信息，又绝不会跟「已授权」打架。 */
-        if (conflict)
-            snprintf(note, sizeof(note), "正常 %s 到期%s (他卡被拒)",
-                     BS_DYLIB_VER, exp[0] ? exp : "?");
-        else
-            snprintf(note, sizeof(note), "正常 %s 到期%s",
-                     BS_DYLIB_VER, exp[0] ? exp : "?");
-    } else if (conflict && g_card_cur[0]) {
+    if (g_note_cf_card[0]) {
         snprintf(note, sizeof(note),
-                 "卡密冲突:%.16s 已被其他设备占用,已拒绝(本机不受影响)", g_note_cf_card);
-    } else if (conflict) {
-        snprintf(note, sizeof(note), "本机卡密已被其他设备接管");
-    } else if (g_card_expire > 0 && g_card_expire < now) {
-        snprintf(note, sizeof(note), "卡已过期 %s", exp[0] ? exp : "?");
-    } else {
-        snprintf(note, sizeof(note), "未授权 %s", BS_DYLIB_VER);
+                 "卡密冲突:%.16s 已被其他设备绑定,已拒绝%s",
+                 g_note_cf_card,
+                 g_card_cur[0] ? " (本机卡不受影响)" : "");
     }
 
     int runnow  = bs_center_run_flag();
-    int runchg  = (g_note_lastrun != runnow);     // ★ v6.50：运行态翻转必须补推
     int changed = strcmp(note, g_note_last) != 0;
-    int forced  = g_note_force;
-    if (!changed && !forced && !runchg && (now - g_note_ts) < 300) {
-        /* ★★★★★ v6.51（2026-10-30 04:40 .216 实测修正）：
-         *   v6.50 一度试过「正常态永不周期重推」，实测**不能这么做** ——
-         *   原厂每发一个 ≤21 字节的 07 包就会把备注清空（BBCenter 0xb2a4
-         *   `cmp rax,0x15; jbe clear_remark`）。装 v6.50 后 .216 备注列
-         *   只剩 40 秒就被原厂清空，之后再也不回来（截图 04:36 实证：备注空）。
-         *   所以 **正常态也必须保留 300s 保底重推**，否则「备注显示卡密绑定状态」
-         *   这个原始需求就废了。
-         *   而「覆盖原厂自己写的备注」这个担心，在 v6.50 修好 [7] 之后已经不再
-         *   有额外代价：原厂自己也会用下一个包把备注清掉/改写，这个字段本来就是
-         *   「当前值」不是流水。我们能保证的是**不再因为重推而搅乱运行列**。 */
-        return;
+
+    if (note[0]) {
+        /* 冲突态：变了一秒内就发；同文案 300s 保底（原厂会把备注清掉） */
+        if (!changed && (now - g_note_ts) < 300) return;
+    } else {
+        /* 非冲突态：只有在「上一拍还挂着冲突文案」或「本次启动还没清过场」时
+           才发一个 21 字节空备注包清场；清完 g_note_last 归空、g_note_boot 置 1，
+           此后彻底静默 —— 平时零发包，对原厂运行列零干扰。 */
+        if (!g_note_last[0] && g_note_boot) return;
     }
+
     int rc = bs_center_note_send(ip, note);
     if (rc == 0) {
+        if (changed || !note[0])
+            bs_log("[note] -> %s:%d  %s (run=%d)", ip, g_noteport,
+                   note[0] ? note : "(clear remark)", runnow);
         snprintf(g_note_last, sizeof(g_note_last), "%s", note);
-        g_note_ts    = now;
-        g_note_force = 0;
+        g_note_ts      = now;
+        g_note_force   = 0;
         g_note_lastrun = runnow;
-        if (changed || forced || runchg)
-            bs_log("[note] -> %s:%d  %s (run=%d)", ip, g_noteport, note, runnow);
+        g_note_boot    = 1;                  // ★ v6.52：本次启动已清过场
     } else if ((now - g_note_ts) > 30) {
         /* 发送失败也必须重试：旧版只在 120s 后重试一次就放弃，
            .98 那次「卡恢复了、备注还挂着接管」就是这里丢的。 */
