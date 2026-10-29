@@ -178,6 +178,10 @@ jobs:
           strings bs_unlock.dylib | grep -q "waiting for new input or server re-bind (probe %lds)" || (echo "MISSING v6.42 blacklist probe gap log" && exit 1)
           # 反回归：v6.42 之后不许再出现"设备码没就位也照判封禁"的旧形态
           if strings bs_unlock.dylib | grep -q "int blocked = verdict_ok ? 0 : 1"; then echo "FORBIDDEN: v6.42 old one-line verdict still present" && exit 1; fi
+          # ===== v6.42c（2026-10-29）：探活成功那一拍不再补打误导性 waiting 行 =====
+          #   .216 实测：recovered 之后紧跟一行 "waiting for new input or server
+          #   re-bind"，日志看起来像没恢复。修法是打印前复查 g_card_kicked。
+          strings bs_unlock.dylib | grep -q "v6.42c" || (echo "MISSING v6.42c banner" && exit 1)
           # v6.25j：消费式缓冲修复的特征串（粘包尾巴不再被整块丢弃）
           strings bs_unlock.dylib | grep -q "conn pkts=\[" || (echo "MISSING conn-pkts" && exit 1)
           strings bs_unlock.dylib | grep -q "rx buffer full" || (echo "MISSING rx-buffer-full" && exit 1)

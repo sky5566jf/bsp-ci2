@@ -948,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.42"
+#define BS_DYLIB_VER       "v6.42c"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7894,7 +7894,11 @@ static void *bs_cardwatch(void *arg) {
                     last_check = now;
                 }
             }
-            if (now - probe_log >= 300) {
+            // ★★★★ v6.42c：探活成功那一拍 g_card_kicked 已在本块内被清空，
+            //   若这里不复查，会在 recovered 之后紧跟着再打一行 "waiting for
+            //   new input or server re-bind" —— 现场看日志像「没恢复」，与上一行
+            //   recovered 自相矛盾（2026-10-29 .216 实测）。加 g_card_kicked[0] 复查。
+            if (g_card_kicked[0] && now - probe_log >= 300) {
                 probe_log = now;
                 bs_log("[card] blacklisted %.20s... waiting for new input or server re-bind (probe %lds)",
                        g_card_kicked, probe_gap);
