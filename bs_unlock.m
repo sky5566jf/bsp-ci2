@@ -7928,6 +7928,16 @@ static void bs_center_note_tick(void) {
 
     int valid    = bs_note_verdict_ok(now);
     int conflict = g_note_cf_card[0] && (now - g_note_cf_ts) < 1800;
+    if (valid && conflict) {
+        /* ★ v6.49：本机卡有效、但又撞了别人已绑的卡。以前这种组合会被写成
+           「本机卡密已被其他设备接管」，跟授权列的「已授权」直接打架。
+           现在只在「正常 …」尾部加 (他卡被拒)，并留一条英文日志便于现场核对。 */
+        static int vc_logged = 0;
+        if (!vc_logged) {
+            vc_logged = 1;
+            bs_log("[note] conflict tag applied on valid card (own card unaffected)");
+        }
+    }
 
     char note[256] = "";
     if (valid) {

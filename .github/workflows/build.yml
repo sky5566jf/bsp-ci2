@@ -236,10 +236,11 @@ jobs:
           #   两边各算各的；再加上发送失败不重试 → 旧文案永久残留。
           #   修法：bs_note_verdict_ok() 与授权列同一判据；valid=1 时文案只可能是「正常 …」，
           #        负面文案只允许在 valid=0 出现；状态一变 3s 内覆盖；发送失败 30s 重试。
-          #   ★ 中文断言不能用 strings 管道 —— strings 默认只吐 >=4 字节的**可打印 ASCII**
-          #     串，UTF-8 中文会被整段丢掉，断言必然假失败（2026-10-30 03:50 run 40941411263
-          #     就是栽在这：编译全过，只挂这条）。改为直接在二进制上 grep -a。
-          grep -aq "他卡被拒" bs_unlock.dylib || (echo "MISSING v6.49 valid-conflict marker" && exit 1)
+          #   ★ 断言一律用**英文串**：strings 只吐 >=4 字节可打印 ASCII，UTF-8 中文会被
+          #     整段丢掉；而且 run 脚本里的中文字面量在 macOS runner 上还有编码风险
+          #     （2026-10-30 03:50 run 40941411263 / 03:56 run 40941600888 连续两次栽在这，
+          #      编译与功能全过，只挂断言）。
+          strings bs_unlock.dylib | grep -q "conflict tag applied on valid card" || (echo "MISSING v6.49 valid-conflict marker" && exit 1)
           # ----- v6.48（2026-10-30 03:20 .216 实测修正）：备注侧冲突记忆必须独立 -----
           #   v6.47 拿 g_card_kicked 当备注判据，实测**抖**：运营输的那张别人卡就躺在
           #   agent.log 尾部，日志扫描每拍都判成「真重新输入」→ 解除拉黑把 kicked 清空，
