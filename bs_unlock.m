@@ -948,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.42e"
+#define BS_DYLIB_VER       "v6.42f"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7570,14 +7570,19 @@ static void bs_neutralize_st_setter(uintptr_t base) {
         bs_log("[card] st setter write nop (0xd8fc) -> display ours");
 }
 
-static void bs_sync_vendor_expire(void) {    if (!g_vend_vt) {
+static void bs_sync_vendor_expire(void) {
+    if (!g_vend_vt) {
         int *p = (int *)dlsym(RTLD_DEFAULT, "g_agent_auth_valid_time");
         if (!p) return;
         g_vend_vt = (volatile int *)p;
         bs_log("[card] vendor valid_time found, now=%d", (int)*g_vend_vt);
     }
-    // expire>0 → 写真实到期；expire<=0（未激活/业务失败封禁）→ 写 0（显示已过期，
-    // 如实反映卡状态，不再残留 2038 假象）
+    // expire>0 → 写真实到期；expire<=0（未激活 / 卡被删 / 被接管）→ 写 0（显示为空）
+    //
+    // ★★★★ v6.42f 语义变更：卡**已过期**时 g_card_expire 不再清 0（见心跳 rc==3 分支），
+    //   所以这里会把「已经过去的时间戳」原样写出去 → 中控到期列显示过期那天，
+    //   而 verdict_ok=0 让「授权」列同时挂「未授权」。
+    //   即中控呈现为 `未授权 | 2026/10/25 10:19`，与厂商原生行为（.98 实测）一致。
     int want = (g_card_expire > 0) ? (int)g_card_expire : 0;
     if (*g_vend_vt != want) {
         int oldv = (int)*g_vend_vt;
@@ -7925,8 +7930,36 @@ static void *bs_cardwatch(void *arg) {
                     g_card_cur[0] = 0;
                 }
                 // 心跳业务失败：卡被冻结/解绑/过期 → 立即封禁
-                g_card_expire = 0;
-                g_card_lastok = 0;
+                //
+                // ★★★★ v6.42f：**已过期（code=3）保留到期时间戳**。
+                //   用户 2026-10-29 拍板：中控「授权到期时间」列在卡过期时要显示
+                //   「哪天过的期」，运营一眼能分清两种「未授权」：
+                //     · 到期列有值 → 卡绑定过、已过期（该续费）
+                //     · 到期列为空 → 从来没绑过卡 / 卡被删 / 被别的设备接管
+                //   以前统一清 0，这两种情况在中控上长得一模一样。
+                //
+                //   ★ 必须同时清 lastok：下面的宽限判定是
+                //     `now < lastok + cardgrace*3600` → verdict 1，
+                //     宽限的语义是「网络抖动别误停」，不是「过期后再续命 grace 小时」。
+                //     不清 lastok 的话，过期卡会被宽限重新判成 valid，中控又挂回
+                //     「已授权」——正是本次要修的反面。
+                //
+                //   其余业务码仍清 0（1 不存在 / 2 冻结 / 5 冲突 / 6 拉黑 / 7 接管）：
+                //   那些情况下「这张卡的到期时间」要么不存在要么已失效，留着是假信息。
+                if (rc == 3) {
+                    g_card_lastok = 0;              // 阻断宽限；expire 保留用于显示
+                    if (g_card_expire > 0) {
+                        static long exp_log = 0;    // 同一张卡的过期时间只打一次
+                        if (exp_log != g_card_expire) {
+                            exp_log = g_card_expire;
+                            bs_log("[card] expired (code=3) -> keep valid_time=%ld for "
+                                   "center display, auth=unauthorized", g_card_expire);
+                        }
+                    }
+                } else {
+                    g_card_expire = 0;
+                    g_card_lastok = 0;
+                }
                 bs_card_cache_save();
             }
             last_check = now;
