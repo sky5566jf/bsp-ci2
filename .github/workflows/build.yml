@@ -30,7 +30,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.48" || (echo "MISSING v6.48" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.49" || (echo "MISSING v6.49" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.41"; then echo "STALE: v6.41 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
@@ -185,7 +185,7 @@ jobs:
           #   背景：中控两列来自两个不同全局 —— 「授权」=g_agent_auth_state、
           #   「到期」=g_agent_auth_valid_time。旧版只同步后者 ⇒ 云端删卡后到期空、
           #   授权仍「已授权」（21:06 .216 实测）。v6.42d 每拍按 verdict_ok 写前者。
-          strings bs_unlock.dylib | grep -q "v6.48" || (echo "MISSING v6.48 banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.49" || (echo "MISSING v6.49 banner" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state found, now=%d" || (echo "MISSING auth_state dlsym log" && exit 1)
           strings bs_unlock.dylib | grep -q "auth_state %d -> %d (verdict=%s -> center auth column)" || (echo "MISSING auth_state sync log" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state symbol NOT found" || (echo "MISSING auth_state fallback log" && exit 1)
@@ -230,6 +230,13 @@ jobs:
           #        探活恢复 / 重输本机原卡。
           strings bs_unlock.dylib | grep -q "conflict cleared by new card -> repush center note" || (echo "MISSING v6.47 conflict-clear repush log" && exit 1)
           strings bs_unlock.dylib | grep -q "own card re-input after conflict -> clear flag on center" || (echo "MISSING v6.47 own-card-reinput log" && exit 1)
+          # ===== v6.49（2026-10-30 03:40 .98 实测）：备注主状态与「授权」列同源 =====
+          #   用户报障：输了一张别人已绑的卡之后，中控那一行 = 「已授权 ｜ 本机卡密已被其他设备接管」，
+          #   两个字段自相矛盾。根因是备注文案只看 g_card_cur/expire，而授权列看 verdict_ok（含宽限），
+          #   两边各算各的；再加上发送失败不重试 → 旧文案永久残留。
+          #   修法：bs_note_verdict_ok() 与授权列同一判据；valid=1 时文案只可能是「正常 …」，
+          #        负面文案只允许在 valid=0 出现；状态一变 3s 内覆盖；发送失败 30s 重试。
+          strings bs_unlock.dylib | grep -q "他卡被拒" || (echo "MISSING v6.49 valid-conflict marker" && exit 1)
           # ----- v6.48（2026-10-30 03:20 .216 实测修正）：备注侧冲突记忆必须独立 -----
           #   v6.47 拿 g_card_kicked 当备注判据，实测**抖**：运营输的那张别人卡就躺在
           #   agent.log 尾部，日志扫描每拍都判成「真重新输入」→ 解除拉黑把 kicked 清空，
@@ -240,6 +247,7 @@ jobs:
           #         取消「newer input seen after kick」分支里的 force（那一拍每 3 秒都命中）。
           if strings bs_unlock.dylib | grep -q "v6\.46"; then echo "FORBIDDEN: stale v6.46 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.47"; then echo "FORBIDDEN: stale v6.47 banner still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "v6\.48"; then echo "FORBIDDEN: stale v6.48 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.44"; then echo "FORBIDDEN: stale v6.44 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42h"; then echo "FORBIDDEN: stale v6.42h banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42g"; then echo "FORBIDDEN: stale v6.42g banner still present" && exit 1; fi

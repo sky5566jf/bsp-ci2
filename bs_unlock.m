@@ -949,7 +949,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.48"
+#define BS_DYLIB_VER       "v6.49"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7774,7 +7774,7 @@ static long bs_card_login(const char *card, int act_new) {
  *   ③ 一条连接**不要连发两个包** —— 原厂时序是「心跳 9B → 状态 21B」，我们只插状态包。
  *   ④ 备注是「当前值」不是流水，原厂状态变化时会覆盖 → cardwatch 定期重刷。
  *
- * ★ v6.47/v6.48 补充（用户拍板，2026-10-30）：
+ * ★ v6.47/v6.48/v6.49 补充（用户拍板，2026-10-30）：
  *   ⑤ 卡密冲突**只报一次**。备注定格显示的是「当前值」，同一条冲突每 45s 重推毫无
  *      意义；更要命的是会一直挂在中控上误导判断。→ g_note_conflict_sent 记忆已报，
  *      只有撞的卡号换了（新一轮冲突）才允许再报一次。
@@ -7882,15 +7882,35 @@ static int bs_center_note_send(const char *ip, const char *note) {
     return (w == (ssize_t)total) ? 0 : -4;
 }
 
+/// ★★★★★ v6.49：备注主状态必须与「授权」列**同一判据**。
+///
+/// 用户 2026-10-30 03:30 报障（.98）：输了一张别人已绑的卡之后，中控那一行变成
+///     授权=已授权 ｜ 备注=本机卡密已被其他设备接管
+/// 两个字段自相矛盾，运营没法判断这台机器到底能不能跑。
+///
+/// 根因是两条链路各用各的判据：
+///   · 「授权」列 ← bs_sync_vendor_auth_state(verdict_ok)，verdict_ok 含 grace 宽限；
+///   · 「备注」    ← 旧实现只看 g_card_cur / g_card_expire，不看宽限，也不保证
+///                  备注变更一定送达到中控（发送失败就永久残留旧文案）。
+/// 只要两边错位一次，中控上就会长期挂着一条与授权列打架的备注。
+///
+/// 现在：valid 与 verdict_ok 完全同源 —— valid=1 时备注只可能是「正常 …」，
+/// 「接管 / 冲突」这类负面文案**只允许出现在 valid=0 时**。
+static int bs_note_verdict_ok(long now) {
+    if (g_card_cur[0] && g_card_expire > 0 && now < g_card_expire) return 1;
+    if (g_card_expire > 0 && g_card_lastok > 0 &&
+        now < g_card_lastok + (long)g_cardgrace * 3600) return 1;
+    return 0;
+}
+
 /// 组装当前状态文案并推给中控
-/// ★ v6.47 两条规则（用户拍板）：
-///   ① **卡密冲突只报一次** —— 中控备注列是「当前值」不是流水，同一条冲突反复推
-///      只会每 45s 把运营正在看的信息冲掉。冲突期间静默，等下一张卡撞出**新**冲突
-///      （卡号变了）才允许再报一次。
-///   ② **冲突解除必须主动覆盖** —— 运营在 A 机撞了冲突之后又输了一张没人绑定的卡
-///      （激活成功），中控备注里那条冲突文案**不会自己消失**，会一直挂着误导判断。
-///      所以激活成功/拉黑解除/探活恢复这三处都要 `g_note_force=1`，15 秒内把备注
-///      改回当前真实状态（正常/过期/未授权）。
+/// ★ v6.49 三条规则（用户 2026-10-30 拍板）：
+///   ① **文案与授权列同源** —— 永不出现「已授权 + 本机卡密已被其他设备接管」；
+///   ② **状态一变立刻覆盖** —— 卡恢复 / 冲突解除后 3 秒内就把旧文案换掉，
+///      不再等 45s 轮询位（.98 实测：旧版恢复后中控上还挂着「已被接管」十几分钟）；
+///   ③ **同文案不发**，只每 300s 幂等保底重推一次（防原厂状态包把备注冲成空），
+///      日志只在文案变化时打一条 —— 这就是用户要的「卡密冲突只上报一次」：
+///      中控上那条文案是稳定的，不会每 45s 刷新一遍。
 static void bs_center_note_tick(void) {
     char ip[64] = "";
     bs_pc_ip_of_plist(ip, sizeof(ip));
@@ -7906,44 +7926,46 @@ static void bs_center_note_tick(void) {
             snprintf(exp, sizeof(exp), "%02d-%02d", tmv.tm_mon + 1, tmv.tm_mday);
     }
 
-    /* ★ v6.47：备注侧冲突判据 = g_note_cf_card（不抖），不是 g_card_kicked（每 3s 抖）。 */
+    int valid    = bs_note_verdict_ok(now);
     int conflict = g_note_cf_card[0] && (now - g_note_cf_ts) < 1800;
 
     char note[256] = "";
-    int  is_conflict = 0;
-    if (conflict && g_card_cur[0]) {
-        is_conflict = 1;
+    if (valid) {
+        /* 有效卡：主状态永远是「正常」。刚误输别人的卡时只在尾部补个短标记，
+           既保留告警信息，又绝不会跟「已授权」打架。 */
+        if (conflict)
+            snprintf(note, sizeof(note), "正常 %s 到期%s (他卡被拒)",
+                     BS_DYLIB_VER, exp[0] ? exp : "?");
+        else
+            snprintf(note, sizeof(note), "正常 %s 到期%s",
+                     BS_DYLIB_VER, exp[0] ? exp : "?");
+    } else if (conflict && g_card_cur[0]) {
         snprintf(note, sizeof(note),
                  "卡密冲突:%.16s 已被其他设备占用,已拒绝(本机不受影响)", g_note_cf_card);
-    } else if (g_card_kicked[0] && !g_card_cur[0]) {
+    } else if (conflict) {
         snprintf(note, sizeof(note), "本机卡密已被其他设备接管");
     } else if (g_card_expire > 0 && g_card_expire < now) {
         snprintf(note, sizeof(note), "卡已过期 %s", exp[0] ? exp : "?");
-    } else if (g_card_cur[0] && g_card_expire > 0) {
-        snprintf(note, sizeof(note), "正常 %s 到期%s", BS_DYLIB_VER, exp[0] ? exp : "?");
     } else {
         snprintf(note, sizeof(note), "未授权 %s", BS_DYLIB_VER);
     }
 
-    // ★ v6.47 ①：冲突文案报过就不再刷（force 由「冲突解除」方向设置，冲突期间不需要）
-    if (is_conflict && g_note_cf_sent) {
-        g_note_force = 0;                     // 该推的已经推过，别让 15s 快通道空转
-        return;
-    }
-
-    if (!g_note_force && !strcmp(note, g_note_last) && (now - g_note_ts) < 60) return;
+    int changed = strcmp(note, g_note_last) != 0;
+    int forced  = g_note_force;
+    if (!changed && !forced && (now - g_note_ts) < 300) return;
     int rc = bs_center_note_send(ip, note);
     if (rc == 0) {
         snprintf(g_note_last, sizeof(g_note_last), "%s", note);
-        g_note_ts   = now;
+        g_note_ts    = now;
         g_note_force = 0;
-        if (is_conflict) g_note_cf_sent = 1;   // 本轮冲突已上报，静默
-        bs_log("[note] -> %s:%d  %s", ip, g_noteport, note);
-    } else if (!g_note_force && (now - g_note_ts) > 120) {
+        if (changed || forced)
+            bs_log("[note] -> %s:%d  %s", ip, g_noteport, note);
+    } else if ((now - g_note_ts) > 30) {
+        /* 发送失败也必须重试：旧版只在 120s 后重试一次就放弃，
+           .98 那次「卡恢复了、备注还挂着接管」就是这里丢的。 */
         g_note_ts = now;
         bs_log("[note] -> %s:%d failed rc=%d（中控未开或端口不对）", ip, g_noteport, rc);
     }
-    // 失败且 g_note_force=1：保留 force，15s 后再试（中控刚开机 / 连接还没建立的场景）
 }
 
 static void *bs_cardwatch(void *arg) {
@@ -7968,21 +7990,15 @@ static void *bs_cardwatch(void *arg) {
     int prev_blocked = -1;   // 首轮强制评估
     long last_check  = 0;
     long pend_since  = 0;    // ★ v6.42：设备码 PENDING 起始时刻（判决用）
-    int  note_tick   = 14;   // ★ v6.45：中控备注刷新计数（首拍即推一次，之后每 45s）
-    int  note_ftick  = 0;    // ★ v6.47：强制推送计数（g_note_force 时 15s 一次，用于尽快覆盖旧备注）
+    // ★ v6.49：中控备注改为「每拍评估 + 函数内节流」，不再需要外部计数
 
     for (;;) {
         sleep(3);
         // ★ v6.45：把卡状态 / 卡密冲突写进 BBCenter 设备列表的「备注」列
         // ★ v6.47：状态切换（冲突解除/激活成功）走 15s 快通道，常规仍 45s 刷一次
-        int  note_due = 0;
-        if (++note_tick >= 15) { note_tick = 0; note_due = 1; }
-        if (g_note_force) {
-            if (++note_ftick >= 5) { note_ftick = 0; note_due = 1; }
-        } else {
-            note_ftick = 0;
-        }
-        if (note_due) bs_center_note_tick();
+        // ★ v6.49：每拍都评估。函数内部自己节流（文案没变就不同发，变了立刻推），
+        //   这样「冲突解除 / 卡恢复」最多 3 秒就把中控上的旧文案覆盖掉。
+        bs_center_note_tick();
         // ★★★★ v6.41：每拍复核设备码 —— 启动时 Agent 可能还没收到服务端设备码，
         //   真源一就位立即生效（失败时保持上一次值，不会退回空/不会换号）。
         bs_card_device_id();
