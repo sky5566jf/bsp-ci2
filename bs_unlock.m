@@ -948,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.42d"
+#define BS_DYLIB_VER       "v6.42e"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7546,8 +7546,31 @@ static void bs_neutralize_vt_setter(uintptr_t base) {
         bs_log("[card] vt setter neutralized (ret @ +0xd94c) -> display ours");
 }
 
-static void bs_sync_vendor_expire(void) {
-    if (!g_vend_vt) {
+/// ★★★★ v6.42e：中和厂商对 g_agent_auth_state 的写入点
+///（`0x10000d8fc: str w19, [x8, #0xb4c]`，vmaddr 0x100000000 起）。
+///
+/// 为什么必须做：v6.42d 实测 22:08:27 云端删卡后我们写 1，但厂商每 48s 又写回 0 ——
+/// 日志出现四次 `auth_state 0 -> 1`（1793282907 / 2913 / 2961 / 3009），
+/// 也就是中控「授权」列每 48s 闪一次「已授权」。根因是 5 点补丁第 3 点只把
+/// setter 内部的 `mov x19,x0` 改成 `mov x19,#0`，**调用点照旧周期性执行**，
+/// 每次调用都把 state 刷成 0（已授权）。
+///
+/// 修法与 vt setter 略不同：这里只把那条 `str` 换成 `nop`，**不**在函数入口打
+/// `ret` —— 因为该 setter 前面还有一次 `bl 0x10003e938`、尾部还有 `b 0x10003e944`，
+/// 整入口打 ret 会把这些厂商逻辑一并跳掉。nop 掉写入后，
+/// g_agent_auth_state 与 g_agent_auth_valid_time 一样只剩 cardwatch 一个写者。
+///
+/// 同页说明：0xd8fc 与 vt setter 的 0xd94c 同在 16KB 页内，
+/// bs_patch_text_word 每次都 memcpy 当前页内容，两次 patch 会累积生效。
+/// 仅 unlock 模式调用（probe 真卡机绝不动厂商代码）。
+static void bs_neutralize_st_setter(uintptr_t base) {
+    uintptr_t va = base + 0xd8fc;                 // str w19, [x8, #0xb4c]
+    static const uint32_t ARM64_NOP = 0xd503201fu;
+    if (bs_patch_text_word(va, ARM64_NOP) == 0)
+        bs_log("[card] st setter write nop (0xd8fc) -> display ours");
+}
+
+static void bs_sync_vendor_expire(void) {    if (!g_vend_vt) {
         int *p = (int *)dlsym(RTLD_DEFAULT, "g_agent_auth_valid_time");
         if (!p) return;
         g_vend_vt = (volatile int *)p;
@@ -7679,6 +7702,7 @@ static void *bs_cardwatch(void *arg) {
     bs_card_device_id();
     bs_card_cache_load();
     bs_neutralize_vt_setter(base);                // ★ v6.23：厂商 setter 变空操作
+    bs_neutralize_st_setter(base);                // ★ v6.42e：厂商 state 写入点 nop（同页累积）
 
     // 解析 Agent 的卡密 getter（厂商符号表暴露，get_* 系列优先）
     typedef char *(*get_str_fn)(void);
