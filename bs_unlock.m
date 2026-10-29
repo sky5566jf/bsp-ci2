@@ -949,7 +949,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.50"
+#define BS_DYLIB_VER       "v6.51"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7992,16 +7992,18 @@ static void bs_center_note_tick(void) {
     int runchg  = (g_note_lastrun != runnow);     // ★ v6.50：运行态翻转必须补推
     int changed = strcmp(note, g_note_last) != 0;
     int forced  = g_note_force;
-    if (!changed && !forced && !runchg) {
-        /* ★★★★★ v6.50（用户 2026-10-30 04:20 拍板，取代 v6.49 的 300s 无脑保底）：
-         *   · **正常态永不周期重推**。备注如果被原厂状态包冲掉也无所谓 ——
-         *     「已授权 + 到期」两列本来就由 bs_sync_vendor_* 维护，信息不丢；
-         *     而周期重推会反复覆盖原厂自己写进备注的内容（原厂在报错时会写，
-         *     例如「卡密不存在！」），也会凭空多发 07 包。
-         *   · **异常态（冲突/接管/过期/未授权）保留 300s 保底重推** ——
-         *     这类文案才是运维一眼要看到的，被冲掉必须补回来。 */
-        if (valid) return;
-        if ((now - g_note_ts) < 300) return;
+    if (!changed && !forced && !runchg && (now - g_note_ts) < 300) {
+        /* ★★★★★ v6.51（2026-10-30 04:40 .216 实测修正）：
+         *   v6.50 一度试过「正常态永不周期重推」，实测**不能这么做** ——
+         *   原厂每发一个 ≤21 字节的 07 包就会把备注清空（BBCenter 0xb2a4
+         *   `cmp rax,0x15; jbe clear_remark`）。装 v6.50 后 .216 备注列
+         *   只剩 40 秒就被原厂清空，之后再也不回来（截图 04:36 实证：备注空）。
+         *   所以 **正常态也必须保留 300s 保底重推**，否则「备注显示卡密绑定状态」
+         *   这个原始需求就废了。
+         *   而「覆盖原厂自己写的备注」这个担心，在 v6.50 修好 [7] 之后已经不再
+         *   有额外代价：原厂自己也会用下一个包把备注清掉/改写，这个字段本来就是
+         *   「当前值」不是流水。我们能保证的是**不再因为重推而搅乱运行列**。 */
+        return;
     }
     int rc = bs_center_note_send(ip, note);
     if (rc == 0) {
