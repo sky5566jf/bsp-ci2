@@ -716,6 +716,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #include <dlfcn.h>       // ★ v6.20：dlsym 解析 Agent 卡密 getter
 #include <sys/socket.h>  // ★ v6.19：厂商服务器进程内屏蔽
 #include <sys/time.h>    // ★ v6.25e：SO_RCVTIMEO 的 struct timeval（桩接收超时）
+#include <sys/select.h>  // ★ v6.45：备注上报的非阻塞 connect 超时（select）
 #include <netinet/in.h>  // ★ v6.19
 #include <arpa/inet.h>   // ★ v6.19：inet_addr/ntohs
 #include <netdb.h>       // ★ v6.19：getaddrinfo/EAI_NONAME
@@ -948,7 +949,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.44"
+#define BS_DYLIB_VER       "v6.45"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1065,6 +1066,9 @@ static char          g_card_key[80]   = CARD_KEY_DEF;
 static int           g_cardcheck      = 1;     // 缺省开（probe 模式整体 early-return 不受影响）
 static int           g_cardgrace      = 1;     // 网络失败宽限（小时；v6.23g 72→1，用户拍板）
 static int           g_cardtick       = 120;   // 心跳间隔（秒）★ v6.23u 300→120（code=7 被踢感知缩到 2 分钟）
+static int           g_noteport       = 34878; // ★ v6.45：BBCenter 中控「备注」上报端口（conf: noteport）
+static char          g_note_last[256] = {0};   // ★ v6.45：上次成功写入中控的备注文案（去重用）
+static long          g_note_ts        = 0;     // ★ v6.45：上次成功写入中控的时间
 static volatile int  g_card_blocked   = 0;     // 1=封禁（未激活/过期/冻结/绑他机/宽限耗尽）
 static volatile long g_card_expire    = 0;     // 到期 unix ts（0=未知）
 static volatile long g_card_lastok    = 0;     // 最近一次校验成功时间
@@ -2222,6 +2226,11 @@ static void bs_load_conf(void) {
         else if (!strcmp(k, "cardhost")) {
             // ★ v6.20：CardVault 服务地址 host:port
             snprintf(g_card_host, sizeof(g_card_host), "%s", v);
+        }
+        else if (!strcmp(k, "noteport")) {
+            // ★ v6.45：向 BBCenter 中控写「备注」的上报端口（缺省 34878）
+            g_noteport = atoi(v);
+            if (g_noteport < 1 || g_noteport > 65535) g_noteport = 34878;
         }
         else if (!strcmp(k, "statip")) {
             // ★ v6.23l：统计上报改道目标（点分 IP）。空值/非法值=关闭改道。
@@ -7719,6 +7728,134 @@ static long bs_card_login(const char *card, int act_new) {
 }
 
 /// 卡密状态机主循环。3s 一拍：读卡密 → 变更即激活 → cardtick 到点心跳 → 维护封禁态。
+/* ================= ★★★★★ v6.45：向 BBCenter 中控写设备「备注」 =================
+ * 需求：卡密冲突 / 卡状态不再只能翻 BSModuleServer.exe 的运行日志，
+ *       直接显示在 BBCenter.exe 设备列表的「备注」列上（运维一眼就看到）。
+ *
+ * 实测协议（2026-10-30，.98 真机 + Frida hook ws2_32.recv）：
+ *   [0:4]   包总长（含自身，小端）
+ *   [4:6]   命令   07 00 = 状态上报（01 00 = 9 字节心跳）
+ *   [6]     版本   01
+ *   [7]     状态位 0=正常 / 1=异常
+ *   [8:12]  授权到期 unix 秒
+ *   [12]    01   [13] 02   [14:16] 00 00   [16:20] 设备指纹   [20] 01
+ *   [21:]   备注 UTF-8，无长度前缀、无结束符
+ *
+ * BBCenter 侧证据：RVA 0xb2a4  cmp rax,0x15 → <=21 清空备注，>21 取 [0x15:]
+ *                  转 QString 写 dev+0x118；填表 RVA 0x29ad0 写 dev+0xE0（备注列）。
+ *
+ * 三条硬实测结论：
+ *   ① 中控按**源 IP** 归属设备 —— 设备自己连上去就落到自己那一行；
+ *      [16:20] 那 4 字节「设备指纹」实测**不校验**（全 0 也照样接收）。
+ *   ② 一个 TCP 连接只处理**第一个包** —— 每次上报单独建连、只发一个包；
+ *      发 9B 握手再发正文 = 正文丢失（踩过）。
+ *   ③ 备注是「当前值」不是流水，原厂状态变化时会覆盖 → cardwatch 定期重刷。
+ */
+static int bs_center_note_send(const char *ip, const char *note) {
+    if (!ip || !ip[0]) return -1;
+    size_t nl = note ? strlen(note) : 0;
+    if (nl > 240) nl = 240;
+    unsigned char pkt[21 + 240];
+    size_t total = 21 + nl;
+
+    memset(pkt, 0, 21);
+    uint32_t t = (uint32_t)total;
+    memcpy(pkt, &t, 4);                       // [0:4] 总长 —— ★ 改备注必须同步改这里
+    pkt[4] = 0x07; pkt[5] = 0x00;             // [4:6] 命令：状态上报
+    pkt[6] = 0x01;                            // [6]   版本
+    pkt[7] = 0x00;                            // [7]   状态位：只借备注，不干扰原厂判定
+    uint32_t exp = (uint32_t)(g_card_expire > 0 ? g_card_expire : 0);
+    memcpy(pkt + 8, &exp, 4);                 // [8:12] 授权到期
+    pkt[12] = 0x01; pkt[13] = 0x02;           // [12][13] 固定
+    pkt[20] = 0x01;                           // [20]   固定
+    if (nl) memcpy(pkt + 21, note, nl);       // [21:]  备注
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -2;
+
+    /* ★★★★★ 必须有：中控提前 close 时 send 会抛 SIGPIPE，直接把承载 dylib 的 App 杀掉 */
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+    /* ★ 非阻塞 connect + select 2 秒超时：中控没开也绝不能卡住 cardwatch 主循环
+       （connect 不受 SO_SNDTIMEO 约束，阻塞模式下会挂几十秒） */
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons((uint16_t)g_noteport);
+    sa.sin_addr.s_addr = inet_addr(ip);
+    if (sa.sin_addr.s_addr == INADDR_NONE) { close(fd); return -3; }
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        if (errno != EINPROGRESS) { close(fd); return -3; }
+        fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
+        struct timeval ctv; ctv.tv_sec = 2; ctv.tv_usec = 0;
+        if (select(fd + 1, NULL, &wf, NULL, &ctv) <= 0) { close(fd); return -3; }
+        int soerr = 0; socklen_t sl = sizeof(soerr);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) != 0 || soerr != 0) {
+            close(fd); return -3;
+        }
+    }
+
+    fcntl(fd, F_SETFL, fl);                    // 恢复阻塞，配合 SO_SNDTIMEO
+    struct timeval tv;
+    tv.tv_sec = 2; tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    ssize_t w = send(fd, pkt, total, 0);
+    close(fd);
+    return (w == (ssize_t)total) ? 0 : -4;
+}
+
+/// 组装当前状态文案并推给中控；同内容 60 秒内不重发
+static void bs_center_note_tick(void) {
+    char ip[64] = "";
+    bs_pc_ip_of_plist(ip, sizeof(ip));
+    if (!ip[0]) snprintf(ip, sizeof(ip), "%s", g_appip);
+    if (!ip[0]) return;                       // 没配中控地址，什么都不做
+
+    long now = (long)time(NULL);
+    char exp[24] = "";
+    if (g_card_expire > 0) {
+        time_t t = (time_t)g_card_expire;
+        struct tm tmv;
+        if (localtime_r(&t, &tmv) != NULL)
+            snprintf(exp, sizeof(exp), "%02d-%02d", tmv.tm_mon + 1, tmv.tm_mday);
+    }
+
+    /* v6.44 语义：g_card_kicked 记的是「被拒绝的那张别人的卡」，
+       本机原卡还在 g_card_cur 里 —— 只有 kicked 且在 30 分钟内才提示冲突 */
+    int conflict = g_card_kicked[0] && (now - g_card_kickts) < 1800;
+
+    char note[256] = "";
+    if (conflict && g_card_cur[0]) {
+        snprintf(note, sizeof(note),
+                 "卡密冲突:%.16s 已被其他设备占用,已拒绝(本机不受影响)", g_card_kicked);
+    } else if (g_card_kicked[0] && !g_card_cur[0]) {
+        snprintf(note, sizeof(note), "本机卡密已被其他设备接管");
+    } else if (g_card_expire > 0 && g_card_expire < now) {
+        snprintf(note, sizeof(note), "卡已过期 %s", exp[0] ? exp : "?");
+    } else if (g_card_cur[0] && g_card_expire > 0) {
+        snprintf(note, sizeof(note), "正常 %s 到期%s", BS_DYLIB_VER, exp[0] ? exp : "?");
+    } else {
+        snprintf(note, sizeof(note), "未授权 %s", BS_DYLIB_VER);
+    }
+
+    if (!strcmp(note, g_note_last) && (now - g_note_ts) < 60) return;
+    int rc = bs_center_note_send(ip, note);
+    if (rc == 0) {
+        snprintf(g_note_last, sizeof(g_note_last), "%s", note);
+        g_note_ts = now;
+        bs_log("[note] -> %s:%d  %s", ip, g_noteport, note);
+    } else if ((now - g_note_ts) > 120) {
+        g_note_ts = now;
+        bs_log("[note] -> %s:%d failed rc=%d（中控未开或端口不对）", ip, g_noteport, rc);
+    }
+}
+
 static void *bs_cardwatch(void *arg) {
     uintptr_t base = (uintptr_t)arg;
     bs_card_device_id();
@@ -7741,9 +7878,12 @@ static void *bs_cardwatch(void *arg) {
     int prev_blocked = -1;   // 首轮强制评估
     long last_check  = 0;
     long pend_since  = 0;    // ★ v6.42：设备码 PENDING 起始时刻（判决用）
+    int  note_tick   = 14;   // ★ v6.45：中控备注刷新计数（首拍即推一次，之后每 45s）
 
     for (;;) {
         sleep(3);
+        // ★ v6.45：把卡状态 / 卡密冲突写进 BBCenter 设备列表的「备注」列
+        if (++note_tick >= 15) { note_tick = 0; bs_center_note_tick(); }
         // ★★★★ v6.41：每拍复核设备码 —— 启动时 Agent 可能还没收到服务端设备码，
         //   真源一就位立即生效（失败时保持上一次值，不会退回空/不会换号）。
         bs_card_device_id();
