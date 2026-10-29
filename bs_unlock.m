@@ -861,6 +861,19 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 // ★ v6.6：主动跟版（免卡密机从我们云端取脚本包本体）
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
 
+// ★★★★ v6.42（2026-10-29）：**卡密判决的两处误判修正**（设备码已定真源后的收尾）
+//   ① PENDING 期不否决：v6.41 起 bs_card_login 在 devid 空时直接 return -1
+//      （绝不上报空 device_id），可判决段仍只看本地 expire/lastok ⇒ 一次正常冷启
+//      （Agent 还没收到服务端下发的设备码，几十秒窗口）会被判 BLOCKED → OPER_STOP
+//      + 每 3s 抹模块 → 下次运行必撞 bs_module_lost。改成「没裁决就不判」：
+//      保持上一拍状态，持续 PENDING ≥600s 才按正常判定走。
+//      → 日志特征 `[card] verdict HELD: device_id pending`
+//   ② code=7 拉黑冷却探活：旧版被接管后永久静默，管理员在云端把卡改绑回来
+//      设备也一次不再试（现场=「绑回来了还是死不跑」，只能人工换卡/重装 App）。
+//      改成每 cardtick×5（≥10min）发一次**不带 act** 的探活心跳：只探不改绑、
+//      不与持有方互踢；code=0 就地恢复。
+//      → 日志特征 `blacklisted card re-bound on server -> recovered`
+//
 // ★★★★ v6.41（2026-10-29）：**设备码单一真源 —— 卸载/重装/覆盖都不再变号**
 //   现象（2026-10-27 现场 15f9da…）：换机后同一张卡绑在旧机号上，新机被拒（code=7）；
 //   中控「自建卡密到期」列空白；重装一次设备号就换一个，卡库绑定全部失配。
@@ -935,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.41"
+#define BS_DYLIB_VER       "v6.42"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7637,6 +7650,7 @@ static void *bs_cardwatch(void *arg) {
 
     int prev_blocked = -1;   // 首轮强制评估
     long last_check  = 0;
+    long pend_since  = 0;    // ★ v6.42：设备码 PENDING 起始时刻（判决用）
 
     for (;;) {
         sleep(3);
@@ -7772,11 +7786,39 @@ static void *bs_cardwatch(void *arg) {
             if (g_card_kicked[0] && strcmp(card, g_card_kicked) == 0 && !real_input) {
                 // ★ v6.23s：被接管卡本地拉黑 —— 自动重试会以 act=new 抢回，
                 //   与接管方 60s 心跳互踢振荡；静默等真输入（换卡或重启 App）
+                //
+                // ★★★★ v6.42：黑名单**冷却探活**（旧版永久静默的自愈盲点）。
+                //   场景：卡在 A 机手上 → B 机输同卡act=new接管 → A 收 code=7 拉黑。
+                //   之后管理员在云端把这张卡改绑回 A（或把 B 机换走），A 机因为
+                //   拉黑着**一次都不再试**，只能人工换卡或重装 App 才活 —— 现场
+                //   表现为「明明绑回来了，设备还是死不跑」。
+                //   修法：每 cardtick×5（默认 10 分钟）发一次**不带 act 的探活心跳**：
+                //     · 不带 act ⇒ 服务端不会改绑、不会与持有方互踢（bsmod v3.10 语义）
+                //     · 仍 code=7 就继续拉黑（服务端只多一条 bind_conflict 留痕）
+                //     · code=0 ⇒ 绑定已回到本机，就地解除拉黑恢复运行
                 static long last_kick_log = 0;
+                static long last_probe    = 0;
+                long probe_gap = (long)g_cardtick * 5;
+                if (probe_gap < 600) probe_gap = 600;
+                if (now - last_probe >= probe_gap) {
+                    last_probe = now;
+                    long prc = bs_card_login(card, 0);   // ★ 不带 act：只探不改绑
+                    if (prc == 0) {
+                        snprintf(g_card_cur, sizeof(g_card_cur), "%s", card);
+                        g_card_kicked[0] = 0;
+                        g_card_kickts    = 0;
+                        last_fail[0]     = 0;
+                        bs_card_cache_save();
+                        bs_log("[card] blacklisted card re-bound on server -> "
+                               "recovered %.20s...", card);
+                        last_check = now;
+                    }
+                }
                 if (now - last_kick_log >= 300) {
                     last_kick_log = now;
                     bs_log("[card] taken over card %.20s... blacklisted, "
-                           "waiting for new input", card);
+                           "waiting for new input or server re-bind (probe %lds)",
+                           card, probe_gap);
                 }
             } else {
             if (real_input && g_card_kicked[0] && strcmp(card, g_card_kicked) == 0) {
@@ -7855,7 +7897,35 @@ static void *bs_cardwatch(void *arg) {
             now < g_card_lastok + (long)g_cardgrace * 3600) verdict_ok = 1;
 
         // 从未激活过 & 没有卡 → 封禁（cardcheck=1 的设备必须先输卡）
-        int blocked = verdict_ok ? 0 : 1;
+        //
+        // ★★★★ v6.42：设备码 PENDING 期间**不否决** —— v6.41 起 bs_card_login 在
+        //   devid 为空时直接 return -1（绝不上报空 device_id），此时本机根本没拿到
+        //   任何服务端裁决。把「没裁决」当成「卡无效」是误判：一次正常冷启
+        //   （Agent 尚未收到服务端下发的设备码，通常几十秒窗口）就会被判 BLOCKED
+        //   → OPER_STOP + 每 3s 抹模块 → 下次运行必撞 bs_module_lost。
+        //   处理：保持上一拍状态（首拍不封）；仅当持续 PENDING ≥600s 仍未拿到真值，
+        //   才按正常判定走（防止设备码永久缺失导致卡密被无限期跳过）。
+        int blocked;
+        if (verdict_ok) {
+            blocked    = 0;
+            pend_since = 0;
+        } else if (!g_card_devid[0]) {
+            if (!pend_since) pend_since = now;
+            if (now - pend_since < 600) {
+                blocked = (prev_blocked < 0) ? 0 : prev_blocked;
+                static int pd_logged = 0;
+                if (!pd_logged) {
+                    pd_logged = 1;
+                    bs_log("[card] verdict HELD: device_id pending (no server "
+                           "verdict yet, never block on unknown)");
+                }
+            } else {
+                blocked = 1;
+            }
+        } else {
+            blocked    = 1;
+            pend_since = 0;
+        }
 
         if (blocked != prev_blocked) {
             if (blocked) {

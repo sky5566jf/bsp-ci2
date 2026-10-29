@@ -30,7 +30,8 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.41" || (echo "MISSING v6.41" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.42" || (echo "MISSING v6.42" && exit 1)
+          if strings bs_unlock.dylib | grep -q "v6.41"; then echo "STALE: v6.41 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6.25a"; then echo "STALE: v6.25a string still present" && exit 1; fi
@@ -167,6 +168,16 @@ jobs:
           # 反回归：v6.41 之后不许再出现任何"本地造号"痕迹
           if strings bs_unlock.dylib | grep -q "src=local-gen"; then echo "FORBIDDEN: v6.41 local-gen devid still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q ".bs_devid"; then echo "FORBIDDEN: v6.41 legacy .bs_devid path still present" && exit 1; fi
+          # ===== v6.42（2026-10-29）：卡密判决的两处误判修正 =====
+          #   ① 设备码 PENDING 期不否决：没有服务端裁决 ≠ 卡无效。
+          #      旧行为会在冷启窗口直接 BLOCKED → OPER_STOP + 每 3s 抹模块 → bs_module_lost。
+          #   ② code=7 拉黑后每 ≥10min 发一次不带 act 的探活心跳：
+          #      云端把卡改绑回来后能自动恢复，不再依赖人工换卡/重装。
+          strings bs_unlock.dylib | grep -q "verdict HELD: device_id pending" || (echo "MISSING v6.42 pending-hold verdict" && exit 1)
+          strings bs_unlock.dylib | grep -q "blacklisted card re-bound on server" || (echo "MISSING v6.42 blacklist probe recovery" && exit 1)
+          strings bs_unlock.dylib | grep -q "waiting for new input or server re-bind (probe %lds)" || (echo "MISSING v6.42 blacklist probe gap log" && exit 1)
+          # 反回归：v6.42 之后不许再出现"设备码没就位也照判封禁"的旧形态
+          if strings bs_unlock.dylib | grep -q "int blocked = verdict_ok ? 0 : 1"; then echo "FORBIDDEN: v6.42 old one-line verdict still present" && exit 1; fi
           # v6.25j：消费式缓冲修复的特征串（粘包尾巴不再被整块丢弃）
           strings bs_unlock.dylib | grep -q "conn pkts=\[" || (echo "MISSING conn-pkts" && exit 1)
           strings bs_unlock.dylib | grep -q "rx buffer full" || (echo "MISSING rx-buffer-full" && exit 1)

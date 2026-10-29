@@ -109,10 +109,28 @@ def cmd_dl(run_id, outdir):
         return 1
     a = arts[0]
     print('artifact=%s size=%s' % (a['name'], a['size_in_bytes']))
-    st, blob = req('GET', a['archive_download_url'], raw=True)
-    if st != 200:
-        print('download http=%s' % st)
+
+    class _NoRedir(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kw):
+            return None
+
+    # 关键：artifacts 的下载地址会 302 到 S3 签名 URL。带着 Authorization 去跟跳转
+    # 会被 S3 拒（签名 + Authorization 冲突 → 401）。必须先拿 Location，再裸取。
+    op = urllib.request.build_opener(_NoRedir)
+    r = urllib.request.Request(a['archive_download_url'], headers=HDR)
+    loc = ''
+    try:
+        with op.open(r, timeout=60) as resp:
+            loc = resp.headers.get('Location') or ''
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get('Location') or ''
+        if not loc:
+            print('download http=%s body=%r' % (e.code, e.read()[:200]))
+            return 1
+    if not loc:
+        print('no redirect location')
         return 1
+    blob = urllib.request.urlopen(loc, timeout=120).read()
     zp = os.path.join(outdir, 'dylibs.zip')
     open(zp, 'wb').write(blob)
     with zipfile.ZipFile(zp) as z:
