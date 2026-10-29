@@ -948,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.42h"
+#define BS_DYLIB_VER       "v6.44"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7910,14 +7910,37 @@ static void *bs_cardwatch(void *arg) {
                     // （可能被解绑/冻结）→ 清缓存封禁
                     snprintf(last_fail, sizeof(last_fail), "%s", card);
                     if (rc == 7) {
-                        // ★ v6.23s：卡在他机手里 → 本地拉黑 + 清缓存封禁
+                        // ★ v6.23s：抢卡被拒 → 把这**张被抢的卡**拉黑，等真输入。
+                        //
+                        // ★★★★★ v6.44（2026-10-30 现场事故修正）：**不许再清
+                        //   g_card_cur / g_card_expire / g_card_lastok。**
+                        //   事故复现（.216）：本机原本绑定 SNAIL2VX6… 正常跑，
+                        //   运营又输入了别人已绑的 SNAIL2K0…（act=new 被拒 code=7），
+                        //   旧代码把本机**正在用的那张卡**一起清空 ⇒
+                        //   [card] BLOCKED (verdict=invalid expire=0 lastok=0)
+                        //   → OPER_STOP + 抹 3 个模块 → 中控「授权」直接掉成
+                        //   「未授权」且到期列空白。实际自己那张卡毫发无伤。
+                        //
+                        //   v3.26 云端语义已从「卡被抢走」变成「抢不了、被拒」：
+                        //   拒绝的是**这次请求**，不是本机的授权。所以：
+                        //     · 只有 `card` 本来就是本机当前卡时，才谈得上失效
+                        //       （那种情况归下方心跳分支的 code=7 处理）
+                        //     · 否则本机当前卡始终有效 → 原样保留，心跳照跑
+                        //   一句话：抢别人的卡失败，不该把自己的卡弄丢。
                         snprintf(g_card_kicked, sizeof(g_card_kicked), "%s", card);
-                        g_card_kickts = now;                    // ★ v6.23t 记录被踢时刻
-                        bs_log("[card] taken over by another device, "
-                               "blocked: %.20s...", card);
-                        g_card_cur[0] = 0;
-                        g_card_expire = 0;
-                        g_card_lastok = 0;
+                        g_card_kickts = now;                    // ★ v6.23t 记录被抢时刻
+                        int was_current = (g_card_cur[0] && !strcmp(card, g_card_cur));
+                        bs_log("[card] already activated on another device, "
+                               "refused (no auto-rebind): %.20s...%s", card,
+                               (!was_current && g_card_cur[0])
+                                   ? " -> keep current card, heartbeat unaffected"
+                                   : "");
+                        if (was_current) {
+                            // 只有「本机当前卡」在别机被激活时才清（防互踢振荡）
+                            g_card_cur[0] = 0;
+                            g_card_expire = 0;
+                            g_card_lastok = 0;
+                        }
                         bs_card_cache_save();
                     } else if (g_card_cur[0] && strcmp(card, g_card_cur) == 0) {
                         g_card_cur[0] = 0;
