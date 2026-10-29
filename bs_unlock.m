@@ -948,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.42c"
+#define BS_DYLIB_VER       "v6.42d"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7479,6 +7479,14 @@ static long bs_card_parse(const unsigned char *resp, size_t rn, long long *out_e
 /// 厂商 setter 已被 5 点补丁硬编码 0x7FFF0000（2038）→ 绕过 setter 直接写全局；
 /// 反汇编实证全二进制唯一写点就是该 setter，本函数每 tick 重校准自愈。
 static volatile int *g_vend_vt = NULL;
+/// ★★★★ v6.42d：厂商授权态 g_agent_auth_state（int32，0=已授权 / 1=未授权）。
+/// 中控「授权」列读的就是这个字段 —— 与「授权到期时间」列（g_agent_auth_valid_time）
+/// 是**两个不同的全局**，此前我们只同步了后者，所以云端删卡后中控「到期」变空、
+/// 「授权」却永远挂「已授权」（21:06 .216 实测）。
+/// 本字段原本被 5 点补丁第 3 点（_set_agent_auth_state @+0xd8e4 改 mov x19,#0）
+/// 恒置 0 —— 那是「unlock 包免卡密恒授权」的设计，与现在「无卡要如实显示未授权」
+/// 冲突。改为由 cardwatch 每拍按真实卡状态写入，setter 补丁保留（不破坏厂商流程）。
+static volatile int *g_vend_st = NULL;
 
 /// ★ v6.23b：文本页补丁通道 —— mprotect 对签名 __TEXT 页被内核拒
 ///（errno=13，代码签名 W^X 强制），改用 mach_vm_remap OVERWRITE 整页替换
@@ -7552,6 +7560,42 @@ static void bs_sync_vendor_expire(void) {
         int oldv = (int)*g_vend_vt;
         *g_vend_vt = want;
         bs_log("[card] valid_time %d -> %d (CardVault expire sync)", oldv, want);
+    }
+}
+
+/// ★★★★ v6.42d：把真实授权态同步进厂商全局 g_agent_auth_state（中控「授权」列）。
+///
+/// 为什么必须做：中控两列来自**两个不同全局**——
+///   · 「授权」      ← g_agent_auth_state（off 0x4fb4c；0=已授权 / 1=未授权）
+///   · 「授权到期时间」← g_agent_auth_valid_time（off 0x530c0）
+/// 我们以前只写后者 ⇒ 云端删卡/拉黑后到期列变空、授权列却恒「已授权」，
+/// 运营看到的是一台「已授权但没到期时间」的机器，正好是用户诉求的反面。
+///
+/// 写入值严格对齐 cardwatch 自己的闸门判定（verdict_ok），保证
+/// **中控显示 = 设备实际行为**，不会出现「中控说未授权、脚本还在跑」的偏差。
+///
+/// 语义风险：该字段厂商状态机也读，写 1 可能触发厂商自身的授权失败分支。
+/// 实测若出现自停，退路是只改上报不改全局（hook 上报序列化），见 v6.42e 备注。
+static void bs_sync_vendor_auth_state(int ok) {
+    if (!g_vend_st) {
+        int *p = (int *)dlsym(RTLD_DEFAULT, "g_agent_auth_state");
+        if (!p) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                bs_log("[card] vendor auth_state symbol NOT found -> auth-column sync off");
+            }
+            return;
+        }
+        g_vend_st = (volatile int *)p;
+        bs_log("[card] vendor auth_state found, now=%d (0=auth 1=unauth)", (int)*g_vend_st);
+    }
+    int want = ok ? 0 : 1;
+    if (*g_vend_st != want) {
+        int oldv = (int)*g_vend_st;
+        *g_vend_st = want;
+        bs_log("[card] auth_state %d -> %d (verdict=%s -> center auth column)",
+               oldv, want, ok ? "valid" : "invalid");
     }
 }
 
@@ -7971,6 +8015,13 @@ static void *bs_cardwatch(void *arg) {
             }
         }
         g_card_blocked = blocked;
+
+        // ★★★★ v6.42d：同步「授权」列（g_agent_auth_state）。
+        //   · 传 verdict_ok 而非 blocked：verdict_ok 含宽限语义，与闸门完全同源，
+        //     保证中控显示 = 脚本实际行为（不会「显示未授权但还在跑」）。
+        //   · 设备码 PENDING 期间（g_card_devid 为空）跳过：那时根本没有服务端裁决，
+        //     强写 1 会让一次正常冷启在中控闪几十秒「未授权」，观感上是故障。
+        if (g_card_devid[0]) bs_sync_vendor_auth_state(verdict_ok);
     }
     return NULL;
 }
