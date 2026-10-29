@@ -948,7 +948,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.42g"
+#define BS_DYLIB_VER       "v6.42h"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -7903,6 +7903,7 @@ static void *bs_cardwatch(void *arg) {
                     last_fail[0] = 0;
                     g_card_kicked[0] = 0;           // ★ v6.23s 激活成功清拉黑
                     g_card_kickts    = 0;           // ★ v6.23t
+                    last_check       = now;         // ★ v6.42h 刚激活过，本拍不必再心跳
                     bs_card_cache_save();
                 } else if (rc > 0) {
                     // 业务失败：记住这张失败卡（节流用）；若与已绑卡相同
@@ -7923,11 +7924,34 @@ static void *bs_cardwatch(void *arg) {
                         g_card_expire = 0;
                         g_card_lastok = 0;
                         bs_card_cache_save();
+                    } else {
+                        // ★★★★ v6.42h：输入的是**另一张**卡且被拒（不存在 code=1 /
+                        //   冻结 2 / 已过期 3 / 拉黑 6）—— 什么都不动，继续用当前卡。
+                        //   现场语义：运营误输一张假卡，设备上正在跑的卡不该被牵连。
+                        //   每分钟最多记一条，避免 3s 一拍刷满 8KB 设备日志窗口。
+                        static long bad_log_min = 0;
+                        if (bad_log_min != now / 60) {
+                            bad_log_min = now / 60;
+                            bs_log("[card] input rejected code=%ld -> keep current card "
+                                   "%.20s... (heartbeat unaffected)",
+                                   rc, g_card_cur[0] ? g_card_cur : "(none)");
+                        }
                     }
                 }
             }
             }
-            last_check = now;
+            // ★★★★ v6.42h：这里**不再**无条件 `last_check = now`。
+            //   这是 2026-10-29 .216 桩测发现的真实连锁故障：
+            //   运营在已授权设备上误输一张不存在的卡（code=1），agent.log 最后一条
+            //   激活事件就变成那张假卡 → 本分支每拍都试图激活它，被 60s 节流；
+            //   而旧代码每次（包括 throttled 后的空转）都把 last_check 刷成 now，
+            //   60s < cardtick 120s ⇒ 下方心跳条件 `now - last_check >= 120`
+            //   **永远不成立**，真卡心跳彻底停摆（桩日志 22:50:49 之后 3 分钟
+            //   零次 SNAILTESTN 请求，只有假卡每 60s 撞一次）。
+            //   后果：云端看该设备掉线、到期时间不再刷新；若服务端有「心跳超时
+            //   解绑」类策略还会被误伤 —— 比「输错卡」本身危害大得多。
+            //   修法：只有**激活成功**那一拍抑制心跳（见 rc==0 分支），失败/节流
+            //   都不影响心跳计时。
         }
 
         // ---- 心跳：到点重发 login（在线状态 + 到期刷新） ----
