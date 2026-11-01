@@ -949,7 +949,8 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     ④ [mh] 的 errno 日志 300s 去抖并带 pid —— 旧版每 3s 一条把 8KB 设备日志窗口刷满，
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
-#define BS_DYLIB_VER       "v6.52"
+// ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
+#define BS_DYLIB_VER       "v6.53"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1097,6 +1098,7 @@ static char          g_card_kicked[80]= {0};   // ★ v6.23s 被 code=7 踢掉�
 static long          g_card_kickts    = 0;     // ★ v6.23t 被踢时刻（unix ts）——解除拉黑须「更晚的新输入」
 static char          g_card_devid[64] = {0};   // device_id：hw.serial，回退 token
 static char          g_cardval[80]    = {0};   // ★ v6.21：conf cardval= 手动卡密（兜底通道）
+static char          g_card_cloud[80] = {0};   // ★ v6.53：/hb 应答 bindcard 下发的卡（云端换绑通道）
 
 // ★ v6.19：厂商服务器进程内屏蔽（仅 unlock 模式安装钩子）
 static volatile int  g_block_vps     = 1;    // conf `blockvps=`（缺省开）
@@ -2025,6 +2027,25 @@ static void bs_off_query(char *out, size_t n) {
 static void bs_q_live(char *out, size_t n) {
     snprintf(out, n, "%s", g_qbuf);
     bs_off_query(out, n);
+    // ★ v6.53：上报本机当前卡（g_card_cur = 最近一次激活成功的卡缓存）。
+    //   云端判据「设备上报的 cc == 它名下的卡 → 不下发 bindcard」就靠这个。
+    //   空 = 本机没有激活卡（云端照发）。只上报纯字母数字卡号（SNAIL 厂商
+    //   格式），异常内容一个字节都不出去；g_card_cur 最长 80，截到 64 防溢出。
+    if (g_card_cur[0]) {
+        size_t L = strlen(g_card_cur), i;
+        int printable = (L <= 64);
+        for (i = 0; printable && i < L; i++) {
+            char ch = g_card_cur[i];
+            if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                  (ch >= '0' && ch <= '9')))
+                printable = 0;
+        }
+        if (printable) {
+            size_t cur = strlen(out);
+            if (cur + L + 6 < n)
+                snprintf(out + cur, n - cur, "&cc=%s", g_card_cur);
+        }
+    }
 }
 
 // 生成 "&nm=<设备名>&md=<型号>&ov=<系统版本>[&pc=<中控IP>]"；全空返回空串
@@ -3241,6 +3262,38 @@ static int bs_hb_ping(uintptr_t base) {
                 char offv[16];
                 if (bs_json_pick_str((const unsigned char *)s, n, "off", offv, sizeof(offv)))
                     bs_offline_apply(offv, "hb");
+                // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。
+                //   云端判据：本 devid 名下有有效卡 && 设备 &cc= 与它不一致。
+                //   设备侧安全闸（★★★ 绝不覆盖在用卡）：
+                //     · 本机卡健康（g_card_cur 非空且在有效期内）→ 忽略下发，
+                //       只低频记一条日志（运营在用的卡最大，人工意图优先）；
+                //     · 无卡 / 卡已失效（过期、被踢清空）→ 收进 g_card_cloud，
+                //       卡密线程下一拍按标准「卡变化 → 激活」路径处理，
+                //       与真实输入完全同款（激活成功清拉黑/清冲突备注）。
+                //   字段缺失（老中控）= 忽略；g_card_cloud 只在此处写入。
+                {
+                    char bc[80];
+                    if (bs_json_pick_str((const unsigned char *)s, n, "bindcard",
+                                         bc, sizeof(bc)) && bc[0]) {
+                        long nowb = (long)time(NULL);
+                        int healthy = (g_card_cur[0] && g_card_expire > 0 &&
+                                       nowb < g_card_expire);
+                        if (strcmp(bc, g_card_cur) == 0) {
+                            // 云端仍在补发但本机已激活同一张：静默
+                        } else if (healthy) {
+                            static long last_bc_skip = 0;
+                            if (nowb - last_bc_skip >= 300) {
+                                last_bc_skip = nowb;
+                                bs_log("[card] cloud deliver skipped - "
+                                       "own card healthy (%.20s...)", g_card_cur);
+                            }
+                        } else {
+                            snprintf(g_card_cloud, sizeof(g_card_cloud), "%s", bc);
+                            bs_log("[card] cloud deliver received %.20s... (cur=%s)",
+                                   bc, g_card_cur[0] ? g_card_cur : "(none)");
+                        }
+                    }
+                }
             }
         }
         free(buf);
@@ -8149,6 +8202,30 @@ static void *bs_cardwatch(void *arg) {
                 fb_logged = 1;
                 bs_log("[card] card source = cache fallback (%.24s...)", card);
             }
+        }
+        // ★ v6.53：云端下发卡兜底（换绑免手输，配套 bsmod v3.36）。优先级排在
+        //   缓存之后 —— getter/日志/conf/缓存都拿不到卡时才启用，换绑到无卡
+        //   新设备恰好命中。收卡来源见 bs_hb_ping 的 "cloud deliver received"。
+        if (!have_card && g_card_cloud[0]) {
+            snprintf(card, sizeof(card), "%s", g_card_cloud);
+            have_card = 1;
+            static int cld_logged = 0;
+            if (!cld_logged) {
+                cld_logged = 1;
+                bs_log("[card] card source = cloud deliver (%.24s...)", card);
+            }
+        }
+        // ★ v6.53：本机卡被踢（code=7 拉黑等待中）而卡源（厂商内存/日志残留）
+        //   还在往外吐那张被踢卡时，用云端下发的另一张卡顶替 —— 否则残留卡
+        //   会永远挡在「卡变化」分支前，换绑回本机也无法自动恢复。
+        //   例外：运营刚真输入的卡优先（lg 时间戳晚于被踢时刻），人工意图最大。
+        else if (have_card && g_card_kicked[0] && g_card_cloud[0] &&
+                 strcmp(card, g_card_kicked) == 0 &&
+                 strcmp(g_card_cloud, card) != 0 &&
+                 !(lg_card[0] && strcmp(card, lg_card) == 0 &&
+                   lg_ts > 0 && lg_ts > g_card_kickts)) {
+            bs_log("[card] cloud deliver overrides kicked card -> %.20s...", g_card_cloud);
+            snprintf(card, sizeof(card), "%s", g_card_cloud);
         }
 
         // ---- 卡密变化 → 立即激活（幂等；失败同卡 60s 节流重试） ----
