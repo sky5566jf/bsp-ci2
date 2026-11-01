@@ -8215,17 +8215,42 @@ static void *bs_cardwatch(void *arg) {
                 bs_log("[card] card source = cloud deliver (%.24s...)", card);
             }
         }
-        // ★ v6.53：本机卡被踢（code=7 拉黑等待中）而卡源（厂商内存/日志残留）
-        //   还在往外吐那张被踢卡时，用云端下发的另一张卡顶替 —— 否则残留卡
-        //   会永远挡在「卡变化」分支前，换绑回本机也无法自动恢复。
-        //   例外：运营刚真输入的卡优先（lg 时间戳晚于被踢时刻），人工意图最大。
-        else if (have_card && g_card_kicked[0] && g_card_cloud[0] &&
-                 strcmp(card, g_card_kicked) == 0 &&
-                 strcmp(g_card_cloud, card) != 0 &&
-                 !(lg_card[0] && strcmp(card, lg_card) == 0 &&
-                   lg_ts > 0 && lg_ts > g_card_kickts)) {
-            bs_log("[card] cloud deliver overrides kicked card -> %.20s...", g_card_cloud);
-            snprintf(card, sizeof(card), "%s", g_card_cloud);
+        // ★ v6.53：本机卡已被云端判死（code=7 被踢 / 冻结·拉黑·不存在等业务失败）
+        //   而卡源（厂商内存/日志残留/conf/缓存）还在往外吐那张死卡时，用云端
+        //   下发的另一张卡顶替 —— 否则残留卡会永远挡在「卡变化」分支前，换绑
+        //   回本机也无法自动恢复。
+        //   判死两类（★ 冻结尤其隐蔽：心跳分支保留 g_card_cur 以便解冻恢复，
+        //   但 expire/lastok 已清零 —— lg_card 会一直供着冻结卡）：
+        //     ① card == g_card_kicked（code=7 拉黑）；
+        //     ② g_card_expire==0 && g_card_lastok==0（当前无任何有效授权；
+        //       永久卡 lastok>0 不会误中，健康卡 expire>0 不会误中）。
+        //   人工意图优先 —— 真输入不顶替，两类判死的「真输入」判据不同：
+        //     ① 被踢：lg 时间戳晚于被踢时刻（v6.23t 语义）；
+        //     ② 死卡：没有踢时刻可比，改用「lg 事件发生在 10 分钟内」
+        //       （agent.log 残留的激活事件是几天前的，必然不新鲜）。
+        //   另加双保险：云端卡若已等于 g_card_cur（刚激活完的竞态）不顶替。
+        {
+            int kicked_case = (g_card_kicked[0] && g_card_cloud[0] &&
+                               strcmp(card, g_card_kicked) == 0);
+            int dead_case   = (!kicked_case && g_card_cloud[0] &&
+                               g_card_expire == 0 && g_card_lastok == 0);
+            int manual_recent = 0;
+            if (kicked_case || dead_case) {
+                if (lg_card[0] && strcmp(card, lg_card) == 0 && lg_ts > 0)
+                    manual_recent = kicked_case ? (lg_ts > g_card_kickts)
+                                                : (now - lg_ts < 600);
+            }
+            if ((kicked_case || dead_case) && !manual_recent &&
+                strcmp(g_card_cloud, card) != 0 &&
+                strcmp(g_card_cloud, g_card_cur) != 0) {
+                if (kicked_case)
+                    bs_log("[card] cloud deliver overrides kicked card -> %.20s...",
+                           g_card_cloud);
+                else
+                    bs_log("[card] cloud deliver overrides dead card -> %.20s...",
+                           g_card_cloud);
+                snprintf(card, sizeof(card), "%s", g_card_cloud);
+            }
         }
 
         // ---- 卡密变化 → 立即激活（幂等；失败同卡 60s 节流重试） ----

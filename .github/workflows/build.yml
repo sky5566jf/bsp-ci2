@@ -279,6 +279,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "cloud deliver skipped" || (echo "MISSING v6.53 healthy-skip log" && exit 1)
           strings bs_unlock.dylib | grep -q "card source = cloud deliver" || (echo "MISSING v6.53 cloud card source log" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud deliver overrides kicked card" || (echo "MISSING v6.53 kicked-override log" && exit 1)
+          strings bs_unlock.dylib | grep -q "cloud deliver overrides dead card" || (echo "MISSING v6.53 dead-card-override log" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6\.52"; then echo "FORBIDDEN: stale v6.52 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42h"; then echo "FORBIDDEN: stale v6.42h banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42g"; then echo "FORBIDDEN: stale v6.42g banner still present" && exit 1; fi
