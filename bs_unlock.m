@@ -950,7 +950,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.53"
+#define BS_DYLIB_VER       "v6.54"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -2382,9 +2382,19 @@ static void bs_load_conf(void) {
 /// 现在：真源一就位就回填 token + 重拼 query + 落 conf，
 ///   从此心跳 key 与卡密 device_id **恒等**（同一台设备永远同一个号）。
 static void bs_identity_tick(void) {
-    if (g_token[0]) return;                     // 已落定：一行不改
-    bs_card_devid_local();                      // 唯一来源
-    if (!g_card_devid[0]) return;               // 真源未就位：等下一拍，不猜
+    // ★★★★ v6.54：每拍重结算，不再落定短路。动机（8186/05105f32 现场实证）：
+    //   旧逻辑 `if (g_token[0]) return` —— 冷启窗口 pin 把旧号 restore 进 Agent、
+    //   token 落定在旧号上；厂商 TLV 稍后下发真号（硬件指纹）后，/hb 的 key
+    //   永远冻在旧号，而卡密 device_id（每拍重读真源）已切真号 ⇒ 同一台机
+    //   双身份：APP 显示真号、心跳用旧号，卡绑谁谁冲突。
+    //   现在：每拍重读真源，live 一变（TLV 真号到达 / 换机）立刻重拼 ?key= +
+    //   conf 写回，三方（APP 显示 / 心跳 key / 卡密 device_id）恒等收敛。
+    //   幂等：真源未变时只多一次 dlsym 缓存读，零副作用。
+    char prev[40] = {0};
+    snprintf(prev, sizeof(prev), "%s", g_token);
+    bs_card_devid_local();                      // 唯一来源（真源未就位则清零）
+    if (!g_card_devid[0]) return;               // PENDING：等下一拍，不猜不回退
+    if (strcmp(prev, g_card_devid) == 0) return;// 已一致：零开销返回
     snprintf(g_token, sizeof(g_token), "%s", g_card_devid);
     int n = snprintf(g_qbuf, sizeof(g_qbuf), "?key=%s", g_token);
     char q[384] = {0};
@@ -2392,7 +2402,11 @@ static void bs_identity_tick(void) {
     if (q[0] && n > 0 && (size_t)n + strlen(q) < sizeof(g_qbuf))
         memcpy(g_qbuf + n, q, strlen(q) + 1);
     int w = bs_conf_set_key(PULL_CONF, "token", g_token);
-    bs_evt("[id] token settled %.8s (src=agent.dev_id) conf_write=%d", g_token, w);
+    if (!prev[0])
+        bs_evt("[id] token settled %.8s (src=agent.dev_id) conf_write=%d", g_token, w);
+    else
+        bs_evt("[id] identity re-settled %.8s -> %.8s (vendor live drift adopted) conf_write=%d",
+               prev, g_token, w);
     bs_log("[id] identity settled devid=%.32s q=%s", g_token, g_qbuf);
 }
 
@@ -5604,14 +5618,28 @@ static int bs_ar_stop_kind(const char *path, long want) {
             //   拆出 kind=6 = 自停（归属不明但确定不是人点的），[ar] 按 self-stop 走。
             //   ★ 真·中控/人停不受影响：它带 `begin process operate script msg`，
             //     已在上面 :5408 提前 return 2。App 内手动停止也是同一条消息通道。
+            // ★★★★ v6.54 两处修正（3246 现场实证：音量键停被误判 kind=6 → [ar] 拉起）：
+            //   ① "connect remote server" 21 字节前缀把 **成功行** 也撞上了 ——
+            //      agent.log 每 30s 一条 "connect remote server2:14 success!"，
+            //      4KB 窗口几乎必中 ⇒ 一切 bare stop 都被判网络自停。
+            //      现在命中后向后看 24B，含 "success" 不算失败。
+            //   ② 精度约束同 pse/paf：网络签名必须**晚于最后一次 run 事件**，
+            //      历史周期遗留的网络噪声不归属本次停止。
             int netfail = 0;
             p = w0;
             while (p < ls) {
                 if (!strncmp(p, "tcp connect server timeout", 26) ||
-                    !strncmp(p, "connect remote server", 21) ||
                     !strncmp(p, "connect server failed", 21) ||
                     !strncmp(p, "tcp connect failed", 18) ||
-                    !strncmp(p, "no network", 10)) { netfail = 1; break; }
+                    !strncmp(p, "no network", 10)) {
+                    if (!lr || p > lr) { netfail = 1; break; }
+                } else if (!strncmp(p, "connect remote server", 21)) {
+                    // ★ v6.54：排除成功行 "connect remote serverN:P success!"
+                    const char *tail = p + 21;
+                    size_t room = (size_t)(ls - tail) < 24 ? (size_t)(ls - tail) : 24;
+                    int is_ok = room >= 8 && strncmp(tail, " success", 8) == 0;
+                    if (!is_ok && (!lr || p > lr)) { netfail = 1; break; }
+                }
                 ++p;
             }
             kind = netfail ? 6 : 2;
@@ -5621,6 +5649,82 @@ static int bs_ar_stop_kind(const char *path, long want) {
     }
     free(buf);
     return kind;
+}
+
+/// ★★★★ v6.54：判断 agent.log 里**最后一次启动**是否带中控 operate 签名。
+///   动机（3246 现场实证，2026-11-02 19:24）：音量键-/人停之后，vendor App 自己
+///   会把脚本拉回来 —— agent.log 只留 bare "agent run script"（前 200B 无任何
+///   process 消息）。旧 arming 判据 `saw_run || rk==1 || sjz fresh` 把它当成
+///   「中控点了运行」重新武装 → 用户停掉的脚本被 vendor 拉起后又被 [ar] 永久接管。
+///   现在武装/清闸门都只认中控证据：run 事件前 400B 内出现
+///   "begin process run script msg" 或 "begin process operate script msg"。
+///   音量键 +/vendor 自动拉起（bare run）一律不算中控授权。
+///   ★ v6.54b：带新鲜度 —— 最后 run 事件的时间戳必须在 300s 内。防「App 重启后
+///   run 标志残留 1」撞上日志尾部几天前的旧中控签名而误武装（0->1 分支每冷启
+///   必经过一次，残留场景 last_run 初值 0）。解析行首 [Y/M/D H:M:S] 与 now 比。
+static int bs_ar_run_is_center(const char *path, long want) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat sb;
+    if (fstat(fd, &sb) != 0 || sb.st_size <= 0) { close(fd); return 0; }
+    long off = sb.st_size > want ? sb.st_size - want : 0;
+    long add = sb.st_size - off;
+    char *buf = (char *)malloc((size_t)add + 1);
+    if (!buf) { close(fd); return 0; }
+    lseek(fd, off, SEEK_SET);
+    ssize_t gn = read(fd, buf, (size_t)add);
+    close(fd);
+    if (gn <= 0) { free(buf); return 0; }
+    buf[gn] = 0;
+
+    // 最后一次「执行启动」事件：agent run script / begin run script 取更晚者
+    char *lr = NULL, *q = buf;
+    while ((q = strstr(q, "agent run script")) != NULL) { lr = q; ++q; }
+    q = buf;
+    while ((q = strstr(q, "begin run script")) != NULL) {
+        if (!lr || q > lr) lr = q;
+        ++q;
+    }
+    // "begin process run script msg" 本身也算 run 事件（有些版本先打它再执行）
+    q = buf;
+    char *prm = NULL;
+    while ((q = strstr(q, "begin process run script msg")) != NULL) { prm = q; ++q; }
+    if (prm && (!lr || prm > lr)) lr = prm;
+
+    int is_center = 0;
+    if (lr) {
+        // ★ v6.54b：新鲜度 —— 行首 [Y/M/D H:M:S] 距 now 超 300s 的 run 证据作废
+        char *ls_line = lr;
+        while (ls_line > buf && ls_line[-1] != '\n') ls_line--;
+        {
+            int Y = 0, M = 0, D = 0, h = 0, m = 0, s = 0;
+            if (sscanf(ls_line, "[%d/%d/%d %d:%d:%d]", &Y, &M, &D, &h, &m, &s) == 6) {
+                struct tm tmbuf;
+                memset(&tmbuf, 0, sizeof(tmbuf));
+                tmbuf.tm_year = Y - 1900; tmbuf.tm_mon = M - 1; tmbuf.tm_mday = D;
+                tmbuf.tm_hour = h; tmbuf.tm_min = m; tmbuf.tm_sec = s;
+                tmbuf.tm_isdst = -1;
+                time_t evt_t = mktime(&tmbuf);
+                if (evt_t != (time_t)-1 && time(NULL) - evt_t > 300) {
+                    free(buf);
+                    return 0;                    // 旧签名：过期作废
+                }
+            }
+            // 解析不出时间：保守按新鲜处理（日志格式变动时不至于整段失效）
+        }
+        char *w0 = (lr - buf > 400) ? lr - 400 : buf;
+        char *po = NULL, *pq = w0;
+        while (pq < lr) {
+            if (!strncmp(pq, "begin process run script msg", 28) ||
+                !strncmp(pq, "begin process operate script msg", 32)) po = pq;
+            ++pq;
+        }
+        is_center = (po != NULL);
+    } else if (prm) {
+        is_center = 1;                       // 只有 process run 消息：必是中控
+    }
+    free(buf);
+    return is_center;
 }
 
 // ★ v6.24i：判断「最后一条事件是中控显式停脚本」——用于避免空闲兜底与人工停脚本打架。
@@ -5872,7 +5976,9 @@ static void *bs_watchdog(void *arg) {
             //   双重闸门：① stop_kind==2 / hold 后 60s 内；② run 必须仍为 1。
             int hold_stop = (ar_stop_kind == 2)
                          || (ar.hold && time(NULL) - ar.hold <= 60);
-            int can_arm   = (run != 0) && !hold_stop;
+            // ★ v6.54：闸门在（人停证据未解除）时，哪怕脚本真在跑（vendor 自动拉起）
+            //   也不许重新武装 —— armed 只能来自中控。
+            int can_arm   = (run != 0) && !hold_stop && !us_latched;
             if (!ar.lst || (!ar.armed && can_arm)) {
                 int was_armed = ar.armed;
                 ar.lst = 1;
@@ -5888,13 +5994,25 @@ static void *bs_watchdog(void *arg) {
         }
 
         // ★ v6.24k：用户停止闸门同步 —— run==1（中控下发「运行」）即解除。
-        //   放在最前面：本拍后续所有自动拉起分支统一读 us_latched。
+        //   ★★★ v6.54：**闸门只被「中控签名运行」解除**。bare run（音量键+ /
+        //   vendor App 自动拉起）不清闸、不置 us_latched=0 —— 否则人停后 vendor
+        //   一拉闸门就白落了（3246 实证：19:23:57 落闸 → 19:24:11 bare run 清闸
+        //   + re-arm → 19:26 [ar] 把用户停掉的脚本永久接管）。
         if (run) {
             if (bs_us_mark_exists()) {
-                bs_us_mark_clear();
-                bs_evt("[us] run=1 -> user-stop gate cleared");
+                if (bs_ar_run_is_center(DATA_DIR "/log/agent.log", 262144)) {
+                    bs_us_mark_clear();
+                    us_latched = 0;
+                    bs_evt("[us] center run=1 -> user-stop gate cleared");
+                } else {
+                    if (!us_latched)
+                        bs_evt("[us] run=1 (bare, no center operate) -> gate KEPT, "
+                               "vendor auto-run not trusted");
+                    us_latched = 1;
+                }
+            } else {
+                us_latched = 0;
             }
-            us_latched = 0;
         } else {
             us_latched = bs_us_mark_exists();
         }
@@ -5908,15 +6026,20 @@ static void *bs_watchdog(void *arg) {
             // ★★★ v6.32：补上「agent.log 说最后一条是 run」这条独立证据。
             //   旧判据只看 sjz.log 新鲜度，脚本挂机无输出时它可能几十分钟不写，
             //   中控刚点的运行就会被判成「冷启残留」而不武装 → 自动恢复整段失效。
-            int rk = bs_ar_stop_kind(DATA_DIR "/log/agent.log", 262144);
-            if (saw_run || rk == 1 || (a_sja >= 0 && a_sja <= US_STOP_FRESH)) {
+            //   ★★★ v6.54：武装只认中控 operate 签名（bs_ar_run_is_center）。
+            //   旧三证据（saw_run || rk==1 || sjz fresh）会把音量键+/vendor 自动
+            //   拉起的 bare run 也武装（3246 实证 19:24:11）。冷启恢复场景不受影响：
+            //   中控授权过的 armed 落盘 .bs_ar，重启后由 armed restored 分支恢复。
+            int c_run = bs_ar_run_is_center(DATA_DIR "/log/agent.log", 262144);
+            if (c_run) {
                 ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
                 ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：中控点了运行=解除硬失败
                 bs_ar_write(&ar, "run1");
-                bs_evt("[ar] armed (run 0->1, sjz=%lds rk=%d) -> auto-resume active", a_sja, rk);
+                bs_evt("[ar] armed (run 0->1, center operate evidence, sjz=%lds) -> auto-resume active",
+                       a_sja);
             } else {
-                bs_evt("[ar] run 0->1 but sjz=%lds (>%ds) rk=%d -> stale flag, NOT armed",
-                       a_sja, US_STOP_FRESH, rk);
+                bs_evt("[ar] run 0->1 bare (no center operate, sjz=%lds) -> "
+                       "volume-key/vendor auto-run, NOT armed", a_sja);
             }
         }
 
@@ -6189,10 +6312,22 @@ static void *bs_watchdog(void *arg) {
                 //   App 刚装完包时 run 标志是 0、sjz 也停摆，只能从日志看中控到底点过什么。
                 //   （v6.34：赋值已上移到 us_stop 之前，此处不再重复读盘）
                 if (ar_stop_kind == 1 && !ar.armed) {
-                    ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
-                    ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：日志证据=解除硬失败
-                    bs_ar_write(&ar, "run-log");
-                    bs_evt("[ar] armed (agent.log: last event = begin run script)");
+                    // ★★★ v6.54：同 0->1 分支 —— 只认中控 operate 签名。
+                    //   bare run（音量键+/vendor 自动拉起）让 kind 变 1（run 晚于 stop），
+                    //   旧逻辑这里每 60s 就会把人停后的脚本重新武装（3246 实证）。
+                    if (bs_ar_run_is_center(ap, 262144)) {
+                        ar.armed = 1; ar.att = 0; ar.gu = 0; ar.next = 0;
+                        ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;   // v6.31：日志证据=解除硬失败
+                        bs_ar_write(&ar, "run-log");
+                        bs_evt("[ar] armed (agent.log: center run evidence)");
+                    } else {
+                        static int s_bare_run_skipped = 0;
+                        if (!s_bare_run_skipped) {
+                            s_bare_run_skipped = 1;
+                            bs_evt("[ar] agent.log last event = bare run (volume-key/"
+                                   "vendor auto-run) -> NOT armed (v6.54)");
+                        }
+                    }
                 } else if (ar_stop_kind == 2) {
                     // ★★★★ v6.40（断网事故根因点①）：这条 stop 极可能是**我们自己**
                     //   killswitch 发的。OPER_STOP 走 `FN_SET_OPER(OPER_STOP)` 直接调 App

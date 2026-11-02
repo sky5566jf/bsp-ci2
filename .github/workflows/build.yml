@@ -30,7 +30,7 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.53" || (echo "MISSING v6.53" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.54" || (echo "MISSING v6.54" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.41"; then echo "STALE: v6.41 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "loads on next script start" || (echo "MISSING so disk-only note" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6.24s"; then echo "STALE: v6.24s string still present" && exit 1; fi
@@ -185,7 +185,7 @@ jobs:
           #   背景：中控两列来自两个不同全局 —— 「授权」=g_agent_auth_state、
           #   「到期」=g_agent_auth_valid_time。旧版只同步后者 ⇒ 云端删卡后到期空、
           #   授权仍「已授权」（21:06 .216 实测）。v6.42d 每拍按 verdict_ok 写前者。
-          strings bs_unlock.dylib | grep -q "v6.53" || (echo "MISSING v6.53 banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.54" || (echo "MISSING v6.54 banner" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state found, now=%d" || (echo "MISSING auth_state dlsym log" && exit 1)
           strings bs_unlock.dylib | grep -q "auth_state %d -> %d (verdict=%s -> center auth column)" || (echo "MISSING auth_state sync log" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor auth_state symbol NOT found" || (echo "MISSING auth_state fallback log" && exit 1)
@@ -280,6 +280,14 @@ jobs:
           strings bs_unlock.dylib | grep -q "card source = cloud deliver" || (echo "MISSING v6.53 cloud card source log" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud deliver overrides kicked card" || (echo "MISSING v6.53 kicked-override log" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud deliver overrides dead card" || (echo "MISSING v6.53 dead-card-override log" && exit 1)
+          # ===== v6.54（2026-11-02）：音量键停不被拉起 + 设备码严格跟厂商真源 =====
+          strings bs_unlock.dylib | grep -q "identity re-settled" || (echo "MISSING v6.54 identity re-settle log" && exit 1)
+          strings bs_unlock.dylib | grep -q "vendor live drift adopted" || (echo "MISSING v6.54 drift-adopted log" && exit 1)
+          strings bs_unlock.dylib | grep -q "center operate evidence" || (echo "MISSING v6.54 center-evidence arm log" && exit 1)
+          strings bs_unlock.dylib | grep -q "gate KEPT, " || (echo "MISSING v6.54 gate-kept log" && exit 1)
+          strings bs_unlock.dylib | grep -q "volume-key/vendor auto-run, NOT armed" || (echo "MISSING v6.54 bare-run-no-arm log" && exit 1)
+          strings bs_unlock.dylib | grep -q "user-stop gate cleared" || (echo "MISSING us gate clear log (regression guard)" && exit 1)
+          if strings bs_unlock.dylib | grep -q "v6\.53"; then echo "FORBIDDEN: stale v6.53 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.52"; then echo "FORBIDDEN: stale v6.52 banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42h"; then echo "FORBIDDEN: stale v6.42h banner still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q "v6\.42g"; then echo "FORBIDDEN: stale v6.42g banner still present" && exit 1; fi
