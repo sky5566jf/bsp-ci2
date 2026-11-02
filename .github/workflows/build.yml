@@ -71,7 +71,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "stop-log-live" || (echo "MISSING v6.32 live stop ar state" && exit 1)
           strings bs_unlock.dylib | grep -q "sjz=%lds sk=%d st=%p" || (echo "MISSING v6.32 sk in stop log" && exit 1)
           strings bs_unlock.dylib | grep -q "run 1->0 sk=%d(%s) sjz=%lds" || (echo "MISSING v6.33 sk class in self-stop log" && exit 1)
-          strings bs_unlock.dylib | grep -q "sjz=%lds rk=%d" || (echo "MISSING v6.32 rk in arm log" && exit 1)
+          strings bs_unlock.dylib | grep -q "(no center operate, sjz=%lds)" || (echo "MISSING v6.54 bare-run arm-reject log" && exit 1)
           # ===== v6.33：厂商因脚本报错停脚本，不许被判成「用户停止」=====
           # 216 历史实证（2026-10-21 21:54:31 agent.log 第 15625 行附近）：
           #   run script error:[string "..."]:1: bs_module_lost:task_lhdb_into!
