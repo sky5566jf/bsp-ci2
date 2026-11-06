@@ -950,7 +950,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.54"
+#define BS_DYLIB_VER       "v6.55"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1194,16 +1194,24 @@ static void bs_s2_apply(const char *v, const char *src) {
 static int           g_so_sync = 1;
 static int           g_so_tick = SO_SYNC_TICK_SECS;
 
-// ★★★ v6.37：probe 上行开关（conf probeupl=，**默认 0 = 不上传**）。
-//   背景（2026-10-22 / 10-23 事故）：.98 真卡机 probe 在 15:44:22.599 上报 030102，
-//   7ms 后云端落盘 beta_030102.so → 全网 280+ 台被 bs_so_sync「只升不降」顶到
-//   厂商原版（AUTO_HARDEN=False，不硬化），8105 等设备随即 func-nil 死亡循环。
-//   probe 的职责从此收窄为「只拉不传」：
-//     · 上传（BSPR 帧 = 密钥 + 1MB 包体）：默认关闭，一个字节都不发。
-//     · 跟版（GET /ver → /script/beta.so）：MODE_PROBE 下照跑，落盘后**不重启脚本**
-//       （bs_so_maybe_reload 自 v6.24q 起只写 pend=1，不做任何运行态改动）。
-//   要临时恢复上传：conf 写 probeupl=1（老行为，慎用）。
-static int           g_probe_upl = 0;
+// ★★★ v6.37：probe 上行开关（conf probeupl=）。
+//   历史（2026-10-22 / 10-23 事故）：.98 真卡机 probe 在 15:44:22.599 上报 030102，
+//   7ms 后云端直接落 SCRIPT_DIR/beta_030102.so → 全网 280+ 台被 bs_so_sync
+//   「只升不降」顶到厂商原版（AUTO_HARDEN=False，不硬化），8105 等设备随即
+//   func-nil 死亡循环。v6.37 因此把上游默认值改成 0（只拉不传）。
+//
+// ★★★★★ v6.55（2026-11-06）：云端 v3.21 起已把 /probe 收包改成「落 pending 待审区」，
+//   /ver 与 /script/beta.so 只扫正式目录 ⇒ 上报【不会】对全网生效，必须人工
+//   POST /api/beta/promote 才上线（证据：_server/bsmod_server.py:4308 / :3979）。
+//   事故的根因（上报即全网生效）已被云端隔离掉，所以这里把**源码默认值**恢复成 1，
+//   让 probe 包出厂即带自动上架能力：官方发新版 → 真卡机自动把「版本密钥 + beta.so」
+//   存到我们云端 → 人工拉取测改 → promote 推给假卡机。
+//   · 想彻底静默的机：conf 写 probeupl=0（等价旧 v6.37 行为，只本地看版本）。
+//   · ★ 前提：云端必须 ≥ v3.21（/health 带 pending_n）。若对接老的 v3.20 云端，
+//     必须写 probeupl=0，否则重现 10-22 事故。postinst 已按包权威写入。
+//   · 跟版（GET /ver → /script/beta.so）：MODE_PROBE 下照跑，落盘后**不重启脚本**
+//     （bs_so_maybe_reload 自 v6.24q 起只写 pend=1，不做任何运行态改动）。
+static int           g_probe_upl = 1;
 
 // ================================================================
 // ★★★★ v6.25：真离线 —— 进程内接管 server2，一个字节都不发厂商
@@ -4925,11 +4933,9 @@ static void *bs_probe_thread(void *arg) {
            g_probe_upl);
     sleep(PULL_FIRST_DELAY);
 
-    // ★★★ v6.37：默认「只拉不传」—— 上行全关，一个字节都不发云端。
-    //   事故背景：.98 在 2026-10-22 23:44:22.599 上报 030102，7ms 后云端落盘并
-    //   被 bs_so_sync 顶到全网 280+ 台（只升不降 + AUTO_HARDEN=False）。
-    //   probe 从此只保留**纯本地**版本观测：厂商换包时记一行 evt，用于事后取证
-    //   （哪天换的、换到哪个版本），进程内不产生任何上行流量。
+    // ★★★ v6.37：上传开关（probeupl）关闭时走纯本地版本观测循环。
+    //   ★ v6.55：默认值已恢复为 1（云端 pending 隔离兜底），只有现场显式写
+    //   probeupl=0 的机才会走到这里 —— 一个字节都不发，只记 evt。
     if (!g_probe_upl) {
         char lastwatch[8] = {0};
         bs_log("[probe] ★★ upload DISABLED (probeupl=0) -> pull-only, nothing sent to cloud");
@@ -4943,8 +4949,29 @@ static void *bs_probe_thread(void *arg) {
         }
     }
 
+    // ★★★★★ v6.55：上次成功上报的版本**持久化到磁盘**。
+    //   旧版用内存变量 last_ver，App 冷启动就归零 ⇒ 每次重启都白传一整包 1MB。
+    //   真卡机一天重启数次，云端 pending 也会被同尺寸包反复命中（pend-dup）。
+    //   落盘后：同版本永不重传，除非现场删掉这个文件（或版本号变了）。
     char last_ver[8] = {0};
     int  last_ok = 0;
+    {
+        char vbuf[16] = {0};
+        int  fd = open(DATA_DIR "/bs_probe_last", O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, vbuf, sizeof(vbuf) - 1);
+            close(fd);
+            if (n >= 6) {
+                vbuf[6] = 0;
+                if (strlen(vbuf) == 6) {
+                    snprintf(last_ver, sizeof(last_ver), "%s", vbuf);
+                    last_ok = 1;                        // 视为「已上报过」
+                    bs_log("[probe] resume: last reported ver=%s (disk) -> skip until change",
+                           last_ver);
+                }
+            }
+        }
+    }
 
     for (;;) {
         char verhex[8] = {0};
@@ -5038,6 +5065,16 @@ static void *bs_probe_thread(void *arg) {
         if (rb && code == 200) {
             last_ok = 1;
             snprintf(last_ver, sizeof(last_ver), "%s", verhex);
+            // ★ v6.55：版本落盘 —— 冷启动不再重传整包（见上方 last_ver 加载处）
+            {
+                int wfd = open(DATA_DIR "/bs_probe_last",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (wfd >= 0) {
+                    if (write(wfd, verhex, 6) != 6)
+                        bs_log("[probe] warn: write bs_probe_last short");
+                    close(wfd);
+                }
+            }
             bs_log("[probe] ★ report OK ver=%s so=%luB resp=%.64s",
                    verhex, (unsigned long)solen, (const char *)rb);
         } else {
