@@ -954,7 +954,14 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.58"
+#define BS_DYLIB_VER       "v6.59"
+// ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
+//   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
+//      它自己 30s 问一次云端并缓存，替全网设备扛掉版本探询）；
+//   ② 包体下载只走中控中继，**删除云端兜底整段**（原 v6.12 起的 relay→cloud 回退）；
+//   ③ 中控解析不出地址 / 中控没起 ⇒ 本轮直接跳过，保持旧包（脚本照跑，不跟版）。
+//   动机：1098 台设备抢 1.2MB 包体把 VPS 出口打满（实测 90s 仅 111 份 ≈12Mbps），
+//   云端只保留 /hb 心跳与 /key 密钥职责。
 // ★ v6.58：① 中继自动发现（getpeername 扫 App 持久连接拿中控 IP，零配置）；
 //   ② conf sofollow（默认 1）= 全等跟版：版本或 md5 不一致即更新（替代只升不降），
 //      has_key 闸与逐段键闸门原样保留；③ tick 抖动 ±25% + 回退云端退避抖动。
@@ -4617,6 +4624,38 @@ static int bs_center_ip_discover(char *out, size_t n) {
     return 0;
 }
 
+/// ★★★★★ v6.59（2026-11-07）：中控（BSModuleServer）地址解析 —— 单一真源。
+///   下载 beta.so 与查询 /ver 版本号必须用**同一个**中控地址，否则会出现
+///   「问的是 A 的版本、拉的是 B 的包」这种 md5 永远对不上的死循环。
+///   优先级：conf sohost > getpeername 自动发现 > app.plist。
+///   全部落空返回 0（调用方本轮放弃，**不再回退云端**，见 v6.59 定策）。
+///   src 回填命中来源，仅用于日志。
+static int bs_relay_addr(char *out, size_t outn, int *outport, const char **src) {
+    int pdef = (g_soport > 0) ? g_soport : SO_PORT_DEF;
+    if (g_sohost[0]) {
+        snprintf(out, outn, "%s", g_sohost);
+        *outport = pdef;
+        if (src) *src = "conf sohost";
+        return 1;
+    }
+    char disc[64] = {0};
+    if (bs_center_ip_discover(disc, sizeof(disc))) {
+        snprintf(out, outn, "%s", disc);
+        *outport = pdef;
+        if (src) *src = "peer discovery";
+        return 1;
+    }
+    char apip[64] = {0};
+    bs_pc_ip_of_plist(apip, sizeof(apip));
+    if (apip[0]) {
+        snprintf(out, outn, "%s", apip);
+        *outport = pdef;
+        if (src) *src = "app.plist";
+        return 1;
+    }
+    return 0;
+}
+
 static unsigned char *bs_dl_beta_relay(const char *ip, int port,
                                        const char *ver, size_t *outn) {
     // ★ v6.9→v6.13：下载走局域网中继（app.plist 中控 ip，每次现读）；
@@ -4624,28 +4663,19 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
     // ★ v6.58：优先级改为 conf sohost > getpeername 自动发现 > app.plist > 云端。
     //   自动发现解决了「App 里没填中控 IP 就直连云端」的覆盖缺口 ——
     //   11-06 事故里正是这批设备把云端带宽打满。
-    char appip_now[64];
-    char disc[64] = {0};
-    int have_disc = bs_center_ip_discover(disc, sizeof(disc));
-    bs_pc_ip_of_plist(appip_now, sizeof(appip_now));
-    const char *dip;
-    int dport;
-    if (g_sohost[0]) {
-        dip = g_sohost;
-        dport = (g_soport > 0) ? g_soport : port;
-        bs_log("[so] download via relay %s:%d (conf sohost)", dip, dport);
-    } else if (have_disc) {
-        dip = disc;
-        dport = (g_soport > 0) ? g_soport : SO_PORT_DEF;
-        bs_log("[so] download via relay %s:%d (peer discovery)", dip, dport);
-    } else if (appip_now[0]) {
-        dip = appip_now;
-        dport = (g_soport > 0) ? g_soport : SO_PORT_DEF;
-        bs_log("[so] download via relay %s:%d (app.plist)", dip, dport);
-    } else {
-        dip = ip;
-        dport = port;
+    // ★ v6.59：地址解析抽到 bs_relay_addr()（与 /ver 查询共用），
+    //   且**云端兜底整段删除**（用户定策）。解析不出中控就本轮放弃。
+    char dipbuf[64] = {0};
+    int dport = 0;
+    const char *dsrc = NULL;
+    if (!bs_relay_addr(dipbuf, sizeof(dipbuf), &dport, &dsrc)) {
+        bs_log("[so] no relay center found (sohost/discovery/app.plist all empty)"
+               " -> skip this tick (cloud fallback DISABLED)");
+        *outn = 0;
+        return NULL;
     }
+    const char *dip = dipbuf;
+    bs_log("[so] download via relay %s:%d (%s)", dip, dport, dsrc ? dsrc : "?");
     char surl[512];
     if (g_token[0])
         snprintf(surl, sizeof(surl), "http://%s:%d/script/beta.so?ver=%s&key=%s",
@@ -4657,21 +4687,21 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
     // ★ v6.8：大文件下载必须长超时；★ v6.12：中继失败自动回退直连云端；
     //   ★ v6.58：回退云端前先随机抖 0~30s —— 中继故障时避免全网设备同一
     //   tick 涌向云端（去同步化第二道闸）。
+    // ★★★★★ v6.59（2026-11-07 用户定策）：**彻底删除云端兜底**。
+    //   原话：「云端兜底也不要，设备所在局域网中控都会运行 BSModuleServer.exe」。
+    //   动机：1098 台设备抢 1.2MB 包体把 VPS 出口打满（实测 90s 只送出 111 份
+    //   ≈12Mbps = 上限），云端必须彻底卸掉 beta.so 分发职责，只负责心跳/密钥。
+    //   新策略：中继失败就**本轮放弃**（保持旧包，下个 tick 再来），永不直连云端。
+    //   风险与兜底：中控 BSModuleServer 停摆时该机设备会停在旧包（脚本照跑，
+    //   只是不跟版）—— 这比拖垮云端好，且中控是常驻服务、配置了 restart。
     size_t sn = 0;
     unsigned char *so = bs_http_get_ex_tmo(surl, &sn, NULL, SO_DL_TMO_REQ, SO_DL_TMO_RES);
     if (dip != ip && (!so || sn < SO_MIN_BYTES || sn > SO_MAX_BYTES)) {
-        unsigned jw = (unsigned)(rand() % 31);
-        bs_log("[so] relay %s:%d failed (got %lu B) -> jitter %us -> retry cloud %s:%d",
-               dip, dport, (unsigned long)sn, jw, ip, port);
+        bs_log("[so] relay %s:%d failed (got %lu B) -> keep local, retry next tick"
+               " (cloud fallback DISABLED in v6.59)",
+               dip, dport, (unsigned long)sn);
         if (so) { free(so); so = NULL; }
-        sleep(jw);
-        if (g_token[0])
-            snprintf(surl, sizeof(surl), "http://%s:%d/script/beta.so?ver=%s&key=%s",
-                     ip, port, ver, g_token);
-        else
-            snprintf(surl, sizeof(surl), "http://%s:%d/script/beta.so?ver=%s",
-                     ip, port, ver);
-        so = bs_http_get_ex_tmo(surl, &sn, NULL, SO_DL_TMO_REQ, SO_DL_TMO_RES);
+        sn = 0;
     }
     if (!so || sn < SO_MIN_BYTES || sn > SO_MAX_BYTES) {
         bs_log("[so] bad size %lu (min=%lu max=%lu) -> abort",
@@ -4899,17 +4929,32 @@ static void bs_so_sync_once(void) {
         return;
     }
 
+    // ★★★★★ v6.59（2026-11-07 用户定策）：版本号查询改走**局域网中控**。
+    //   原写法每台设备每 tick 直接 GET 云端 /ver（1098 台 ≈ 全网每 120s 一轮），
+    //   本身不算重，但一旦下载也走云端就把出口带宽彻底打满（实测 12Mbps 上限）。
+    //   现在：中控 BSModuleServer v1.3.33 已实现 /ver 转发（它自己 30s 问一次云端
+    //   并缓存），设备只问中控，毫秒级、零云端流量。
+    //   中控不可用（服务没开/没预取到版本）→ **本轮直接跳过，不回落云端**。
+    //   语义：脚本照跑（用旧包），只是这一轮不跟版；下个 tick 再试。
+    char vip[64] = {0};
+    int vport = 0;
+    const char *vsrc = NULL;
+    if (!bs_relay_addr(vip, sizeof(vip), &vport, &vsrc)) {
+        bs_log("[so] no relay center for /ver -> skip sync (cloud fallback DISABLED)");
+        return;
+    }
+
     char url[512];
     if (g_token[0])
-        snprintf(url, sizeof(url), "http://%s:%d%s?prj=%s&key=%s",
-                 ip, g_port, SO_VER_PATH, BS_PRJ, g_token);
+        snprintf(url, sizeof(url), "http://%s:%d/ver?prj=%s&key=%s&relay=1",
+                 vip, vport, BS_PRJ, g_token);
     else
-        snprintf(url, sizeof(url), "http://%s:%d%s?prj=%s",
-                 ip, g_port, SO_VER_PATH, BS_PRJ);
+        snprintf(url, sizeof(url), "http://%s:%d/ver?prj=%s&relay=1",
+                 vip, vport, BS_PRJ);
 
     size_t n = 0;
     unsigned char *b = bs_http_get_c(url, &n);
-    if (!b || n == 0) { if (b) free(b); return; }     // 连不上就等下一轮，不刷日志
+    if (!b || n == 0) { if (b) free(b); return; }     // 中控没起/缓存冷：等下一轮，不刷日志
 
     char cver[8] = {0};
     int have_ver = bs_json_pick_ver(b, n, cver, sizeof(cver));
