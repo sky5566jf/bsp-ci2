@@ -30,7 +30,8 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.57" || (echo "MISSING v6.57" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.58" || (echo "MISSING v6.58" && exit 1)
+          strings bs_unlock.dylib | grep -q "peer discovery" || (echo "MISSING v6.58 relay peer discovery" && exit 1)
           strings bs_unlock.dylib | grep -q "mhdump" || (echo "MISSING mhdump export" && exit 1)
           strings bs_unlock.dylib | grep -q "bs_probe_last" || (echo "MISSING bs_probe_last dedupe" && exit 1)
           strings bs_unlock.dylib | grep -q "radar starting" || (echo "MISSING probe radar banner" && exit 1)

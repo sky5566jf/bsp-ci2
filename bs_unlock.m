@@ -954,7 +954,10 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.57"
+#define BS_DYLIB_VER       "v6.58"
+// ★ v6.58：① 中继自动发现（getpeername 扫 App 持久连接拿中控 IP，零配置）；
+//   ② conf sofollow（默认 1）= 全等跟版：版本或 md5 不一致即更新（替代只升不降），
+//      has_key 闸与逐段键闸门原样保留；③ tick 抖动 ±25% + 回退云端退避抖动。
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1195,7 +1198,11 @@ static void bs_s2_apply(const char *v, const char *src) {
 }
 
 // ★ v6.6：主动跟版（conf sosync= / sotick=）
+// ★ v6.58：sofollow（conf 键，默认 1）—— 全等跟版开关：
+//   1 = 云端版本或 md5 与本地不一致就更新（含降级，云端为唯一真相源）；
+//   0 = 旧「只升不降」。has_key 闸与逐段键闸门在两种模式下都保留。
 static int           g_so_sync = 1;
+static int           g_sofollow = 1;
 static int           g_so_tick = SO_SYNC_TICK_SECS;
 
 // ★★★ v6.37：probe 上行开关（conf probeupl=）。
@@ -2339,6 +2346,11 @@ static void bs_load_conf(void) {
             if (t > SO_SYNC_MAX_TICK) t = SO_SYNC_MAX_TICK;
             g_so_tick = t;
         }
+        else if (!strcmp(k, "sofollow")) {
+            // ★ v6.58：全等跟版开关。缺省 1（版本或 md5 不一致即更新）；
+            //   写 0 退回 v6.57 前的「只升不降」。现场逃生门。
+            g_sofollow = atoi(v) ? 1 : 0;
+        }
         else if (!strcmp(k, "offstall")) {
             // ★ v6.25e：连续多少次**协议级异常**判为「厂商协议可能变了」。
             //   （v6.25d 数的是「没走到 accepted」，会把正常短连接算进去 → 误报）
@@ -2393,12 +2405,12 @@ static void bs_load_conf(void) {
     // ★ v6.12：缓存 app.plist 的中控 ip —— beta.so 中继地址直接用它（见 so_sync 下载处）
     bs_pc_ip_of_plist(g_appip, sizeof(g_appip));
 
-    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d probeupl=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d egress=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
+    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sofollow=%d probeupl=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d egress=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
            BS_DYLIB_VER,
            g_port, g_tick, g_enable, g_mode == MODE_PROBE ? "probe" : "unlock",
            g_token[0] ? "(set)" : "(none)",
            g_qbuf[0] ? g_qbuf : "(none)", g_mod_dir, g_hb_max,
-           g_so_sync, g_probe_upl, g_so_tick, g_offstall, g_autoreload,
+           g_so_sync, g_sofollow, g_probe_upl, g_so_tick, g_offstall, g_autoreload,
            g_crashresume, g_block_vps, g_off_egress,
            g_cardcheck, g_cardgrace, g_cardtick,
            g_card_host, g_cardval[0] ? "(set)" : "(none)",
@@ -4572,11 +4584,49 @@ static int bs_json_pick_str(const unsigned char *j, size_t n, const char *key,
 /// ★ v6.23n：beta.so 下载统一走这里（中继优先 → 云端回退 → 体积校验）。
 ///   原 bs_so_sync_once 内联逻辑抽出，容器修复（v6.23n）复用同一条路。
 ///   成功返回缓冲（调用方 free）并写 *outn；失败返回 NULL。
+/// ★ v6.58：中控 IP 零配置自动发现。
+///   原理：App 与中控 BBCenter 之间有一条持久 TCP 连接（备注列/状态包复用的
+///   那条），在本进程里扫 fd + getpeername 就能拿到对端（中控）的局域网 IP。
+///   识别特征 = 对端是私网地址 && 对端端口 ∈ {noteport(34878), 7875, 7880}
+///   （7875/7880 是厂商统计/照片改道端口，指向中控时同样是中控本机）。
+///   命中即返回 1 并把 IP 写入 out；找不到返回 0。
+static int bs_center_ip_discover(char *out, size_t n) {
+    int ports[3];
+    int np = 0;
+    ports[np++] = g_noteport;               // 缺省 34878（conf noteport= 可改）
+    ports[np++] = 7875;
+    ports[np++] = 7880;
+    for (int f = 3; f < 1024; f++) {
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        if (getpeername(f, (struct sockaddr *)&sa, &sl) != 0) continue;
+        if (sa.sin_family != AF_INET) continue;
+        unsigned char *b = (unsigned char *)&sa.sin_addr.s_addr;   // 网络序
+        int priv = (b[0] == 10) ||
+                   (b[0] == 172 && b[1] >= 16 && b[1] <= 31) ||
+                   (b[0] == 192 && b[1] == 168);
+        if (!priv) continue;                 // 云端公网 IP 一律不当中继
+        int p = ntohs(sa.sin_port);
+        int hit = 0;
+        for (int i = 0; i < np && !hit; i++) if (ports[i] == p) hit = 1;
+        if (!hit) continue;
+        snprintf(out, n, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        return 1;
+    }
+    return 0;
+}
+
 static unsigned char *bs_dl_beta_relay(const char *ip, int port,
                                        const char *ver, size_t *outn) {
     // ★ v6.9→v6.13：下载走局域网中继（app.plist 中控 ip，每次现读）；
     //   conf sohost 仅应急覆盖；app.plist 缺失 → 直连云端。
+    // ★ v6.58：优先级改为 conf sohost > getpeername 自动发现 > app.plist > 云端。
+    //   自动发现解决了「App 里没填中控 IP 就直连云端」的覆盖缺口 ——
+    //   11-06 事故里正是这批设备把云端带宽打满。
     char appip_now[64];
+    char disc[64] = {0};
+    int have_disc = bs_center_ip_discover(disc, sizeof(disc));
     bs_pc_ip_of_plist(appip_now, sizeof(appip_now));
     const char *dip;
     int dport;
@@ -4584,6 +4634,10 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
         dip = g_sohost;
         dport = (g_soport > 0) ? g_soport : port;
         bs_log("[so] download via relay %s:%d (conf sohost)", dip, dport);
+    } else if (have_disc) {
+        dip = disc;
+        dport = (g_soport > 0) ? g_soport : SO_PORT_DEF;
+        bs_log("[so] download via relay %s:%d (peer discovery)", dip, dport);
     } else if (appip_now[0]) {
         dip = appip_now;
         dport = (g_soport > 0) ? g_soport : SO_PORT_DEF;
@@ -4600,13 +4654,17 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
         snprintf(surl, sizeof(surl), "http://%s:%d/script/beta.so?ver=%s",
                  dip, dport, ver);
 
-    // ★ v6.8：大文件下载必须长超时；★ v6.12：中继失败自动回退直连云端
+    // ★ v6.8：大文件下载必须长超时；★ v6.12：中继失败自动回退直连云端；
+    //   ★ v6.58：回退云端前先随机抖 0~30s —— 中继故障时避免全网设备同一
+    //   tick 涌向云端（去同步化第二道闸）。
     size_t sn = 0;
     unsigned char *so = bs_http_get_ex_tmo(surl, &sn, NULL, SO_DL_TMO_REQ, SO_DL_TMO_RES);
     if (dip != ip && (!so || sn < SO_MIN_BYTES || sn > SO_MAX_BYTES)) {
-        bs_log("[so] relay %s:%d failed (got %lu B) -> retry cloud %s:%d",
-               dip, dport, (unsigned long)sn, ip, port);
+        unsigned jw = (unsigned)(rand() % 31);
+        bs_log("[so] relay %s:%d failed (got %lu B) -> jitter %us -> retry cloud %s:%d",
+               dip, dport, (unsigned long)sn, jw, ip, port);
         if (so) { free(so); so = NULL; }
+        sleep(jw);
         if (g_token[0])
             snprintf(surl, sizeof(surl), "http://%s:%d/script/beta.so?ver=%s&key=%s",
                      ip, port, ver, g_token);
@@ -4895,8 +4953,11 @@ static void bs_so_sync_once(void) {
         bs_so_repair_if_dirty(ip, g_port, cver);
         return;
     }
-    if (strcmp(cver, lver) < 0) {                     // 只升不降
-        bs_log("[so] cloud %s < local %s -> keep local", cver, lver);
+    // ★ v6.58：sofollow（默认 1）= 全等跟版 —— 版本不一致就更新（含云端<本地
+    //   的降级场景，云端是唯一真相源）。sofollow=0 退回旧「只升不降」。
+    //   无论哪种模式，后面的 has_key 闸与逐段键闸门都原样保留。
+    if (!g_sofollow && strcmp(cver, lver) < 0) {      // 只升不降（旧行为）
+        bs_log("[so] cloud %s < local %s -> keep local (sofollow=0)", cver, lver);
         return;
     }
     if (!has_key) {
@@ -4906,8 +4967,8 @@ static void bs_so_sync_once(void) {
     }
 
 SO_DL:
-    bs_evt("[so] cloud %s > local %s -> downloading", cver,
-           have_local ? lver : "(none)");
+    bs_evt("[so] cloud %s %s local %s -> downloading", cver,
+           (strcmp(cver, lver) > 0) ? ">" : "<", have_local ? lver : "(none)");
     // ★ v6.23n：下载逻辑抽到 bs_dl_beta_relay（中继优先→云端回退→体积校验），
     //   与容器修复共用同一条路；app.plist 现读/sohost 覆盖/长超时都在 helper 里。
     size_t sn = 0;
@@ -4976,14 +5037,22 @@ SO_DL:
 }
 
 /// 跟版线程：首轮延迟 20s（等 App 网络栈就绪），之后每 g_so_tick 秒复查一次。
+/// ★ v6.58：tick 加 ±25% 随机抖动（120s → 实际 90~150s）—— 去同步化，
+///   promote 新版时全网设备的拉取请求在时间轴上自然摊开。
 static void *bs_so_sync_thread(void *arg) {
     (void)arg;
-    bs_evt("[so] sync thread start tick=%ds sosync=%d host=%s:%d",
-           g_so_tick, g_so_sync, g_host, g_port);
+    srand((unsigned)(time(NULL) ^ (unsigned long)pthread_self()));
+    bs_evt("[so] sync thread start tick=%ds sosync=%d sofollow=%d host=%s:%d",
+           g_so_tick, g_so_sync, g_sofollow, g_host, g_port);
     sleep(SO_SYNC_FIRST_DELAY);
     for (;;) {
         if (g_so_sync) bs_so_sync_once();
-        sleep((unsigned)g_so_tick);
+        unsigned jt = (unsigned)g_so_tick;
+        if (jt > 8) {
+            unsigned lo = jt - jt / 4, hi = jt + jt / 4;
+            jt = lo + (unsigned)(rand() % (int)(hi - lo + 1));
+        }
+        sleep(jt);
     }
     return NULL;
 }
