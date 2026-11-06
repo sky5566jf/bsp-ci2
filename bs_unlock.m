@@ -954,7 +954,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.56"
+#define BS_DYLIB_VER       "v6.57"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -4988,6 +4988,38 @@ static void *bs_so_sync_thread(void *arg) {
     return NULL;
 }
 
+/// ★★★★★ v6.56：字典导出线程（conf mhdump=1 时启动）。
+///
+///   为什么不复用 probe 循环：probe 的 `PROBE_TICK_SECS=600`（10 分钟），
+///   且已上报过的版本会直接 continue ⇒ 现场开开关后要等 10 分钟才可能导出。
+///   而字典由厂商在 App 启动后异步填充（实测启动瞬间是 nil、几十秒后才有），
+///   等 10 分钟正好错过最佳窗口。
+///
+///   本线程自己按 15s 轮询，一拿到非空字典立刻落盘、写完自动退出。
+///   ★ 不联网、不发请求，纯本地只读快照 + 落盘。
+static void *bs_mhdump_thread(void *arg) {
+    uintptr_t base = (uintptr_t)arg;
+    bs_log("[mhdump] watchdog thread start (15s poll, dict must be non-empty)");
+    int tries = 0;
+    for (;;) {
+        if (!g_mh_dump) {
+            bs_log("[mhdump] switch off -> thread exit");
+            return NULL;
+        }
+        @autoreleasepool { bs_mh_snapshot(base); }
+        if (g_mh_n > 0) {
+            bs_mh_export();          // 成功会把 g_mh_dump 置 0
+            if (!g_mh_dump) return NULL;
+        } else {
+            // 只在前 8 次打日志，避免长时间空字典刷屏
+            if (++tries <= 8)
+                bs_log("[mhdump] dict still nil (try %d) -> wait 15s", tries);
+        }
+        sleep(15);
+    }
+    return NULL;
+}
+
 /// probe 线程：版本 → 密钥 → 组帧 → POST /probe。
 ///   幂等设计：与上次成功上报同版本则本轮静默（不重复传 1MB 包）。
 static void *bs_probe_thread(void *arg) {
@@ -5049,16 +5081,8 @@ static void *bs_probe_thread(void *arg) {
             continue;
         }
 
-        // 与上次成功上报一致 -> 静默（但每 tick 仍会重读快照，防止版本回退后漏报）
-        // ★★★ v6.56：导出开关必须**在去重 continue 之前**处理。
-        //   否则一旦本版本已上报成功（last_ok=1、版本未变），循环每拍都直接
-        //   continue，永远走不到下面的 bs_mh_snapshot ⇒ mhdump 形同虚设。
-        //   这里单独做一次快照 + 导出，不影响后续上报流程。
-        if (g_mh_dump) {
-            @autoreleasepool { bs_mh_snapshot(base); }
-            bs_mh_export();
-        }
-
+        // ★★★ v6.56：导出已移到独立的 bs_mhdump_thread（15s 轮询），
+        //   probe 循环这里不再重复处理，避免两处抢同一个开关。
         if (last_ok && strcmp(last_ver, verhex) == 0) {
             sleep(PROBE_TICK_SECS);
             continue;
@@ -8917,6 +8941,16 @@ static void *bs_bootstrap(void *arg) {
                 pthread_detach(tpr);
             } else {
                 bs_log("probe thread create failed");
+            }
+            // ★ v6.56：字典导出看门狗（conf mhdump=1 才真正干活，否则立刻退出）
+            if (g_mh_dump) {
+                pthread_t tmd;
+                if (pthread_create(&tmd, NULL, bs_mhdump_thread, (void *)g_base) == 0) {
+                    pthread_detach(tmd);
+                    bs_log("[mhdump] watchdog spawned (15s poll)");
+                } else {
+                    bs_log("[mhdump] thread create failed");
+                }
             }
             return NULL;
         }
