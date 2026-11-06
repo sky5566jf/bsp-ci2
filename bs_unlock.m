@@ -857,7 +857,11 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define VERWATCH_RETRY_EVERY 10
 #define MODE_UNLOCK      0
 #define MODE_PROBE       1
-#define MH_SNAP_MAX      12     // 密钥字典快照最多记 8 个版本（v6.23q 起留余量给 keyhunt 注入）
+// ★★★ v6.56（2026-11-06）：12 → 24。
+//   3.1.4 包内嵌 12 个版本段，云端只覆盖 2 个；真卡机字典里实测正好 12 项，
+//   已顶到上限（`mh snapshot n=12`）⇒ 再多一个版本就会被截断丢掉。
+//   倍到 24 留足余量（每项 35B，24 项才 840B，代价可忽略）。
+#define MH_SNAP_MAX      24     // 密钥字典快照最多记 24 个版本（v6.56 由 12 扩容）
 
 // ★ v6.6：主动跟版（免卡密机从我们云端取脚本包本体）
 #define SO_VER_PATH        "/ver"        // 云端最新版本查询（只元数据）
@@ -950,7 +954,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.55"
+#define BS_DYLIB_VER       "v6.56"
 #define SO_SYNC_TICK_SECS  120           // 默认复查间隔
 #define SO_SYNC_MIN_TICK   30            // conf sotick= 下限
 #define SO_SYNC_MAX_TICK   3600          // 上限
@@ -1212,6 +1216,23 @@ static int           g_so_tick = SO_SYNC_TICK_SECS;
 //   · 跟版（GET /ver → /script/beta.so）：MODE_PROBE 下照跑，落盘后**不重启脚本**
 //     （bs_so_maybe_reload 自 v6.24q 起只写 pend=1，不做任何运行态改动）。
 static int           g_probe_upl = 1;
+
+// ★★★★★ v6.56（2026-11-06）：密钥字典导出开关（conf mhdump=1）。
+//
+//   动机：厂商 3.1.4 起脚本包内嵌 12 个版本段（030105/030104/010903/020102/
+//   020109/020105/020108/010904/020002/020106/020003/020008），而云端密钥库
+//   只有当时推过的几个 ⇒ 假卡机 `can not find version key!!` → 脚本加载失败。
+//   真卡机的 _g_script_mushroom_head 里实测就有这 12 项（`mh snapshot n=12`），
+//   但 roothide 环境下 frida-server 拿不到 root、attach 一律 PermissionDenied，
+//   内存 dump 这条路走不通 ⇒ 让 dylib 自己把快照吐成文本，零外部依赖。
+//
+//   做法：probe 线程每拍 bs_mh_snapshot() 之后，若开关打开就写
+//       DATA_DIR "/mh_dump.txt"
+//   格式（每行一项，可直接喂给云端 /api/key）：
+//       <6位hex版本> <64位hex密钥>
+//   写完立刻把开关落回 0（只导一次，避免每 600s 反复覆盖同一文件）。
+//   ★ 默认 0 = 不导出、不产生任何额外文件，对现网零影响。
+static int           g_mh_dump = 0;
 
 // ================================================================
 // ★★★★ v6.25：真离线 —— 进程内接管 server2，一个字节都不发厂商
@@ -2238,6 +2259,11 @@ static void bs_load_conf(void) {
             // ★★★ v6.37：probe 上行开关（缺省/写 0 = 不上传；写 1 = 恢复老的
             //   「密钥 + 1MB 包体」上报）。probe 的上传会把厂商原版顶到全网，慎开。
             g_probe_upl = atoi(v) ? 1 : 0;
+        }
+        else if (!strcmp(k, "mhdump")) {
+            // ★★★ v6.56：密钥字典导出开关（缺省 0）。写 1 → probe 下一拍把
+            //   DATA_DIR/mh_dump.txt 吐出来（格式 <版本hex> <密钥hex>），写完自动回 0。
+            g_mh_dump = atoi(v) ? 1 : 0;
         }
         else if (!strcmp(k, "autoreload")) {
             // ★ v6.7：落盘后自动重启开关（缺省开；写 0 关掉，只落盘不动脚本）
@@ -4060,6 +4086,44 @@ static void bs_mh_snapshot(uintptr_t base) {
     }
 }
 
+/// ★★★★★ v6.56：把密钥字典快照导出成文本（conf mhdump=1 触发，只导一次）。
+///
+///   为什么需要它：厂商新版脚本包内嵌多个历史版本段，云端密钥库不一定齐全
+///   （3.1.4 实测缺 10 个）。真卡机的字典里其实有这些键，但 roothide 下
+///   frida 拿不到 root、attach 被拒，内存 dump 不可行 ⇒ 让 dylib 自己吐。
+///
+///   输出：DATA_DIR "/mh_dump.txt"，每行 "<6位hex版本> <64位hex密钥>"
+///   写完把 g_mh_dump 置 0 —— 只导一次，避免每拍覆盖同一文件。
+///   ★ 全程不联网、不发请求，纯本地落盘。
+static void bs_mh_export(void) {
+    if (!g_mh_dump) return;
+    if (g_mh_n <= 0) {
+        bs_log("[mhdump] snapshot empty -> skip");
+        return;
+    }
+    const char *fp = DATA_DIR "/mh_dump.txt";
+    int fd = open(fp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        bs_log("[mhdump] open %s failed errno=%d", fp, errno);
+        return;
+    }
+    char line[96];
+    int written = 0;
+    for (int i = 0; i < g_mh_n; i++) {
+        int p = snprintf(line, sizeof(line), "%02x%02x%02x ",
+                         g_mh_snap[i][0], g_mh_snap[i][1], g_mh_snap[i][2]);
+        for (int j = 0; j < 32; j++)
+            p += snprintf(line + p, sizeof(line) - p, "%02x", g_mh_snap[i][3 + j]);
+        p += snprintf(line + p, sizeof(line) - p, "\n");
+        if (write(fd, line, p) == (ssize_t)p) written++;
+    }
+    close(fd);
+    // 落盘后立刻回落开关，避免每拍重写
+    g_mh_dump = 0;
+    bs_log("[mhdump] ★ exported %d/%d keys -> %s", written, g_mh_n, fp);
+    bs_evt("[mhdump] exported %d keys to mh_dump.txt", written);
+}
+
 // ================================================================
 // ★★★ v6.23q：keyhunt —— 密钥字典缺失时的进程内存暴力找回
 //
@@ -4945,6 +5009,11 @@ static void *bs_probe_thread(void *arg) {
                 bs_evt("[probe] local beta.so ver=%s (upload off, local watch only)", wv);
                 snprintf(lastwatch, sizeof(lastwatch), "%s", wv);
             }
+            // ★ v6.56：纯本地模式也支持字典导出（不联网，只落盘）
+            if (g_mh_dump) {
+                @autoreleasepool { bs_mh_snapshot((uintptr_t)arg); }
+                bs_mh_export();
+            }
             sleep(PROBE_TICK_SECS);
         }
     }
@@ -4981,6 +5050,15 @@ static void *bs_probe_thread(void *arg) {
         }
 
         // 与上次成功上报一致 -> 静默（但每 tick 仍会重读快照，防止版本回退后漏报）
+        // ★★★ v6.56：导出开关必须**在去重 continue 之前**处理。
+        //   否则一旦本版本已上报成功（last_ok=1、版本未变），循环每拍都直接
+        //   continue，永远走不到下面的 bs_mh_snapshot ⇒ mhdump 形同虚设。
+        //   这里单独做一次快照 + 导出，不影响后续上报流程。
+        if (g_mh_dump) {
+            @autoreleasepool { bs_mh_snapshot(base); }
+            bs_mh_export();
+        }
+
         if (last_ok && strcmp(last_ver, verhex) == 0) {
             sleep(PROBE_TICK_SECS);
             continue;
