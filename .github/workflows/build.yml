@@ -30,8 +30,10 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.60" || (echo "MISSING v6.60" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.61" || (echo "MISSING v6.61" && exit 1)
           strings bs_unlock.dylib | grep -q "peer discovery" || (echo "MISSING relay peer discovery" && exit 1)
+          # ★ v6.61 小包项目放闸：csws 官方包仅 124839B，600KB 老闸会判 bad size
+          strings bs_unlock.dylib | grep -q "max=%lu prj=%s" || (echo "MISSING v6.61 per-prj size floor log" && exit 1)
           # ★ v6.60 多项目：项目名运行期可配（conf prj= / /hb 下发 / 默认 sjz）
           strings bs_unlock.dylib | grep -q "prj locked by conf" || (echo "MISSING v6.60 conf prj=" && exit 1)
           strings bs_unlock.dylib | grep -q "\[prj\] switch" || (echo "MISSING v6.60 prj switch on /hb" && exit 1)

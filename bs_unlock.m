@@ -970,7 +970,7 @@ static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用�
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.60"
+#define BS_DYLIB_VER       "v6.61"
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
 //      它自己 30s 问一次云端并缓存，替全网设备扛掉版本探询）；
@@ -987,6 +987,27 @@ static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用�
 #define SO_SYNC_FIRST_DELAY 20           // 启动后首轮延迟（等 App 网络栈就绪）
 #define SO_MIN_BYTES       (600 * 1024)  // 合法 beta.so 体积下限（实际 1.1MB 量级）
 #define SO_MAX_BYTES       (8 * 1024 * 1024)   // 上限（与服务端 probe 同口径）
+
+// ★★★★★ v6.61（2026-11-08 实测事故）：**非默认项目的包体下限必须单独放行**。
+//   现象（.109 真机，csws 卡激活后第一轮跟版）：
+//       [so] cloud 010803 < local 030107 -> downloading
+//       [so] download via relay 192.168.31.23:27391 (peer discovery)
+//       [so] relay ... failed (got 124839 B) -> keep local, retry next tick
+//       [so] bad size 0 (min=614400 max=8388608) -> abort
+//   —— 包其实完整下到了（124839 B 一个字节不差），是被 600KB 的老闸判死。
+//   原因：SO_MIN_BYTES 是当年给 sjz（1.19MB 单一项目大容器）立的防垃圾闸；
+//   而 csws 1.8.3 官方包只有 124839 B ⇒ 新项目永远拉不下来、卡在旧包。
+//   现在：默认项目 sjz 保持 600KB 不变（存量 1000+ 台行为零变化），
+//   其它项目用 16KB 下限。完整性另有双保险，不靠体积兜底：
+//       ① 下载后比包头 3 字节版本（memcmp，见 bs_so_sync 调用点）
+//       ② 落盘前逐段「版本键闸门」（任何一段没键就不落盘）
+#define SO_MIN_PRJ_BYTES   (16 * 1024)
+
+static size_t bs_so_min_bytes(void) {
+    // 默认项目沿用历史闸门；其它项目（csws 等小包项目）放行到 16KB
+    return (strcmp(BS_PRJ, "sjz") == 0) ? (size_t)SO_MIN_BYTES
+                                        : (size_t)SO_MIN_PRJ_BYTES;
+}
 
 // ★ 运行时配置：PULL_CONF（键=值，一行一个，可缺省）
 //     port=18083
@@ -4767,17 +4788,19 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
     //   只是不跟版）—— 这比拖垮云端好，且中控是常驻服务、配置了 restart。
     size_t sn = 0;
     unsigned char *so = bs_http_get_ex_tmo(surl, &sn, NULL, SO_DL_TMO_REQ, SO_DL_TMO_RES);
-    if (dip != ip && (!so || sn < SO_MIN_BYTES || sn > SO_MAX_BYTES)) {
-        bs_log("[so] relay %s:%d failed (got %lu B) -> keep local, retry next tick"
+    // ★ v6.61：下限按项目取（sjz 600KB，其它项目 16KB）—— 见 SO_MIN_PRJ_BYTES 注释
+    size_t smin = bs_so_min_bytes();
+    if (dip != ip && (!so || sn < smin || sn > SO_MAX_BYTES)) {
+        bs_log("[so] relay %s:%d failed (got %lu B, min=%lu) -> keep local, retry next tick"
                " (cloud fallback DISABLED in v6.59)",
-               dip, dport, (unsigned long)sn);
+               dip, dport, (unsigned long)sn, (unsigned long)smin);
         if (so) { free(so); so = NULL; }
         sn = 0;
     }
-    if (!so || sn < SO_MIN_BYTES || sn > SO_MAX_BYTES) {
-        bs_log("[so] bad size %lu (min=%lu max=%lu) -> abort",
-               (unsigned long)sn, (unsigned long)SO_MIN_BYTES,
-               (unsigned long)SO_MAX_BYTES);
+    if (!so || sn < smin || sn > SO_MAX_BYTES) {
+        bs_log("[so] bad size %lu (min=%lu max=%lu prj=%s) -> abort",
+               (unsigned long)sn, (unsigned long)smin,
+               (unsigned long)SO_MAX_BYTES, BS_PRJ);
         if (so) { free(so); so = NULL; }
         return NULL;
     }
