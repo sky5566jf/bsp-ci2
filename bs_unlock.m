@@ -871,8 +871,32 @@ static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用�
 #define VERWATCH_TICK_SECS 3
 // ★ v6.5：新版本密钥云端还没上架时的重试节流（N 个 tick 试一次；10 * 3s = 30s）。
 #define VERWATCH_RETRY_EVERY 10
-#define MODE_UNLOCK      0
-#define MODE_PROBE       1
+// ★★★★★ v6.62（2026-11-08 泄露事故）：**probe 变体编译期硬锁**。
+//   事故现场：`bspath_2.10_iphoneos-arm64e-probe.deb` 里的 bs_unlock.dylib 与正式版
+//   **字节完全相同**（205936B），唯一区别是 bs_pull.conf 里一行 `mode=probe`。
+//   ⇒ 拿到这个包的人只要 ① 改 conf 的 mode、② 删掉 conf（g_mode 缺省就是 UNLOCK），
+//     就得到一个**全功能免卡密解锁器**。probe 包等于「破解器 + 一行注释」。
+//
+//   修法：probe 变体改用 `-DBS_PROBE_LOCKED` 单独编译，把 MODE_UNLOCK 定义成与
+//   MODE_PROBE 相同的值。这样「unlock」这个状态在二进制里**根本不存在**：
+//       CONF 不写 mode   → g_mode = MODE_UNLOCK = 0 = PROBE ✔
+//       CONF 写 mode=probe → 0 = PROBE ✔
+//       CONF 写 mode=unlock / 乱写 → 0 = PROBE ✔
+//       CONF 整份删掉      → 0 = PROBE ✔
+//   即「改配置」这条降级路径被物理堵死，不依赖任何运行时判断。
+//   ★ 注意：这不等于「probe 包不含解锁代码」——代码仍在（省掉整文件 #ifdef 手术的
+//     风险），但进入解锁路径的唯一入口 bs_bootstrap 第 9128 行判的是 g_mode，
+//     而 g_mode 在该变体里恒为 PROBE ⇒ 全部 unlock 逻辑不可达。
+//   ★ 真正让泄露包失效的仍然只有两件事：云端密钥准入 + 换密钥重加密（见方案文档）。
+#ifdef BS_PROBE_LOCKED
+  #define MODE_PROBE       0
+  #define MODE_UNLOCK      0      // 与 PROBE 同值 —— 该变体不存在 unlock 状态
+  #define BS_PROBE_LOCKED_ 1
+#else
+  #define MODE_UNLOCK      0
+  #define MODE_PROBE       1
+  #define BS_PROBE_LOCKED_ 0
+#endif
 // ★★★ v6.56（2026-11-06）：12 → 24。
 //   3.1.4 包内嵌 12 个版本段，云端只覆盖 2 个；真卡机字典里实测正好 12 项，
 //   已顶到上限（`mh snapshot n=12`）⇒ 再多一个版本就会被截断丢掉。
@@ -970,7 +994,13 @@ static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用�
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.61"
+// ★★★★★ v6.62（2026-11-08）：probe 变体编译期硬锁（见 MODE_* 宏处的长注释）。
+//   变体标识进版本串，现场一眼能分清装的是不是锁定版：v6.62（正式）/ v6.62p（probe 锁死）。
+#ifdef BS_PROBE_LOCKED
+  #define BS_DYLIB_VER     "v6.62p"
+#else
+  #define BS_DYLIB_VER     "v6.62"
+#endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
 //      它自己 30s 问一次云端并缓存，替全网设备扛掉版本探询）；
@@ -2300,7 +2330,14 @@ static void bs_load_conf(void) {
         }
         else if (!strcmp(k, "mode")) {
             // ★ v6.4：只有 probe 走雷达模式，其余（含拼错）一律按 unlock，避免误配成「什么都不做」
-            g_mode = (!strcmp(v, "probe")) ? MODE_PROBE : MODE_UNLOCK;
+            // ★ v6.62：probe 锁定变体里 mode 键**整体失效** —— 写什么都不改变 g_mode，
+            //   只留一条醒目日志，方便判断「是不是有人正在试图把 radar 改成解锁器」。
+            if (BS_PROBE_LOCKED_) {
+                bs_log("[conf] ★ mode=%s IGNORED (probe-locked build, MODE_UNLOCK not compiled)",
+                       v);
+            } else {
+                g_mode = (!strcmp(v, "probe")) ? MODE_PROBE : MODE_UNLOCK;
+            }
         }
         else if (!strcmp(k, "prj") && v[0]) {
             // ★ v6.60：现场强锁脚本项目名（合法字符才认，防止手写脏值把 URL 打歪）。

@@ -14,6 +14,18 @@ jobs:
             -install_name @rpath/bs_unlock.dylib \
             bs_unlock.m fishhook.c -o bs_unlock.dylib
           codesign -f -s - bs_unlock.dylib
+      # ★★★★★ v6.62（2026-11-08 泄露事故）：probe 变体单独编译，编译期锁死模式。
+      #   起因：bspath_2.10_probe.deb 里的 dylib 与正式版字节完全相同，改一行 conf
+      #   就变全功能解锁器。此变体里 MODE_UNLOCK 与 MODE_PROBE 同值（0），
+      #   conf 的 mode 键整体失效 ⇒ 不存在任何可进入 unlock 路径的配置组合。
+      - name: Build bs_unlock_probe.dylib (probe-locked variant)
+        run: |
+          xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 \
+            -miphoneos-version-min=13.0 -framework Foundation -framework Security \
+            -DBS_PROBE_LOCKED=1 \
+            -install_name @rpath/bs_unlock.dylib \
+            bs_unlock.m fishhook.c -o bs_unlock_probe.dylib
+          codesign -f -s - bs_unlock_probe.dylib
       - name: Build bs_test.dylib
         run: |
           xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -O2 \
@@ -30,7 +42,8 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.61" || (echo "MISSING v6.61" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.62" || (echo "MISSING v6.62" && exit 1)
+          if strings bs_unlock.dylib | grep -q "v6\.61"; then echo "STALE: v6.61 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "peer discovery" || (echo "MISSING relay peer discovery" && exit 1)
           # ★ v6.61 小包项目放闸：csws 官方包仅 124839B，600KB 老闸会判 bad size
           strings bs_unlock.dylib | grep -q "max=%lu prj=%s" || (echo "MISSING v6.61 per-prj size floor log" && exit 1)
@@ -353,9 +366,38 @@ jobs:
           strings bs_unlock.dylib | grep -q "RESP80 hex len=" || (echo "MISSING RESP80 length guard" && exit 1)
           strings bs_unlock.dylib | grep -q "5000000003004300000004" || (echo "MISSING RESP80 blob" && exit 1)
           otool -l bs_unlock.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE" && exit 1)
+      # ★★★★★ v6.62：probe 锁定变体断言 —— 这是本次泄露事故的核心防线，
+      #   任何一条不过都说明「probe 包又能被 conf 改成解锁器」了。
+      - name: Probe-locked variant assertions
+        run: |
+          echo "=== probe variant must be a DIFFERENT binary ==="
+          A=$(md5 -q bs_unlock.dylib); B=$(md5 -q bs_unlock_probe.dylib)
+          echo "full=$A probe=$B"
+          if [ "$A" = "$B" ]; then echo "FATAL: probe variant identical to full build (-DBS_PROBE_LOCKED not applied)" && exit 1; fi
+
+          echo "=== probe variant carries the lock banner + own version tag ==="
+          strings bs_unlock_probe.dylib | grep -q "probe-locked build, MODE_UNLOCK not compiled" \
+            || (echo "MISSING v6.62 probe-lock banner" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "v6.62p" || (echo "MISSING v6.62p probe version tag" && exit 1)
+
+          echo "=== full build must NOT carry the lock banner (macro really gated) ==="
+          if strings bs_unlock.dylib | grep -q "probe-locked build"; then
+            echo "FATAL: lock banner leaked into full build (-DBS_PROBE_LOCKED applied globally)" && exit 1
+          fi
+          if strings bs_unlock.dylib | grep -q "v6.62p"; then
+            echo "FATAL: probe version tag leaked into full build" && exit 1
+          fi
+
+          echo "=== probe variant keeps the radar (must still work as a radar) ==="
+          strings bs_unlock_probe.dylib | grep -q "radar starting" || (echo "MISSING probe radar banner" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "PROBE mode: inject/watchdog/pull ALL skipped" \
+            || (echo "MISSING probe early-return banner" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt in probe variant" && exit 1)
+          otool -l bs_unlock_probe.dylib | grep -q LC_CODE_SIGNATURE || (echo "NO LC_CODE_SIGNATURE (probe)" && exit 1)
       - uses: actions/upload-artifact@v4
         with:
           name: dylibs
           path: |
             bs_unlock.dylib
+            bs_unlock_probe.dylib
             bs_test.dylib
