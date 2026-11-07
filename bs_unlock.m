@@ -821,9 +821,25 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //     需要临时换服务端时，在 bs_pull.conf 写 `host=1.2.3.4` 即可覆盖（无需重编译）。
 #define BS_HOST_DEF "47.116.161.226"   // ★ v6.16：云端迁移（老 47.243.156.129 弃用）
 
-// ★ v6.3：脚本项目名（beta.so 记录 0 里的 prj_name），云端 /key 查密钥用。
-//   只有换脚本项目（sjz 之外）才需改这里；版本升级不需要。
-#define BS_PRJ "sjz"
+// ★★★★★ v6.60（2026-11-08 用户定策）：脚本项目名 **运行期可配**。
+//
+//   背景：一张卡密决定一个项目（sjz=三角洲 / csws=传世无双 …），官方按卡密所属
+//   下发对应项目的 beta.so；中控必须下发同一个项目名，设备才 `begin run script`。
+//   旧版把项目名编译期写死在 BS_PRJ，换项目就得重编 dylib —— 全网 900+ 台无法
+//   随卡密分布自动跟随。
+//
+//   现在的取值优先级（后者覆盖前者）：
+//     ① 默认 "sjz"（保持历史行为，老设备零改动）
+//     ② bs_pull.conf 的 `prj=`（现场强锁，调试用）
+//     ③ /hb 应答的 `prj` 字段（★权威：由云端按卡密所属项目下发）
+//
+//   ★ 只有 /hb 才是权威源：云端 card_prj_of_dev() 与 bindcard_deliver() 同源判定，
+//     保证「下发的项目」和「下发的卡」永远来自同一张卡，不会出现
+//     「卡是 csws 的、项目却是 sjz 的」这种必然 `can not find version key!!` 的组合。
+//   ★ 切换项目时必须清密钥缓存并强制跟版，否则会拿旧项目的包/键跑新项目。
+static char g_prj[40] = "sjz";      // 当前生效的脚本项目名
+static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用于变化检测）
+#define BS_PRJ g_prj
 
 // ---- v6：心跳授权（"心跳即死亡"）。
 //   BSModuleServer 每次 pull 时用 /hb 端点返回授权；连续拿不到 -> 判定失联 ->
@@ -954,7 +970,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //        远端根本看不到 [so]/[pull]/[off] 真日志（本次排障踩坑）。
 // ★ v6.23q：dylib 版本常量 —— 随 /hb 的 &dv= 上报云端（版本历史见文件头注释）
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
-#define BS_DYLIB_VER       "v6.59"
+#define BS_DYLIB_VER       "v6.60"
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
 //      它自己 30s 问一次云端并缓存，替全网设备扛掉版本探询）；
@@ -2265,6 +2281,20 @@ static void bs_load_conf(void) {
             // ★ v6.4：只有 probe 走雷达模式，其余（含拼错）一律按 unlock，避免误配成「什么都不做」
             g_mode = (!strcmp(v, "probe")) ? MODE_PROBE : MODE_UNLOCK;
         }
+        else if (!strcmp(k, "prj") && v[0]) {
+            // ★ v6.60：现场强锁脚本项目名（合法字符才认，防止手写脏值把 URL 打歪）。
+            //   正常运营**不要写这一项** —— 项目应当由 /hb 按卡密所属下发，
+            //   否则这里会盖掉云端权威值，出现「卡是 A 项目、跑的是 B 项目」。
+            int okc = 1;
+            for (const char *q = v; *q; q++)
+                if (!(isalnum((unsigned char)*q) || *q == '_' || *q == '-')) { okc = 0; break; }
+            if (okc && strlen(v) < sizeof(g_prj)) {
+                snprintf(g_prj, sizeof(g_prj), "%s", v);
+                bs_log("[conf] prj locked by conf -> %s", g_prj);
+            } else {
+                bs_log("[conf] prj= 非法值 '%s' 已忽略（只允许字母数字_-）", v);
+            }
+        }
         else if (!strcmp(k, "sosync")) {
             // ★ v6.6：主动跟版开关（写 0 关掉；缺省开）
             g_so_sync = atoi(v) ? 1 : 0;
@@ -2412,8 +2442,8 @@ static void bs_load_conf(void) {
     // ★ v6.12：缓存 app.plist 的中控 ip —— beta.so 中继地址直接用它（见 so_sync 下载处）
     bs_pc_ip_of_plist(g_appip, sizeof(g_appip));
 
-    bs_log("[conf] dylib=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sofollow=%d probeupl=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d egress=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
-           BS_DYLIB_VER,
+    bs_log("[conf] dylib=%s prj=%s port=%d tick=%d enable=%d mode=%s token=%s q=%s moddir=%s hbmiss=%d sosync=%d sofollow=%d probeupl=%d sotick=%d offstall=%d autoreload=%d crashresume=%d blockvps=%d egress=%d cardcheck=%d cardgrace=%d cardtick=%d cardhost=%s cardval=%s sohost=%s soport=%d appip=%s statip=%s",
+           BS_DYLIB_VER, g_prj,
            g_port, g_tick, g_enable, g_mode == MODE_PROBE ? "probe" : "unlock",
            g_token[0] ? "(set)" : "(none)",
            g_qbuf[0] ? g_qbuf : "(none)", g_mod_dir, g_hb_max,
@@ -3358,6 +3388,43 @@ static int bs_hb_ping(uintptr_t base) {
                             snprintf(g_card_cloud, sizeof(g_card_cloud), "%s", bc);
                             bs_log("[card] cloud deliver received %.20s... (cur=%s)",
                                    bc, g_card_cur[0] ? g_card_cur : "(none)");
+                        }
+                    }
+                }
+                // ★★★★★ v6.60：云端按「卡密所属项目」下发脚本项目名（权威源）。
+                //   云端 card_prj_of_dev() 与 bindcard_deliver() 同源判定 ⇒
+                //   prj 与 bindcard 永远来自同一张卡，不会配错。
+                //   字段缺失（老云端/无卡）= 保持现值，绝不擅自改回 sjz。
+                {
+                    char hj[40];
+                    if (bs_json_pick_str((const unsigned char *)s, n, "prj",
+                                         hj, sizeof(hj)) && hj[0]) {
+                        int okc = 1;
+                        for (const char *q = hj; *q; q++)
+                            if (!(isalnum((unsigned char)*q) || *q == '_' || *q == '-'))
+                                { okc = 0; break; }
+                        if (!okc) {
+                            bs_log("[prj] 云端下发非法项目名 '%s' -> 忽略", hj);
+                        } else if (strcmp(hj, g_prj) != 0) {
+                            char ov[40];
+                            snprintf(ov, sizeof(ov), "%s", g_prj);
+                            snprintf(g_prj_hb, sizeof(g_prj_hb), "%s", hj);
+                            snprintf(g_prj, sizeof(g_prj), "%s", hj);
+                            // 切项目 = 换一整套密钥与脚本包：旧键旧包全部作废
+                            g_mh_cached = 0;
+                            memset(g_mh_kk, 0, sizeof(g_mh_kk));
+                            memset(g_mh_vv, 0, sizeof(g_mh_vv));
+                            g_mh_n = 0;
+                            g_mh_miss[0] = 0;
+                            bs_log("[prj] ★★ 项目切换 %s -> %s（清密钥缓存，"
+                                   "下一次跟版将拉取该项目的包）", ov, hj);
+                            bs_evt("[prj] switch %s -> %s", ov, hj);
+                            if (!g_so_sync)
+                                bs_log("[prj] 注意：sosync=0，不会自动拉新项目的包，"
+                                       "需手动把 sutick 打开或人工投放 beta.so");
+                        } else if (g_prj_hb[0] == 0) {
+                            snprintf(g_prj_hb, sizeof(g_prj_hb), "%s", hj);
+                            bs_log("[prj] 云端确认项目 = %s", hj);
                         }
                     }
                 }
@@ -4677,12 +4744,16 @@ static unsigned char *bs_dl_beta_relay(const char *ip, int port,
     const char *dip = dipbuf;
     bs_log("[so] download via relay %s:%d (%s)", dip, dport, dsrc ? dsrc : "?");
     char surl[512];
+    // ★★★★★ v6.60：下载 URL 必须带 prj —— 否则中控/云端按默认项目 sjz 回包，
+    //   csws 设备会拉到 sjz 的容器 ⇒ `can not find version key!!` ⇒ 脚本死。
     if (g_token[0])
-        snprintf(surl, sizeof(surl), "http://%s:%d/script/beta.so?ver=%s&key=%s",
-                 dip, dport, ver, g_token);
+        snprintf(surl, sizeof(surl),
+                 "http://%s:%d/script/beta.so?prj=%s&ver=%s&key=%s",
+                 dip, dport, BS_PRJ, ver, g_token);
     else
-        snprintf(surl, sizeof(surl), "http://%s:%d/script/beta.so?ver=%s",
-                 dip, dport, ver);
+        snprintf(surl, sizeof(surl),
+                 "http://%s:%d/script/beta.so?prj=%s&ver=%s",
+                 dip, dport, BS_PRJ, ver);
 
     // ★ v6.8：大文件下载必须长超时；★ v6.12：中继失败自动回退直连云端；
     //   ★ v6.58：回退云端前先随机抖 0~30s —— 中继故障时避免全网设备同一
