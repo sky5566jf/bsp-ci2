@@ -42,7 +42,9 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.63" || (echo "MISSING v6.63" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.64" || (echo "MISSING v6.64" && exit 1)
+          strings bs_unlock.dylib | grep -q "prj guard" || (echo "MISSING v6.64 prj guard" && exit 1)
+          strings bs_unlock.dylib | grep -q "prj_name" || (echo "MISSING v6.64 prj_name reader" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6\.61"; then echo "STALE: v6.61 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "peer discovery" || (echo "MISSING relay peer discovery" && exit 1)
           # ★ v6.61 小包项目放闸：csws 官方包仅 124839B，600KB 老闸会判 bad size
@@ -378,13 +380,13 @@ jobs:
           echo "=== probe variant carries the lock banner + own version tag ==="
           strings bs_unlock_probe.dylib | grep -q "probe-locked build, MODE_UNLOCK not compiled" \
             || (echo "MISSING v6.62 probe-lock banner" && exit 1)
-          strings bs_unlock_probe.dylib | grep -q "v6.63p" || (echo "MISSING v6.63p probe version tag" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "v6.64p" || (echo "MISSING v6.64p probe version tag" && exit 1)
 
           echo "=== full build must NOT carry the lock banner (macro really gated) ==="
           if strings bs_unlock.dylib | grep -q "probe-locked build"; then
             echo "FATAL: lock banner leaked into full build (-DBS_PROBE_LOCKED applied globally)" && exit 1
           fi
-          if strings bs_unlock.dylib | grep -q "v6.63p"; then
+          if strings bs_unlock.dylib | grep -q "v6.64p"; then
             echo "FATAL: probe version tag leaked into full build" && exit 1
           fi
 

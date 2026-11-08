@@ -1000,10 +1000,14 @@ static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用�
 // ★★★★★ v6.63（2026-11-08）：/hb 解析云端下发的 code/expire，覆盖厂商 5 点补丁
 //   硬编码的 2038 授权（见 bs_hb / code 解析块的长注释）。
 //   特征串 "cloud code="。
+// ★★★★★ v6.64（2026-11-08 .109 多项目串包事故）：
+//   卡密项目必须成为**运行闸门** —— 盘上 beta.so 的 prj_name 与卡密项目不一致时
+//   禁止 App 加载该包（还原厂商 `run prj name != auth prj name` 校验的失效），
+//   并强制把盘上旧包换成本项目的包。特征串 "prj guard"。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.63p"
+  #define BS_DYLIB_VER     "v6.64p"
 #else
-  #define BS_DYLIB_VER     "v6.63"
+  #define BS_DYLIB_VER     "v6.64"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -1041,6 +1045,119 @@ static size_t bs_so_min_bytes(void) {
     // 默认项目沿用历史闸门；其它项目（csws 等小包项目）放行到 16KB
     return (strcmp(BS_PRJ, "sjz") == 0) ? (size_t)SO_MIN_BYTES
                                         : (size_t)SO_MIN_PRJ_BYTES;
+}
+
+// ================================================================
+// ★★★★★ v6.64（2026-11-08 .109 多项目串包事故）：项目闸门
+//
+//   事故现象：.109 绑的是 csws 卡（SNAILX8KWYTG…，prj=csws），
+//   中控选「三角洲辅助」（0x16 下发 sjz），脚本照样跑起来了 —— 授权形同虚设。
+//
+//   根因（不是卡密验证失效，是**项目维度没有闸门**）：
+//     厂商 App 内部有一道校验（agent 二进制 0x100041403 处）：
+//         if (run prj name != auth prj name) { log("find run prj name not equal
+//                                              auth prj name!"); return; }
+//     其中 run prj name = 中控 0x16 下发的；auth prj name = **当前已加载
+//     beta.so 里记录的 prj_name**（记录 0），不是卡密项目！
+//     ⇒ 只要盘上 beta.so 换成 sjz 的包，auth prj 就变成 sjz，
+//       中控下发 sjz 当然通过 —— 自己跟自己比，永远相等。
+//
+//   我们这边丢的闸门：dylib 的 g_prj 只用来拼 URL，从没校验过
+//   「盘上包的 prj_name 是否等于卡密项目」。而云端 /script 也不按 prj 隔离
+//   ⇒ 设备可以自由拿到任意项目的包 ⇒ 换掉 beta.so 就换掉了 auth prj。
+//
+//   本闸门做三件事：
+//     ① 读盘上 beta.so 记录 0 的 prj_name（厂商同一份数据源）；
+//     ② 与卡密项目 BS_PRJ 比对，不一致 = **越项目运行**；
+//     ③ 越项目期间：写状态文件 + 每拍打日志 + 立刻标记需要重拉本项目的包
+//        （so_sync 会按 BS_PRJ 拉正确包覆盖掉）。
+//   为什么用「标记 + 重拉」而不是直接 ret：脚本是厂商 App 自己加载的，
+//   dylib 没有拦截点；但只要盘上包换回本项目，厂商那道校验就会重新生效
+//   （auth prj 变回 csws，中控再发 sjz 就会被拒）。这是唯一不动 App 的解。
+// ================================================================
+#define PRJ_GUARD_STATE  DATA_DIR "/.bs_prj_guard"
+
+// v6.64：本段在 bs_log/bs_evt 的真身之前，先声明
+static void bs_log(const char *fmt, ...);
+static void bs_evt(const char *fmt, ...);
+static void bs_so_state_write(int pending, const char *md5, long size);
+
+/// 从 beta.so 里读记录 0 的 prj_name。
+///   beta.so 是厂商容器：先找 ASCII 锚串 "prj_name"，其后紧跟的是
+///   JSON/plist 里的值（实测形如  prj_name = sjz;  或  "prj_name":"sjz"）。
+///   找不到锚串 = 老格式/异常包 ⇒ 返回 0（无法判定，闸门放行，不误伤）。
+static int bs_so_read_prjname(const char *path, char *out, size_t outsz) {
+    if (!path || !out || outsz < 2) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > (8L << 20)) { fclose(f); return 0; }
+    unsigned char *b = (unsigned char *)malloc((size_t)sz);
+    if (!b) { fclose(f); return 0; }
+    size_t rn = fread(b, 1, (size_t)sz, f);
+    fclose(f);
+    if (rn != (size_t)sz) { free(b); return 0; }
+
+    int found = 0;
+    const char *anchor = "prj_name";
+    size_t alen = 8;
+    for (size_t i = 0; i + alen + 2 < rn; i++) {
+        if (b[i] != (unsigned char)anchor[0]) continue;
+        if (memcmp(b + i, anchor, alen) != 0) continue;
+        // 锚串之后跳过空白与分隔符，取一个 [A-Za-z0-9_-] 词
+        size_t p = i + alen;
+        while (p < rn && (b[p] == ' ' || b[p] == ':' || b[p] == '=' ||
+                          b[p] == '"' || b[p] == '\'' || b[p] == '\t')) p++;
+        size_t s0 = p;
+        while (p < rn && p - s0 < 31 &&
+               (isalnum(b[p]) || b[p] == '_' || b[p] == '-')) p++;
+        if (p > s0) {
+            size_t n2 = p - s0;
+            if (n2 < outsz) {
+                memcpy(out, b + s0, n2);
+                out[n2] = 0;
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(b);
+    return found;
+}
+
+/// 项目闸门检查：返回 0 = 一致/无法判定（放行），1 = 越项目（拦）。
+///   ★ force_sync=1 时顺便把 so_state 置成「盘上包无效」，迫使 so_sync
+///     按 BS_PRJ 重拉本项目包（云端 v3.53 起也会拒绝串项目的包）。
+static int bs_prj_guard_check(int force_sync) {
+    char ondisk[40] = {0};
+    if (!bs_so_read_prjname(DATA_DIR "/beta.so", ondisk, sizeof(ondisk)))
+        return 0;                                   // 老包/异常包：不误伤
+    if (strcmp(ondisk, BS_PRJ) == 0) {
+        unlink(PRJ_GUARD_STATE);
+        return 0;
+    }
+    // 越项目
+    static char last_warn[64] = {0};
+    char sig[64];
+    snprintf(sig, sizeof(sig), "%s>%s", ondisk, BS_PRJ);
+    if (strcmp(last_warn, sig) != 0) {
+        snprintf(last_warn, sizeof(last_warn), "%s", sig);
+        bs_log("[prj guard] ★★ 盘上 beta.so 属于项目 '%s'，但本机卡密项目是 '%s'"
+               " -> 越项目，禁止当成本项目包使用，强制重拉", ondisk, BS_PRJ);
+        bs_evt("[prj guard] on-disk=%s card=%s -> mismatch, force resync", ondisk, BS_PRJ);
+    }
+    FILE *g = fopen(PRJ_GUARD_STATE, "w");
+    if (g) {
+        fprintf(g, "disk=%s\ncard=%s\nts=%ld\n", ondisk, BS_PRJ, (long)time(NULL));
+        fclose(g);
+    }
+    if (force_sync) {
+        // 把 so_state 的 md5 清空 ⇒ bs_so_state_read 之后 so_sync 判定不一致
+        bs_so_state_write(1, "", 0);
+    }
+    return 1;
 }
 
 // ★ 运行时配置：PULL_CONF（键=值，一行一个，可缺省）
@@ -3512,6 +3629,13 @@ static int bs_hb_ping(uintptr_t base) {
                         }
                     }
                 }
+                // ★★★★★ v6.64：每拍过项目闸门。
+                //   项目切换那一拍只清了密钥缓存，盘上还是旧项目的包 ——
+                //   在跟版成功把包换掉之前，这台设备跑的是「别的项目的脚本」，
+                //   而厂商的 prj 校验也正因为包被换掉而失效（自己跟自己比）。
+                //   这里每拍复查一次：不一致就让 so_state 失效 + 打日志 + 留状态文件，
+                //   跟版线程下一轮就会按当前 BS_PRJ 拉正确包覆盖，校验随之恢复。
+                bs_prj_guard_check(1);
                 // ★★★★★ v6.63（2026-11-08）：云端授权判定下发 —— 覆盖厂商 2038。
                 //
                 // 背景：厂商 Agent 二进制被 5 点补丁把 g_agent_auth_valid_time
@@ -5115,6 +5239,12 @@ static void bs_so_repair_if_dirty(const char *ip, int port, const char *verhex) 
 static void bs_so_sync_once(void) {
     char lver[8] = {0};
     int have_local = bs_read_beta_ver(lver, sizeof(lver));
+    // ★★★★★ v6.64：跟版前先过项目闸门。
+    //   盘上 beta.so 若属于别的项目（卡密换成 csws、盘上还是 sjz，或反之），
+    //   这台设备的「auth prj」就被盘上包劫持了 —— 厂商那道
+    //   `run prj name != auth prj name` 会自己跟自己比，永远通过。
+    //   闸门命中 ⇒ 把 so_state 判为无效，逼本轮按 BS_PRJ 重拉本项目正版包。
+    bs_prj_guard_check(1);
     // ★★★ v6.38：本地 beta.so 读不到（缺失/权限/视图差异）**不再直接放弃**。
     //   旧写法是 `return`，于是设备进入「自愈真空」：
     //     厂商 App 在「停止 → 运行」时会重建本地运行库（snail module），
@@ -9117,8 +9247,7 @@ static void *bs_cardwatch(void *arg) {
         if (!verdict_ok && g_card_expire > 0 && g_card_lastok > 0 &&
             now < g_card_lastok + (long)g_cardgrace * 3600) verdict_ok = 1;
 
-        // 从未激活过 & 没有卡 → 封禁（cardcheck=1 的设备必须先输卡）
-        //
+        // 从未激活过 & 没有卡 → 封禁（cardcheck=1 的设备必须先输卡）        //
         // ★★★★ v6.42：设备码 PENDING 期间**不否决** —— v6.41 起 bs_card_login 在
         //   devid 为空时直接 return -1（绝不上报空 device_id），此时本机根本没拿到
         //   任何服务端裁决。把「没裁决」当成「卡无效」是误判：一次正常冷启
@@ -9146,6 +9275,34 @@ static void *bs_cardwatch(void *arg) {
         } else {
             blocked    = 1;
             pend_since = 0;
+        }
+
+        // ★★★★★ v6.64（2026-11-08 .109 事故）：**项目闸门也是封禁条件**。
+        //   卡有效（verdict_ok=1）但盘上 beta.so 属于别的项目时，实际在跑的是
+        //   别人的脚本 —— 这正是 .109「csws 卡却跑起来了 sjz 脚本」的形态。
+        //   厂商那道校验（run prj == auth prj）此时自己跟自己比，永远通过，
+        //   所以必须由我们把「越项目」当成无效授权处理：
+        //     · 关闸门（不注入模块、不允许自动恢复）
+        //     · 发 OPER_STOP 停掉正在跑的脚本
+        //     · 每拍打日志；跟版线程会按 BS_PRJ 重拉本项目包，包到位后自动解除
+        //   ★ 只在 cardcheck=1（有卡密体系）时生效；cardcheck=0 的纯解锁机不碰。
+        if (g_cardcheck && !blocked && verdict_ok) {
+            static int prj_blocked = 0;
+            if (bs_prj_guard_check(0)) {
+                if (!prj_blocked) {
+                    prj_blocked = 1;
+                    bs_log("[prj guard] ★★ 越项目运行：卡密项目=%s ≠ 盘上包项目，"
+                           "按未授权处理 -> OPER_STOP", BS_PRJ);
+                    bs_evt("[prj guard] mismatch -> treated as unauthorized");
+                    if (base)
+                        ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
+                }
+                blocked = 1;
+            } else if (prj_blocked) {
+                prj_blocked = 0;
+                bs_log("[prj guard] 盘上包已回到本项目 %s -> 解除", BS_PRJ);
+                bs_evt("[prj guard] resolved (on-disk == %s)", BS_PRJ);
+            }
         }
 
         if (blocked != prev_blocked) {
