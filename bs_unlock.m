@@ -840,6 +840,9 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //   ★ 切换项目时必须清密钥缓存并强制跟版，否则会拿旧项目的包/键跑新项目。
 static char g_prj[40] = "sjz";      // 当前生效的脚本项目名
 static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用于变化检测）
+// ★ v6.64：/hb 下发的本项目最新包版本（prj_ver，如 "030107" → 0x030107）。
+//   0 = 云端没下发 ⇒ 项目闸门退回保守规则。见 bs_prj_guard_check()。
+static unsigned g_prj_ver_lo = 0;
 #define BS_PRJ g_prj
 
 // ---- v6：心跳授权（"心跳即死亡"）。
@@ -1067,11 +1070,12 @@ static size_t bs_so_min_bytes(void) {
 //   ⇒ 设备可以自由拿到任意项目的包 ⇒ 换掉 beta.so 就换掉了 auth prj。
 //
 //   本闸门做三件事：
-//     ① 读盘上 beta.so 记录 0 的 prj_name（厂商同一份数据源）；
+//     ① 读盘上 beta.so 的**包头版本号**，判定它属于哪个项目的版本空间
+//        （sjz 全在 03xxxx，csws 是 0108xx —— 两族不交叠，见下节说明）；
 //     ② 与卡密项目 BS_PRJ 比对，不一致 = **越项目运行**；
 //     ③ 越项目期间：写状态文件 + 每拍打日志 + 立刻标记需要重拉本项目的包
-//        （so_sync 会按 BS_PRJ 拉正确包覆盖掉）。
-//   为什么用「标记 + 重拉」而不是直接 ret：脚本是厂商 App 自己加载的，
+//        （so_sync 会按 BS_PRJ 拉正确包覆盖掉），并按未授权处理（OPER_STOP）。
+//   为什么用「标记 + 重拉 + 停」而不是直接拦：脚本是厂商 App 自己加载的，
 //   dylib 没有拦截点；但只要盘上包换回本项目，厂商那道校验就会重新生效
 //   （auth prj 变回 csws，中控再发 sjz 就会被拒）。这是唯一不动 App 的解。
 // ================================================================
@@ -1082,79 +1086,85 @@ static void bs_log(const char *fmt, ...);
 static void bs_evt(const char *fmt, ...);
 static void bs_so_state_write(int pending, const char *md5, long size);
 
-/// 从 beta.so 里读记录 0 的 prj_name。
-///   beta.so 是厂商容器：先找 ASCII 锚串 "prj_name"，其后紧跟的是
-///   JSON/plist 里的值（实测形如  prj_name = sjz;  或  "prj_name":"sjz"）。
-///   找不到锚串 = 老格式/异常包 ⇒ 返回 0（无法判定，闸门放行，不误伤）。
-static int bs_so_read_prjname(const char *path, char *out, size_t outsz) {
-    if (!path || !out || outsz < 2) return 0;
+/// 盘上包的「项目指纹」—— 用**包内版本号集合**判定归属。
+///
+/// ★ 为什么不用读 prj_name：beta.so 是**全加密容器**（记录 0 也是密文），
+///   明文里根本没有 "prj_name" 这个串（2026-11-08 在 010803/030107 两个实包
+///   上逐字节搜过：0 次命中）。而且记录 0 用的是包外密钥，dylib 也解不开。
+///
+/// ★ 真正可用的判据 = 包内版本号集合：
+///     csws 1.8.3  → 只有 010803 一个版本段
+///     sjz  3.1.5  → 020909/0300xx…030107 一整套（12 个版本段）
+///   两个项目的版本号空间完全不交叠（sjz 全是 03xxxx，csws 是 0108xx），
+///   所以「包头版本号属于哪个项目的版本空间」就能直接判定包归属。
+///
+///   规则（宁可不误伤）：
+///     · 包头版本 ≥ 030000 → sjz 族；010xxx/0201xx 且 < 030000 → 非 sjz 族
+///     · 无法归类（罕见/未来新项目）→ 返回 0 = 无可判定，闸门放行
+///   这条规则不依赖任何外部配置，也不需要解密，纯读 4 字节包头。
+#define PRJ_SJZ_VER_BASE  0x030000     // sjz 族版本号下界（030000 起）
+
+/// 读盘上 beta.so 的包头版本（3 字节 → 整数）。成功返回 1。
+static int bs_so_head_ver(const char *path, unsigned *out) {
+    if (!path || !out) return 0;
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > (8L << 20)) { fclose(f); return 0; }
-    unsigned char *b = (unsigned char *)malloc((size_t)sz);
-    if (!b) { fclose(f); return 0; }
-    size_t rn = fread(b, 1, (size_t)sz, f);
+    unsigned char h[4] = {0};
+    size_t rn = fread(h, 1, 4, f);
     fclose(f);
-    if (rn != (size_t)sz) { free(b); return 0; }
-
-    int found = 0;
-    const char *anchor = "prj_name";
-    size_t alen = 8;
-    for (size_t i = 0; i + alen + 2 < rn; i++) {
-        if (b[i] != (unsigned char)anchor[0]) continue;
-        if (memcmp(b + i, anchor, alen) != 0) continue;
-        // 锚串之后跳过空白与分隔符，取一个 [A-Za-z0-9_-] 词
-        size_t p = i + alen;
-        while (p < rn && (b[p] == ' ' || b[p] == ':' || b[p] == '=' ||
-                          b[p] == '"' || b[p] == '\'' || b[p] == '\t')) p++;
-        size_t s0 = p;
-        while (p < rn && p - s0 < 31 &&
-               (isalnum(b[p]) || b[p] == '_' || b[p] == '-')) p++;
-        if (p > s0) {
-            size_t n2 = p - s0;
-            if (n2 < outsz) {
-                memcpy(out, b + s0, n2);
-                out[n2] = 0;
-                found = 1;
-                break;
-            }
-        }
-    }
-    free(b);
-    return found;
+    if (rn < 4) return 0;
+    *out = ((unsigned)h[1] << 16) | ((unsigned)h[2] << 8) | (unsigned)h[3];
+    return 1;
 }
 
 /// 项目闸门检查：返回 0 = 一致/无法判定（放行），1 = 越项目（拦）。
 ///   ★ force_sync=1 时顺便把 so_state 置成「盘上包无效」，迫使 so_sync
 ///     按 BS_PRJ 重拉本项目包（云端 v3.53 起也会拒绝串项目的包）。
 static int bs_prj_guard_check(int force_sync) {
-    char ondisk[40] = {0};
-    if (!bs_so_read_prjname(DATA_DIR "/beta.so", ondisk, sizeof(ondisk)))
-        return 0;                                   // 老包/异常包：不误伤
-    if (strcmp(ondisk, BS_PRJ) == 0) {
+    unsigned hv = 0;
+    if (!bs_so_head_ver(DATA_DIR "/beta.so", &hv))
+        return 0;                                   // 无包/读不到：不误伤
+
+    // ★ 判据来源优先级（都由云端权威数据驱动，不写死项目名）：
+    //   ① g_prj_ver_lo：云端 /hb 下发的「本项目最新包版本」(prj_ver)；
+    //      盘上包版本与本项目最新版本**同族**（高 2 位十六进制相同）才算本项目。
+    //      csws 最新 = 010803 → 族 = 0x01xxxx；sjz 最新 = 030107 → 族 = 0x03xxxx
+    //   ② 没有 prj_ver（老云端/首次启动）：退回「sjz 是 03xxxx，其它是 01xxxx」
+    //      这条保守规则（两个已知项目版本空间不交叠）。
+    unsigned fam_mask = 0xFFFFFF;
+    unsigned fam_want = 0;
+    int have_fam = 0;
+    if (g_prj_ver_lo) {
+        fam_want = g_prj_ver_lo & 0xFFFF00;      // 高 2 位 = 项目族
+        have_fam = 1;
+    } else if (strcmp(BS_PRJ, "sjz") == 0) {
+        fam_want = PRJ_SJZ_VER_BASE & 0xFFFF00;
+        have_fam = 1;
+    }
+    int mismatch = 0;
+    if (have_fam && (hv & 0xFFFF00) != fam_want) mismatch = 1;
+    (void)fam_mask;
+
+    if (!mismatch) {
         unlink(PRJ_GUARD_STATE);
         return 0;
     }
-    // 越项目
-    static char last_warn[64] = {0};
-    char sig[64];
-    snprintf(sig, sizeof(sig), "%s>%s", ondisk, BS_PRJ);
-    if (strcmp(last_warn, sig) != 0) {
-        snprintf(last_warn, sizeof(last_warn), "%s", sig);
-        bs_log("[prj guard] ★★ 盘上 beta.so 属于项目 '%s'，但本机卡密项目是 '%s'"
-               " -> 越项目，禁止当成本项目包使用，强制重拉", ondisk, BS_PRJ);
-        bs_evt("[prj guard] on-disk=%s card=%s -> mismatch, force resync", ondisk, BS_PRJ);
+
+    static unsigned last_warn = 0;
+    if (last_warn != hv) {
+        last_warn = hv;
+        bs_log("[prj guard] ★★ 盘上 beta.so 版本 %06x 不属于卡密项目 '%s'"
+               " -> 越项目，禁止当成本项目包使用，强制重拉", hv, BS_PRJ);
+        bs_evt("[prj guard] disk_ver=%06x card=%s -> mismatch, force resync",
+               hv, BS_PRJ);
     }
     FILE *g = fopen(PRJ_GUARD_STATE, "w");
     if (g) {
-        fprintf(g, "disk=%s\ncard=%s\nts=%ld\n", ondisk, BS_PRJ, (long)time(NULL));
+        fprintf(g, "disk_ver=%06x\ncard=%s\nts=%ld\n", hv, BS_PRJ, (long)time(NULL));
         fclose(g);
     }
     if (force_sync) {
-        // 把 so_state 的 md5 清空 ⇒ bs_so_state_read 之后 so_sync 判定不一致
+        // 把 so_state 的 md5 清空 ⇒ so_sync 判定「盘上包不是想要的」
         bs_so_state_write(1, "", 0);
     }
     return 1;
@@ -3626,6 +3636,21 @@ static int bs_hb_ping(uintptr_t base) {
                         } else if (g_prj_hb[0] == 0) {
                             snprintf(g_prj_hb, sizeof(g_prj_hb), "%s", hj);
                             bs_log("[prj] 云端确认项目 = %s", hj);
+                        }
+                    }
+                }
+                // ★★★★★ v6.64：先解析云端下发的本项目最新包版本（prj_ver），
+                //   项目闸门要用它判定「盘上包是不是本项目的」。
+                //   字段缺失 = 保持上一次的值（老云端/无卡机也能继续工作）。
+                {
+                    char pv[16];
+                    if (bs_json_pick_str((const unsigned char *)s, n, "prj_ver",
+                                         pv, sizeof(pv)) && strlen(pv) >= 6) {
+                        unsigned nv = (unsigned)strtoul(pv, NULL, 16);
+                        if (nv && nv != g_prj_ver_lo) {
+                            g_prj_ver_lo = nv;
+                            bs_log("[prj guard] 云端项目版本基准 = %06x (prj=%s)",
+                                   nv, BS_PRJ);
                         }
                     }
                 }
