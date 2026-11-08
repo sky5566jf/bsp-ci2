@@ -996,10 +996,13 @@ static char g_prj_hb[40] = {0};     // /hb 最近一次下发的项目名（用�
 // ★ v6.53：云端下发卡密（换绑免手输，配套 bsmod v3.36）。特征串 "cloud deliver"。
 // ★★★★★ v6.62（2026-11-08）：probe 变体编译期硬锁（见 MODE_* 宏处的长注释）。
 //   变体标识进版本串，现场一眼能分清装的是不是锁定版：v6.62（正式）/ v6.62p（probe 锁死）。
+// ★★★★★ v6.63（2026-11-08）：/hb 解析云端下发的 code/expire，覆盖厂商 5 点补丁
+//   硬编码的 2038 授权（见 bs_hb / code 解析块的长注释）。
+//   特征串 "cloud code="。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.62p"
+  #define BS_DYLIB_VER     "v6.63p"
 #else
-  #define BS_DYLIB_VER     "v6.62"
+  #define BS_DYLIB_VER     "v6.63"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -2791,6 +2794,9 @@ static uintptr_t bs_find_base(void) {
 
 // ---------------------------------------------------------------- 模块注入
 static int bs_inject_modules(uintptr_t base);
+// ★ v6.63：/hb 下发 code 后要覆盖厂商授权，这两个写入函数定义在后面（8238+），此处前置声明
+static void bs_sync_vendor_expire(void);
+static void bs_sync_vendor_auth_state(int ok);
 
 // ---------------------------------------------------------------- v5 拉取
 // ---- md5（自实现，避免依赖 CommonCrypto 的链接细节）
@@ -3483,6 +3489,53 @@ static int bs_hb_ping(uintptr_t base) {
                         } else if (g_prj_hb[0] == 0) {
                             snprintf(g_prj_hb, sizeof(g_prj_hb), "%s", hj);
                             bs_log("[prj] 云端确认项目 = %s", hj);
+                        }
+                    }
+                }
+                // ★★★★★ v6.63（2026-11-08）：云端授权判定下发 —— 覆盖厂商 2038。
+                //
+                // 背景：厂商 Agent 二进制被 5 点补丁把 g_agent_auth_valid_time
+                //   硬编码成 0x7FFF0000（2038-01-19），g_agent_auth_state 恒 0（已授权）。
+                //   我们的 dylib 以前不纠正它 ⇒「无卡设备也显示已授权到 2038，还能跑脚本」。
+                //   云端 v3.52 起在 /hb 应答里带 code/expire，这里据此覆盖。
+                //
+                // code 语义（与云端 card_verdict 一一对应）：
+                //   0 → 已授权，expire = 真实到期（0 = 永久卡）
+                //   3 → 未授权（无卡 / 过期 / 冻结 / 拉黑）；expire>0 时保留用于显示到期日
+                //   1 → 未知设备（devid 非法）
+                //   7 → 卡归属冲突，交给既有 bindcard / 卡密冲突逻辑，这里不动
+                //   ★ 字段缺失 = 维持上一态（宽限），保持与既有语义一致
+                //
+                // ★ 只在 cardcheck=1 时生效：cardcheck=0 = 不做卡密校验（纯解锁/调试机），
+                //   此时不应被云端降级。
+                {
+                    char cdv[16];
+                    if (bs_json_pick_str((const unsigned char *)s, n, "code",
+                                         cdv, sizeof(cdv)) && cdv[0]) {
+                        int hbcode = atoi(cdv);
+                        char expv[24];
+                        long hbexp = 0;
+                        if (bs_json_pick_str((const unsigned char *)s, n, "expire",
+                                             expv, sizeof(expv)))
+                            hbexp = strtol(expv, NULL, 10);
+                        if (hbcode == 0) {
+                            if ((long)g_card_expire != hbexp) {
+                                bs_log("[hb] ★ cloud code=0 expire=%ld -> 覆盖厂商授权",
+                                       hbexp);
+                                g_card_expire = hbexp;
+                            }
+                            bs_sync_vendor_expire();
+                            bs_sync_vendor_auth_state(1);
+                        } else if (hbcode == 3 || hbcode == 1) {
+                            if ((long)g_card_expire != hbexp) {
+                                bs_log("[hb] ★ cloud code=%d (未授权, expire=%ld)",
+                                       hbcode, hbexp);
+                                g_card_expire = hbexp;
+                            }
+                            bs_sync_vendor_expire();
+                            bs_sync_vendor_auth_state(0);
+                        } else if (hbcode == 7) {
+                            bs_log("[hb] cloud code=7 (卡密冲突) -> 交 bindcard 逻辑");
                         }
                     }
                 }
