@@ -3540,7 +3540,7 @@ static int bs_hb_ping(uintptr_t base) {
                             hbexp = strtol(expv, NULL, 10);
                         if (hbcode == 0) {
                             if ((long)g_card_expire != hbexp) {
-                                bs_log("[hb] ★ cloud code=0 expire=%ld -> 覆盖厂商授权",
+                                bs_log("[hb] * cloud code=0 expire=%ld -> shadow vendor auth",
                                        hbexp);
                                 g_card_expire = hbexp;
                             }
@@ -3548,7 +3548,7 @@ static int bs_hb_ping(uintptr_t base) {
                             bs_sync_vendor_auth_state(1);
                         } else if (hbcode == 3 || hbcode == 1) {
                             if ((long)g_card_expire != hbexp) {
-                                bs_log("[hb] ★ cloud code=%d (未授权, expire=%ld)",
+                                bs_log("[hb] * cloud code=%d unauthorized (expire=%ld)",
                                        hbcode, hbexp);
                                 g_card_expire = hbexp;
                             }
