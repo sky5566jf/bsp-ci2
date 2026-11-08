@@ -39,6 +39,8 @@ jobs:
       #   断言 C 组：人停 / 封禁 / 超窗 三种情况必须仍然 gate（防「修完变成人停也拉」）
       - name: Netloss resume state machine test
         run: python3 _netloss_test.py
+      - name: Project gate table test
+        run: python3 _prjguard_test.py
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)

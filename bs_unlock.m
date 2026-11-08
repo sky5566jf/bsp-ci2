@@ -1131,19 +1131,20 @@ static int bs_prj_guard_check(int force_sync) {
     //      csws 最新 = 010803 → 族 = 0x01xxxx；sjz 最新 = 030107 → 族 = 0x03xxxx
     //   ② 没有 prj_ver（老云端/首次启动）：退回「sjz 是 03xxxx，其它是 01xxxx」
     //      这条保守规则（两个已知项目版本空间不交叠）。
-    unsigned fam_mask = 0xFFFFFF;
+    //   ★ 掩码必须是 0xFF0000（高 2 位十六进制）：0x030107 & 0xFF0000 = 0x030000。
+    //     用 0xFFFF00 会留下第 3 位（=0x030100），同项目不同小版本会被误判成越项目
+    //     —— 这个坑本地用例当场抓到了，改前务必保持 0xFF0000。
     unsigned fam_want = 0;
     int have_fam = 0;
     if (g_prj_ver_lo) {
-        fam_want = g_prj_ver_lo & 0xFFFF00;      // 高 2 位 = 项目族
+        fam_want = g_prj_ver_lo & 0xFF0000;      // 高 2 位 = 项目族
         have_fam = 1;
     } else if (strcmp(BS_PRJ, "sjz") == 0) {
-        fam_want = PRJ_SJZ_VER_BASE & 0xFFFF00;
+        fam_want = PRJ_SJZ_VER_BASE & 0xFF0000;  // 0x030000
         have_fam = 1;
     }
     int mismatch = 0;
-    if (have_fam && (hv & 0xFFFF00) != fam_want) mismatch = 1;
-    (void)fam_mask;
+    if (have_fam && (hv & 0xFF0000) != fam_want) mismatch = 1;
 
     if (!mismatch) {
         unlink(PRJ_GUARD_STATE);
