@@ -819,7 +819,8 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 //
 //   → v6.2 起：默认直连 BS_HOST_DEF（公网模块服务端），**完全不碰 app.plist**。
 //     需要临时换服务端时，在 bs_pull.conf 写 `host=1.2.3.4` 即可覆盖（无需重编译）。
-#define BS_HOST_DEF "47.116.161.226"   // ★ v6.16：云端迁移（老 47.243.156.129 弃用）
+#define BS_HOST_DEF "8.153.176.121"    // ★ v6.63：云端迁移到新机 8.153.176.121
+//   （v6.16 曾为 47.116.161.226；conf 的 host= 仍可覆盖，此处只是新装机的默认值）
 
 // ★★★★★ v6.60（2026-11-08 用户定策）：脚本项目名 **运行期可配**。
 //
@@ -1143,7 +1144,9 @@ static long long     g_ek_scan_mtime = -1;
 
 // ★ v6.20：自有卡密系统（v3 并入 BSModuleServer，同协议 /api/client/login）
 //   v6.23h：默认 host 18095(CardVault 弃用)→47391(bsmod v3 卡密，2026-10-03)
-#define CARD_HOST_DEF  "47.116.161.226:47391"
+// ★ v6.63：卡密服务地址 —— 新机走 nginx 收口端口 38471（不是后端 47391）。
+//   ★ 必须带端口：g_card_host 直接拼在 "http://%s%s" 后面，不像 host 会另补 :%d。
+#define CARD_HOST_DEF  "8.153.176.121:38471"
 #define CARD_KEY_DEF   "ak_ba5f7a4ae954dadbb2eaa82ae237967587212d4a6efb0ef4"
 #define CARD_PATH      "/api/client/login"
 static char          g_card_host[64]  = CARD_HOST_DEF;
@@ -1424,7 +1427,7 @@ static int           g_off_hb_stall_logged = 0;  // ★v6.25g：心跳首次带�
 static volatile int  g_off_egress    = 1;   // conf egress=（1=白名单，0=放行）
 static volatile long g_off_n_deny    = 0;   // 被拒的 TCP 出站数
 static volatile long g_off_n_deny_u  = 0;   // 被拒的 UDP 出站数
-static uint32_t      g_off_cloud_net = 0;   // 47.116.161.226（网络序）
+static uint32_t      g_off_cloud_net = 0;   // 我们云端（网络序，v6.63 起取运行期 g_host）
 static uint32_t      g_off_pc_net    = 0;   // 中控 IP（网络序，0=未知）
 static long          g_off_pc_ts     = 0;   // 中控 IP 缓存时间戳
 static uint32_t      g_off_so_net    = 0;   // conf sohost 解析结果（beta.so 独立源）
@@ -2082,7 +2085,17 @@ static int off_egress_ok(uint32_t nip) {
     uint32_t h;
     if (!g_off_egress) return 1;                       // 逃生门：全放行
     if (!nip) return 0;
-    if (!g_off_cloud_net) g_off_cloud_net = inet_addr(BS_HOST_DEF);
+    // ★★★★★ v6.63：白名单必须用**运行期** g_host，不能用编译期 BS_HOST_DEF。
+    //   原来的写法 `if (!g_off_cloud_net) g_off_cloud_net = inet_addr(BS_HOST_DEF);`
+    //   有两个坑：
+    //   ① conf 写了 host=<新机> 也不生效 —— 白名单仍然只放行编译期那个 IP；
+    //   ② `if (!x)` 缓存只算一次，conf 后改 host 也不会重算。
+    //   表现：offline=1 && egress=1 的设备换云端后「连不上且日志看不出原因」（全被静默拦掉）。
+    //   现在改为：优先 g_host（conf 覆盖后），拿不到才回落编译期默认值。
+    if (!g_off_cloud_net) {
+        if (g_host[0]) g_off_cloud_net = inet_addr(g_host);
+        if (!g_off_cloud_net) g_off_cloud_net = inet_addr(BS_HOST_DEF);
+    }
     h = ntohl(nip);
     if ((h >> 24) == 127) return 1;                    // 回环：厂商 server1 在本地
     if (g_off_cloud_net && nip == g_off_cloud_net) return 1;   // 我们云端（hb/pull/card）
@@ -2481,6 +2494,13 @@ static void bs_load_conf(void) {
         }
     }
     fclose(f);
+
+    // ★★★★★ v6.63：conf 解析完，失效离线白名单的地址缓存。
+    //   off_egress_ok() 里是 `if (!g_off_cloud_net)` 才计算 —— 不在这里清，
+    //   conf 改了 host=/sohost= 也不会重算，白名单会一直用旧地址。
+    //   （这是 v6.63 一并修的坑：offline=1 设备换云端后「静默连不上」的根因）
+    g_off_cloud_net = 0;
+    g_off_so_net    = 0;
 
     // ★★★ v6.29：token 为空自愈（必须在下面拼 g_qbuf 之前，否则首轮 /hb 仍是空 key）
     bs_token_selfheal();
