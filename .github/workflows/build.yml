@@ -46,7 +46,8 @@ jobs:
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
           strings bs_unlock.dylib | grep -q "v6.64" || (echo "MISSING v6.64" && exit 1)
           strings bs_unlock.dylib | grep -q "prj guard" || (echo "MISSING v6.64 prj guard" && exit 1)
-          strings bs_unlock.dylib | grep -q "prj_name" || (echo "MISSING v6.64 prj_name reader" && exit 1)
+          strings bs_unlock.dylib | grep -q "disk_ver=%06x card=%s" || (echo "MISSING v6.64 prj mismatch event" && exit 1)
+          strings bs_unlock.dylib | grep -q "cloud prj ver base" || (echo "MISSING v6.64 prj_ver base log" && exit 1)
           if strings bs_unlock.dylib | grep -q "v6\.61"; then echo "STALE: v6.61 banner still present" && exit 1; fi
           strings bs_unlock.dylib | grep -q "peer discovery" || (echo "MISSING relay peer discovery" && exit 1)
           # ★ v6.61 小包项目放闸：csws 官方包仅 124839B，600KB 老闸会判 bad size

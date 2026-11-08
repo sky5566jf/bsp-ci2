@@ -1154,8 +1154,8 @@ static int bs_prj_guard_check(int force_sync) {
     static unsigned last_warn = 0;
     if (last_warn != hv) {
         last_warn = hv;
-        bs_log("[prj guard] ★★ 盘上 beta.so 版本 %06x 不属于卡密项目 '%s'"
-               " -> 越项目，禁止当成本项目包使用，强制重拉", hv, BS_PRJ);
+        bs_log("[prj guard] ★★ disk beta.so ver %06x != card prj '%s'"
+               " -> cross-project, refuse as own pkg, force resync", hv, BS_PRJ);
         bs_evt("[prj guard] disk_ver=%06x card=%s -> mismatch, force resync",
                hv, BS_PRJ);
     }
@@ -3650,7 +3650,7 @@ static int bs_hb_ping(uintptr_t base) {
                         unsigned nv = (unsigned)strtoul(pv, NULL, 16);
                         if (nv && nv != g_prj_ver_lo) {
                             g_prj_ver_lo = nv;
-                            bs_log("[prj guard] 云端项目版本基准 = %06x (prj=%s)",
+                            bs_log("[prj guard] cloud prj ver base = %06x (prj=%s)",
                                    nv, BS_PRJ);
                         }
                     }
@@ -9317,8 +9317,8 @@ static void *bs_cardwatch(void *arg) {
             if (bs_prj_guard_check(0)) {
                 if (!prj_blocked) {
                     prj_blocked = 1;
-                    bs_log("[prj guard] ★★ 越项目运行：卡密项目=%s ≠ 盘上包项目，"
-                           "按未授权处理 -> OPER_STOP", BS_PRJ);
+                    bs_log("[prj guard] ★★ cross-project run: card prj=%s"
+                           " != on-disk pkg -> treated as UNAUTHORIZED, OPER_STOP", BS_PRJ);
                     bs_evt("[prj guard] mismatch -> treated as unauthorized");
                     if (base)
                         ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
@@ -9326,7 +9326,7 @@ static void *bs_cardwatch(void *arg) {
                 blocked = 1;
             } else if (prj_blocked) {
                 prj_blocked = 0;
-                bs_log("[prj guard] 盘上包已回到本项目 %s -> 解除", BS_PRJ);
+                bs_log("[prj guard] on-disk pkg back to card prj %s -> resolved", BS_PRJ);
                 bs_evt("[prj guard] resolved (on-disk == %s)", BS_PRJ);
             }
         }
