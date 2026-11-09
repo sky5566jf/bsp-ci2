@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.70p"
+  #define BS_DYLIB_VER     "v6.71p"
 #else
-  #define BS_DYLIB_VER     "v6.70"
+  #define BS_DYLIB_VER     "v6.71"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -8735,7 +8735,7 @@ static void bs_wipe_onion_dict(uintptr_t base) {
 }
 
 /// 返回 0=ok（g_card_expire 已更新）；-1=网络失败；业务码原值返回。
-static void bs_note_push_now(void);   // ★ v6.65（实现在 bs_center_note_send 之后）
+static void bs_note_push_now(void);   // ★ v6.65 定义；v6.71 起调用点已删（保留备用）
 static long bs_card_login(const char *card, int act_new) {
     // ★★★★ v6.41：设备号未就位时**绝不上报**。旧版会发 `"device_id":""`，
     //   服务端按空 device 记账；等真值到位后整台机在库里看起来像换了设备
@@ -8798,14 +8798,27 @@ static long bs_card_login(const char *card, int act_new) {
         bs_log("[card] login OK expire=%ld lastok=%ld (%.20s...)",
                g_card_expire, g_card_lastok, card);
         bs_sync_vendor_expire();          // ★ v6.22：激活即同步中控显示
-        // ★★★★★ v6.65（2026-11-09 用户诉求「输卡要等一会儿才显示授权时间」）：
-        //   两列就地翻新，不等厂商状态包（它只在自身状态变化时发，最坏 30~60s）。
-        //   · bs_sync_vendor_auth_state(1) 写 g_agent_auth_state → 「授权」列
-        //   · bs_note_push_now() 立刻发 0x07 状态包（[8:12]=到期、[7]=运行态）
-        //     → 「授权到期时间」列；必须复用 App 那条 34878 连接，新 TCP 会被丢
-        //   · g_pull_now 叫醒 puller，模块/包立即重拉，不等 60s 整拍
+        // ★★★★★ v6.71（2026-11-09 用户拍板「恢复零发包」）：**删掉 v6.65 的主动推包**。
+        //
+        //   v6.65 曾在这里加 `bs_note_push_now()`（激活即推 0x07 包，让授权时间秒显）。
+        //   但它放在 `rc==0` 分支里，而**心跳也走 bs_card_login 且每次返回 rc==0**
+        //   ⇒ 每 120 秒推一次包 ⇒ 每次都用我们的 `pkt[7]` 覆盖 BBCenter 的「运行」列。
+        //   而 `[7]` 这一字节被运行列与授权列同时读取，物理上不可能让两列都对：
+        //     [7]=1 → 运行列「运行」✅ / 授权列「未授权」❌
+        //     [7]=0 → 运行列「空闲」❌ / 授权列「已授权」✅
+        //   用户实测（8112，11-09）：脚本确在跑（run=1 st 有效），中控运行列却是「空闲」。
+        //
+        //   ★ 这直接违反了 v6.52 定下的铁律：「**非冲突态一个包都不发**」——
+        //     平时零发包 ⇒ 运行列/连接列完全由原厂自己维护 ⇒ 零干扰。
+        //     v6.65 只看 v6.50 那半段注释（[7] 填真实运行态），忘了 v6.52 的收敛。
+        //
+        //   现实代价（用户已知悉并接受）：输卡后中控「授权到期时间」列
+        //   要等原厂自己的状态包（最坏 30~60s）才显示，不再是"秒显"。
+        //   —— 这换回了「运行列永远正确」，值得。
+        //
+        //   ★ 备注列不受影响：卡密冲突态仍由 bs_center_note_tick() 独立发包
+        //     （那是"我必须发"的场景，且冲突时授权本就异常，[7] 填 0 是对的）。
         bs_sync_vendor_auth_state(1);
-        bs_note_push_now();
         g_pull_now = 1;
     } else {
         bs_log("[card] login FAIL code=%ld msg=%s (http=%ld)", rc, msg, code);
@@ -9039,7 +9052,12 @@ static int __attribute__((unused)) bs_note_verdict_ok(long now) {
 /// BBCenter `RVA 0xb2a4` 收到即刷「授权/到期」两列。
 ///
 /// 只在**激活成功**这一个点调用（不是每拍），频率可忽略。
-static void bs_note_push_now(void) {
+///
+/// ★ v6.71：调用点已删除（恢复 v6.52 的「非冲突态零发包」）。
+///   函数**保留**下来：① 作为备用通道，将来若找到"既刷授权列又不碰运行列"的
+///   正确字段，可直接复用；② 避免一次性删掉大段逻辑带来的回归风险。
+///   加 unused 属性防 -Wunused-function 告警。
+static void __attribute__((unused)) bs_note_push_now(void) {
     char ip[128] = {0};
     bs_pc_ip_of_plist(ip, sizeof(ip));
     if (!ip[0]) snprintf(ip, sizeof(ip), "%s", g_appip);
