@@ -1007,10 +1007,18 @@ static unsigned g_prj_ver_lo = 0;
 //   卡密项目必须成为**运行闸门** —— 盘上 beta.so 的 prj_name 与卡密项目不一致时
 //   禁止 App 加载该包（还原厂商 `run prj name != auth prj name` 校验的失效），
 //   并强制把盘上旧包换成本项目的包。特征串 "prj guard"。
+// ★★★★★ v6.65（2026-11-09 用户诉求「输卡后要等一会儿才显示授权时间」）：
+//   激活成功那一刻就把结果推出去，不再等厂商/整拍：
+//   ① bs_note_push_now() —— 立即发 0x07 状态包（[8:12] 到期/[7] 运行态）
+//      到 BBCenter，中控「授权/到期」两列秒显；特征串 "push on login ok"
+//   ② g_pull_now + bs_pull_sleep() —— 叫醒 puller 立即重拉模块，不等 60s 整拍；
+//      特征串 "woken by card activation"
+//   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
+//      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.64p"
+  #define BS_DYLIB_VER     "v6.65p"
 #else
-  #define BS_DYLIB_VER     "v6.64"
+  #define BS_DYLIB_VER     "v6.65"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -1283,6 +1291,10 @@ static int           g_cardcheck      = 1;     // 缺省开（probe 模式整体
 static int           g_cardgrace      = 1;     // 网络失败宽限（小时；v6.23g 72→1，用户拍板）
 static int           g_cardtick       = 120;   // 心跳间隔（秒）★ v6.23u 300→120（code=7 被踢感知缩到 2 分钟）
 static int           g_noteport       = 34878; // ★ v6.45：BBCenter 中控「备注」上报端口（conf: noteport）
+// ★★★★★ v6.65（2026-11-09）：激活成功 → 立刻叫醒 puller 重拉一轮。
+//   原来 puller 死等 g_tick（60s）：.219 实测 15:15:57 login OK，模块 15:16:25
+//   才拉到、15:18:02 才拿到 csws 包 —— 中间全是干等。置 1 后 1 秒内醒来。
+static volatile int  g_pull_now       = 0;
 static char          g_note_last[256] = {0};   // ★ v6.45：上次成功写入中控的备注文案（去重用）
 static long          g_note_ts        = 0;     // ★ v6.45：上次成功写入中控的时间
 // ★★★★★ v6.47：中控「备注」用的冲突记忆 —— **必须与 g_card_kicked 分开**。
@@ -5789,6 +5801,21 @@ static int bs_pull_modules(uintptr_t base) {
     }
 }
 
+/// ★ v6.65：可被「激活成功」打断的睡眠（1s 粒度）。
+/// 返回 1 = 被 g_pull_now 提前唤醒。只影响 puller 自己的等待，不动 g_tick 语义。
+static int bs_pull_sleep(int secs) {
+    if (secs < 1) secs = 1;
+    for (int i = 0; i < secs; i++) {
+        if (g_pull_now) {
+            g_pull_now = 0;
+            bs_log("[pull] woken by card activation, %ds early", secs - i);
+            return 1;
+        }
+        sleep(1);
+    }
+    return 0;
+}
+
 static void *bs_puller(void *arg) {
     uintptr_t base = (uintptr_t)arg;
     bs_log("[pull] puller thread start, base=%p first_delay=%ds tick=%ds fast=%ds",
@@ -5858,11 +5885,11 @@ static void *bs_puller(void *arg) {
         //   避免长时间断网时每 20s 打一次日志/建连）。
         if (hb_fast && hb_fast_n < HB_FAST_RETRY) {
             hb_fast_n++;
-            sleep(HB_FAST_SECS);
+            bs_pull_sleep(HB_FAST_SECS);      // ★ v6.65 激活可提前唤醒
             if (!hb_fast) hb_fast_n = 0;      // 期间成功了 → 计数归零
         } else {
             hb_fast = 0; hb_fast_n = 0;
-            sleep(g_tick);
+            bs_pull_sleep(g_tick);            // ★ v6.65 激活可提前唤醒
         }
     }
     return NULL;
@@ -8490,6 +8517,7 @@ static void bs_wipe_onion_dict(uintptr_t base) {
 }
 
 /// 返回 0=ok（g_card_expire 已更新）；-1=网络失败；业务码原值返回。
+static void bs_note_push_now(void);   // ★ v6.65（实现在 bs_center_note_send 之后）
 static long bs_card_login(const char *card, int act_new) {
     // ★★★★ v6.41：设备号未就位时**绝不上报**。旧版会发 `"device_id":""`，
     //   服务端按空 device 记账；等真值到位后整台机在库里看起来像换了设备
@@ -8552,6 +8580,15 @@ static long bs_card_login(const char *card, int act_new) {
         bs_log("[card] login OK expire=%ld lastok=%ld (%.20s...)",
                g_card_expire, g_card_lastok, card);
         bs_sync_vendor_expire();          // ★ v6.22：激活即同步中控显示
+        // ★★★★★ v6.65（2026-11-09 用户诉求「输卡要等一会儿才显示授权时间」）：
+        //   两列就地翻新，不等厂商状态包（它只在自身状态变化时发，最坏 30~60s）。
+        //   · bs_sync_vendor_auth_state(1) 写 g_agent_auth_state → 「授权」列
+        //   · bs_note_push_now() 立刻发 0x07 状态包（[8:12]=到期、[7]=运行态）
+        //     → 「授权到期时间」列；必须复用 App 那条 34878 连接，新 TCP 会被丢
+        //   · g_pull_now 叫醒 puller，模块/包立即重拉，不等 60s 整拍
+        bs_sync_vendor_auth_state(1);
+        bs_note_push_now();
+        g_pull_now = 1;
     } else {
         bs_log("[card] login FAIL code=%ld msg=%s (http=%ld)", rc, msg, code);
     }
@@ -8751,6 +8788,36 @@ static int __attribute__((unused)) bs_note_verdict_ok(long now) {
 ///      解除点只有三个（都已存在）：绑定成功可用的卡 / 重输本机原卡 / 探活恢复。
 ///      用户原话：「备注留着就一直留着可以不管他，如果绑定可用的再清空也可以」。
 ///   ④ 包 [7] 始终填真实运行态（bs_center_run_flag），不干扰运行列。
+/// ★★★★★ v6.65（2026-11-09）：激活成功瞬间直接把状态包推给中控。
+///
+/// 用户诉求原话：「我在电脑端中控输入卡密，要等一会儿才会显示自建卡密的授权时间」。
+/// .219 实测：15:15:57 `login OK expire=1796886957` 之后，中控「授权到期时间」列
+/// 还要再晚一段才出现 —— 因为 bs_sync_vendor_expire() 只写厂商内存全局
+/// （g_agent_auth_valid_time），真正送到 BBCenter 的是**厂商自己的状态包**，
+/// 而厂商只在自身状态变化时发，最坏 30~60s，运营就一直盯着空列。
+///
+/// 这里不等它：login 成功即调本函数，复用 App 那条 34878 持久连接发一个
+/// 0x07 状态包 —— [8:12] 真实到期、[7] 真实运行态、[21:] 空备注（非冲突态本就该空）。
+/// BBCenter `RVA 0xb2a4` 收到即刷「授权/到期」两列。
+///
+/// 只在**激活成功**这一个点调用（不是每拍），频率可忽略。
+static void bs_note_push_now(void) {
+    char ip[128] = {0};
+    bs_pc_ip_of_plist(ip, sizeof(ip));
+    if (!ip[0]) snprintf(ip, sizeof(ip), "%s", g_appip);
+    if (!ip[0]) {
+        bs_log("[note] push on login skipped: host unknown");
+        return;
+    }
+    /* 冲突态挂着备注时别用空文案冲掉它 */
+    char note[80] = {0};
+    if (g_note_cf_card[0])
+        snprintf(note, sizeof(note), "卡密冲突:%.20s 已被其他设备激活", g_note_cf_card);
+    int rc = bs_center_note_send(ip, note);
+    bs_log("[note] push on login ok: expire=%ld run=%d rc=%d",
+           (long)g_card_expire, bs_center_run_flag(), rc);
+}
+
 static void bs_center_note_tick(void) {
     char ip[64] = "";
     bs_pc_ip_of_plist(ip, sizeof(ip));
@@ -9055,7 +9122,20 @@ static void *bs_cardwatch(void *arg) {
                 //   备注侧翻篇只认三个真解除点：激活成功 / 探活恢复 / 重输本机原卡。
                 bs_log("[card] newer input seen after kick -> unblock %.20s...", card);
             }
-            int throttled = (last_fail[0] && !strcmp(card, last_fail) && now - last_try < 60);
+            // ★★★★★ v6.65：失败重试 60s 定值 → 5/10/20 → 60 递减退避。
+            //   .219 实测：15:15:30 首拍吃了个 400「卡密不能为空」（抓卡与读卡
+            //   竞态，白跑），却把 60s 节流直接点着 ⇒ 真卡号 15:15:57 才 login OK，
+            //   运营看到的就是「输完卡要等半分钟」。先快试三次，这类瞬时空值
+            //   基本被吃掉；真持续失败才回落 60s，不刷云端。
+            static int  fail_n = 0;
+            static char fail_card[80] = {0};
+            if (strcmp(card, fail_card) != 0) {
+                fail_n = 0;
+                snprintf(fail_card, sizeof(fail_card), "%s", card);
+            }
+            static const int FAIL_GAP[3] = {5, 10, 20};
+            long fail_gap = (fail_n < 3) ? (long)FAIL_GAP[fail_n] : 60L;
+            int throttled = (last_fail[0] && !strcmp(card, last_fail) && now - last_try < fail_gap);
             if (!throttled) {
                 last_try = now;
                 long rc = bs_card_login(card, 1);   // ★ v6.23s 激活带 act=new
@@ -9080,6 +9160,7 @@ static void *bs_cardwatch(void *arg) {
                     // 业务失败：记住这张失败卡（节流用）；若与已绑卡相同
                     // （可能被解绑/冻结）→ 清缓存封禁
                     snprintf(last_fail, sizeof(last_fail), "%s", card);
+                    if (fail_n < 3) fail_n++;      // ★ v6.65 同卡递减退避计数
                     if (rc == 7) {
                         // ★ v6.23s：抢卡被拒 → 把这**张被抢的卡**拉黑，等真输入。
                         //
