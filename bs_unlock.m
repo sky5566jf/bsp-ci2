@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.67p"
+  #define BS_DYLIB_VER     "v6.68p"
 #else
-  #define BS_DYLIB_VER     "v6.67"
+  #define BS_DYLIB_VER     "v6.68"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -5976,6 +5976,12 @@ static long bs_funcnil_mark_age(void) {     // -1 = 无标记
     long a = (long)(time(NULL) - (time_t)sb.st_mtime);
     return a < 0 ? 0 : a;
 }
+/// ★ v6.68：func-nil 标记的时间戳（-1 = 无标记）。与 bs_us_mark_ts() 比先后用。
+static long bs_funcnil_mark_ts(void) {
+    struct stat sb;
+    if (stat(FUNCNIL_MARK, &sb) != 0) return -1;
+    return (long)sb.st_mtime;
+}
 
 // ★ v6.24k：用户主动停脚本的「落盘闸门」——v6.24i 只在 agent.log 尾部找字符串，
 //   而 App 一重启 agent.log 就被轮转（31MB→6.4KB 实测），闸门随即失效；
@@ -6008,6 +6014,15 @@ static int bs_us_mark_exists(void) {
     // 7 天后自动失效（防极端情况下永久躺平：比如用户停脚本后中控再没下发过运行）
     if ((long)(time(NULL) - (time_t)sb.st_mtime) > 7 * 86400) { unlink(US_MARK); return 0; }
     return 1;
+}
+/// ★ v6.68：用户停闸门的**时间戳**（-1 = 无闸门）。
+///   用途：func-nil 穿透判定要比较「崩溃标记 vs 人停时刻」的先后 ——
+///   只有崩溃发生在人停**之后**才允许续跑，防止把人停前遗留的旧崩溃
+///   当成新崩溃、把人刚停掉的脚本又拉起来（v6.24p 边界）。
+static long bs_us_mark_ts(void) {
+    struct stat sb;
+    if (stat(US_MARK, &sb) != 0) return -1;
+    return (long)sb.st_mtime;
 }
 
 // ================================================================
@@ -6909,14 +6924,32 @@ static void *bs_watchdog(void *arg) {
                                     //   统一报错行）都视为脚本停摆信号。厂商行为是
                                     //   报错即自动停脚本，故命中即具备重拉前提；
                                     //   非致命误报由 CR_COOLDOWN + run/st 条件兜住。
-                                    // ★★★★★ v6.67：但**只有 func-nil 精确签名**允许
-                                    //   自动恢复（ar_funcnil_hit）。其余 run script error
-                                    //   仅作证据登记，仍须人工点运行（v6.24p 边界不变）。
+                                    // ★★★★★ v6.68（2026-11-09，8112 实测）：**可自动恢复的
+                                    //   签名从 1 种扩到 3 种** —— 这三种都是「脚本本来在跑、
+                                    //   被厂商自己搞停」的形态，恢复它们不是新开运行。
+                                    //
+                                    //   8112 真机日志去重后的全部 3 种原文：
+                                    //   ① run script error:[string "UNKONW = 0 IPHONE_8P = 1
+                                    //      ANDROID = 2 function..."]:1:
+                                    //      attempt to call local 'func' (a nil value)!   ← 带引号
+                                    //   ② 同上但  attempt to call local func (a nil value)! ← 不带引号
+                                    //   ③ run script error:[string "..."]:1: bs_module_lost:task_lhdb_into!
+                                    //      ← 模块被厂商抹掉/没拉回来
+                                    //
+                                    //   ①② 根因：wait_call_func 4~5h 自刷新定时器把模块全局函数
+                                    //     抹成 nil，重载拿回 nil（v6.17 已定论）。
+                                    //   ③ 根因：模块文件缺失（puller 还没铺回来 / 被抹）。
+                                    //     这类「重试一次可能就好了」，此前被归入 cr_loadfail 但
+                                    //     没有自动恢复路径 ⇒ 撞上就永久停摆。
+                                    //
+                                    //   ★ 其余 "run script error:"（不匹配上述三条）仍只登记证据，
+                                    //     须人工点运行 —— v6.24p 的边界保持不变。
                                     if (strstr(buf, "attempt to call local 'func' (a nil value)") ||
-                                        strstr(buf, "attempt to call local func (a nil value)")) {
+                                        strstr(buf, "attempt to call local func (a nil value)") ||
+                                        strstr(buf, "bs_module_lost:")) {
                                         cr_hit = 1;
                                         cr_src = cri;
-                                        ar_funcnil_hit = 1;     // ★ v6.67：唯一可自动恢复的签名
+                                        ar_funcnil_hit = 1;     // ★ v6.67/v6.68：可自动恢复
                                     } else if (strstr(buf, "run script error:")) {
                                         cr_hit = 1;
                                         cr_src = cri;
@@ -7259,7 +7292,51 @@ static void *bs_watchdog(void *arg) {
                     //   删掉这条就等于「断网恢复后必须人工点运行」，这就是事故本体。
                     want = 0; hold = "hb-not-ok";
                 } else if (us_latched || bs_us_mark_exists()) {
-                    want = 0; hold = "user-stop";
+                    // ★★★★★ v6.68（2026-11-09，8112 实测死锁）：**崩溃续跑必须能穿透人停闸门**。
+                    //
+                    //   死锁现场（8112 真机，11-09 19:41→19:47 复现）：
+                    //     19:41:25 用户在 App 点停止 → sk=2 → armed=0/lst=0，
+                    //               写 .bs_userstop，日志 "auto-start gated until run=1"
+                    //     19:47    脚本跑着跑着 func-nil 崩 → [cr] detected，但 armed=0
+                    //               → [ar] 不动手 → **永不恢复**。
+                    //   闸门解除条件是 run==1（中控签名运行），而崩溃后 run 恒为 0
+                    //   ⇒ 闸门永远不解除 ⇒ 死锁。
+                    //
+                    //   语义辨析（用户 2026-11-09 明确）：
+                    //     · .bs_userstop 的语义是「**人不让它跑**」（点停止 = 这次别跑）
+                    //     · 崩溃续跑的语义是「**它自己跑崩了，续上**」
+                    //     人的停止意图**不该被未来某次意外崩溃继承** ——
+                    //     这跟 v6.24p「不许自动运行」不冲突：v6.24p 防的是
+                    //     「人停了又自己跑起来」，这里防的是「跑着跑着崩了不续」。
+                    //
+                    //   ★ 严格限定，一条不缺（防复活 3246 那些人停被接上的事故）：
+                    //     ① 只认 ar_funcnil_hit（func-nil ×2 格式 + bs_module_lost）；
+                    //     ② 必须有 .cr_funcnil 标记且新鲜（标记只在**真扫到崩溃签名**时写）；
+                    //     ③ 标记时间戳必须**晚于** .bs_userstop 的时间戳
+                    //        （证明崩溃发生在人停之后，不是人停前遗留的旧崩溃）；
+                    //     ④ run==0 && st==0（脚本确实停稳）；
+                    //     ⑤ 冷却 AR_FUNCNIL_COOL=300s。
+                    //   任一条不满足 → 照旧拦截（v6.24p/v6.54 的保护原样保留）。
+                    int fn_pass = 0;
+                    if (g_crashresume && run == 0 && st == 0 &&
+                        bs_funcnil_mark_age() >= 0 &&
+                        bs_funcnil_mark_age() <= FUNCNIL_WIN &&
+                        (ar_funcnil_ts == 0 || nowa - ar_funcnil_ts >= AR_FUNCNIL_COOL)) {
+                        // ③ 标记必须晚于人停（防旧崩溃复活人停）
+                        long umk = bs_us_mark_ts();          // -1 = 无闸门
+                        long fmk = bs_funcnil_mark_ts();     // -1 = 无标记
+                        if (umk < 0 || (fmk >= 0 && fmk > umk)) fn_pass = 1;
+                    }
+                    if (fn_pass) {
+                        want = 1; why = "funcnil-pierce";
+                        bs_evt("[ar] ★ func-nil PIERCES user-stop gate "
+                               "(mark newer than user-stop) -> resume ONCE (v6.68)");
+                        // 穿透即清闸门：这一次崩溃已处理，之后回到正常 gating
+                        bs_us_mark_clear();
+                        us_latched = 0;
+                    } else {
+                        want = 0; hold = "user-stop";
+                    }
                 } else if (ar_stop_kind == 2) {
                     // ★★★★ v6.40：先认自己人。网络类 kill 发的 OPER_STOP 在 agent.log
                     //   里就是一条裸 `agent stop script`，与本矩阵里的 "center-stop"
