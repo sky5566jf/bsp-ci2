@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.66p"
+  #define BS_DYLIB_VER     "v6.67p"
 #else
-  #define BS_DYLIB_VER     "v6.66"
+  #define BS_DYLIB_VER     "v6.67"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -5958,6 +5958,25 @@ static long bs_cr_mark_age(void) {          // -1 = 无 marker
     return a < 0 ? 0 : a;
 }
 
+// ★★★★★ v6.67：func-nil 专属恢复标记（本 dylib 唯一允许的自动运行路径）
+//   为什么需要持久化标记：ar_funcnil_hit 只在「本轮扫到新字节」时为 1，下一拍归零；
+//   而 hard-fail 期间脚本已停、日志不再增长 ⇒ 永远扫不到新签名 ⇒ 永远不恢复。
+//   标记随崩溃一起去，脚本真正跑起来时（[ar] resume 成功）再清掉。
+#define FUNCNIL_MARK  DATA_DIR "/.cr_funcnil"
+static void bs_funcnil_mark_write(void) {
+    FILE *f = fopen(FUNCNIL_MARK, "w");
+    if (!f) return;
+    fprintf(f, "ts=%ld sig=func-nil\n", (long)time(NULL));
+    fclose(f);
+}
+static void bs_funcnil_mark_clear(void) { unlink(FUNCNIL_MARK); }
+static long bs_funcnil_mark_age(void) {     // -1 = 无标记
+    struct stat sb;
+    if (stat(FUNCNIL_MARK, &sb) != 0) return -1;
+    long a = (long)(time(NULL) - (time_t)sb.st_mtime);
+    return a < 0 ? 0 : a;
+}
+
 // ★ v6.24k：用户主动停脚本的「落盘闸门」——v6.24i 只在 agent.log 尾部找字符串，
 //   而 App 一重启 agent.log 就被轮转（31MB→6.4KB 实测），闸门随即失效；
 //   且下面 bs_last_stop_is_user 用的串跟厂商真实日志对不上（见其注释）。
@@ -6043,6 +6062,19 @@ static int bs_us_mark_exists(void) {
 #define AR_GIVEUP_N     5       // 连续失败上限
 #define AR_GIVEUP_HOLD  1800    // 放弃后静默多久再给一轮机会（防永久躺平）
 static const int AR_BACKOFF[AR_GIVEUP_N] = { 60, 120, 300, 600, 1200 };
+
+// ★★★★★ v6.67：func-nil 专属恢复参数（本 dylib **唯一**允许的自动运行路径）
+//   语义边界（与 v6.24p 用户指令一致）：
+//     「除『脚本本来在跑』与『中控手动下发运行』外，其余一律不得自动运行脚本」。
+//     func-nil 属于「脚本本来在跑，被厂商自己的定时器搞崩了」——
+//     恢复它是把本来在跑的跑回去，不是新开运行。
+//   ★ 只认 `attempt to call local 'func' (a nil value)` 这一条精确签名；
+//     其他任何 run script error 仍必须人工点运行。
+//   ★ 硬性闸门一条不减：card-blocked / hb-not-ok / user-stop / center-stop / kill-cool
+//     全部照旧拦截（v6.24p 的保护完整保留）。只豁免「失败次数型」的软静默：
+//     vendor-cool / hard-fail / giveup。
+#define FUNCNIL_WIN     43200   // 标记有效期 12h（覆盖一次夜班 + 白天，够人工介入）
+#define AR_FUNCNIL_COOL 300     // 两次 func-nil 恢复最小间隔（同 v6.17 CR_COOLDOWN）
 
 // ★★★ v6.31：resume 回执 + 失败分类 + 硬失败收敛
 //   背景：v6.30 发完 OPER_START 就 att++，从不验证「这次到底起没起来」。
@@ -6587,6 +6619,15 @@ static void *bs_watchdog(void *arg) {
     time_t ar_vendor_ts = 0;           // 厂商杀脚本时刻（冷却用）
     int    ar_stop_kind = 0;           // agent.log 尾部事件分类（0/1/2/3）
     int    ar_cr_hit    = 0;           // 本拍崩溃签名（由下面 cr 扫描块回填）
+    // ★★★★★ v6.67：**唯一允许的自动运行路径** —— func-nil 专属恢复。
+    //   厂商 wait_call_func 的 4~5h 自刷新定时器把模块全局函数抹成 nil，
+    //   重载路径 load("return "..name)() 又拿回 nil → `attempt to call local 'func'` → 脚本停。
+    //   这不是用户操作、不是配置问题、不是网络问题，是**厂商脚本固有缺陷**，
+    //   跑满 4~5 小时必然发生。恢复它 = 把「本来在跑的脚本」跑回去，
+    //   符合 v6.24p「除脚本本来在跑 / 中控手动下发外不得自动运行」的边界。
+    //   ★ 只认这一个精确签名；其他任何 run script error 一律不自动拉（人点了才动）。
+    int    ar_funcnil_hit  = 0;        // 本拍是否命中 func-nil 精确签名
+    time_t ar_funcnil_ts   = 0;        // 最近一次 func-nil 恢复时刻（冷却用）
     long   ar_sjz_mark  = -1;          // ★ v6.31：resume 时刻 sjz.log 尺寸（分类只看之后的增量）
     long   ar_ag_mark   = -1;          // ★ v6.31：同上 agent.log
     // ★★★ v6.31：上个进程遗留的 resume 回执窗口一律作废。
@@ -6868,9 +6909,15 @@ static void *bs_watchdog(void *arg) {
                                     //   统一报错行）都视为脚本停摆信号。厂商行为是
                                     //   报错即自动停脚本，故命中即具备重拉前提；
                                     //   非致命误报由 CR_COOLDOWN + run/st 条件兜住。
+                                    // ★★★★★ v6.67：但**只有 func-nil 精确签名**允许
+                                    //   自动恢复（ar_funcnil_hit）。其余 run script error
+                                    //   仅作证据登记，仍须人工点运行（v6.24p 边界不变）。
                                     if (strstr(buf, "attempt to call local 'func' (a nil value)") ||
-                                        strstr(buf, "attempt to call local func (a nil value)") ||
-                                        strstr(buf, "run script error:")) {
+                                        strstr(buf, "attempt to call local func (a nil value)")) {
+                                        cr_hit = 1;
+                                        cr_src = cri;
+                                        ar_funcnil_hit = 1;     // ★ v6.67：唯一可自动恢复的签名
+                                    } else if (strstr(buf, "run script error:")) {
                                         cr_hit = 1;
                                         cr_src = cri;
                                     }
@@ -6926,6 +6973,9 @@ static void *bs_watchdog(void *arg) {
         if (g_mode == MODE_UNLOCK && !g_card_blocked) {
             time_t nowt4 = time(NULL);
             if (run) bs_cr_mark_clear();      // 跑起来了 = 已恢复，顺手清证据
+            // ★ v6.67：脚本真正跑起来 → func-nil 标记完成使命，清掉。
+            //   注意只在 run==1 时清；OPER_START 发出后还没跑起来时不清（可能连崩几次）。
+            if (run) bs_funcnil_mark_clear();
             if (nowt4 - cr_stall_last >= CR_STALL_SCAN) {
                 cr_stall_last = nowt4;
                 char ap[300];
@@ -7183,6 +7233,20 @@ static void *bs_watchdog(void *arg) {
                     want = 1; why = "stuck-run1";
                 }
             }
+            // ★★★★★ v6.67：func-nil **持久化**恢复窗口。
+            //   问题：ar_funcnil_hit 只在本轮扫到新字节时为 1，下一拍就归零，
+            //   而 hard-fail 期间脚本停了、日志不再增长 → 永远扫不到新签名 → 永远不恢复。
+            //   解法：命中时就近写一个标记文件 .cr_funcnil（带时间戳），
+            //   在 FUNCNIL_WIN 秒内每一拍都认为「这是 func-nil 待恢复」，直到脚本真跑起来。
+            if (g_crashresume && ar_funcnil_hit) {
+                bs_funcnil_mark_write();
+                ar_funcnil_hit = 0;      // 转成持久标记，不再依赖本拍
+            }
+            if (!want && g_crashresume && run == 0 && st == 0 &&
+                bs_funcnil_mark_age() >= 0 && bs_funcnil_mark_age() <= FUNCNIL_WIN &&
+                (ar_funcnil_ts == 0 || nowa - ar_funcnil_ts >= AR_FUNCNIL_COOL)) {
+                want = 1; why = "funcnil";
+            }
 
             // --- 抑制矩阵 ---
             const char *hold = NULL;
@@ -7216,13 +7280,34 @@ static void *bs_watchdog(void *arg) {
                     //   否则「保留模块」也白搭 —— 还得再等 10 分钟才肯接。封禁才吃满 600s。
                     want = 0; hold = g_kill_resumable ? "kill-cool-net" : "kill-cool";
                 } else if (ar_vendor_ts && nowa - ar_vendor_ts < AR_VENDOR_COOL) {
-                    want = 0; hold = "vendor-cool";
+                    // ★★★★★ v6.67：func-nil 专属豁免 —— 厂商脚本 4~5h 定时器抹函数导致的
+                    //   崩溃，恢复它是「把本来在跑的脚本跑回去」，不是新开运行。
+                    //   这类失败重试一次就能成（重新 load 一遍模块即可），
+                    //   没有理由吃 vendor-cool / hard-fail / giveup 这些「失败次数型」静默。
+                    //   ★ 硬性保护一条不减：card-blocked / hb-not-ok / user-stop /
+                    //     center-stop / kill-cool 全部照旧拦截（那是"人不让它跑"的语义）。
+                    if (g_crashresume && ar_funcnil_hit) {
+                        bs_evt("[ar] ★ func-nil EXEMPT: vendor-cool bypassed "
+                               "(the only auto-resume allowed, v6.67)");
+                    } else {
+                        want = 0; hold = "vendor-cool";
+                    }
                 } else if (ar.hv && nowa - ar.hv < AR_HARD_HOLD) {
-                    want = 0; hold = "hard-fail";
+                    if (g_crashresume && ar_funcnil_hit) {
+                        bs_evt("[ar] ★ func-nil EXEMPT: hard-fail bypassed "
+                               "(hv=%lds ago, the only auto-resume allowed, v6.67)",
+                               (long)(nowa - ar.hv));
+                        ar.hv = 0; ar.hard = 0;   // 清掉硬失败，让它真的跑起来
+                    } else {
+                        want = 0; hold = "hard-fail";
+                    }
                 } else if (ar.gu) {
                     if (nowa - ar.gts > AR_GIVEUP_HOLD) {
                         ar.gu = 0; ar.att = 0; ar.next = 0;
                         bs_evt("[ar] giveup window over -> new retry round");
+                    } else if (g_crashresume && ar_funcnil_hit) {
+                        bs_evt("[ar] ★ func-nil EXEMPT: giveup bypassed (v6.67)");
+                        ar.gu = 0; ar.att = 0; ar.next = 0;
                     } else {
                         want = 0; hold = "giveup";
                     }
@@ -7299,6 +7384,13 @@ static void *bs_watchdog(void *arg) {
                 bs_cr_mark_clear();
                 ar_cr_hit = 0;
                 ar_notrun = 0;
+                // ★ v6.67：记下本次 func-nil 恢复时刻（冷却基准）。
+                //   ★ 故意**不清** .cr_funcnil 标记 —— func-nil 往往连崩 2~3 次
+                //     （每次重载拿回的还是 nil，见 v6.17 根因），
+                //     标记留到脚本真正跑起来（run==1）再清，见下方 else 分支。
+                if (!strcmp(why ? why : "", "funcnil")) ar_funcnil_ts = nowa;
+                bs_evt("[ar] ★ OPER_START issued (why=%s) — func-nil marker kept until run==1",
+                       why ? why : "?");
             } else if (hold) {
                 static time_t hold_log = 0;
                 if (nowa - hold_log >= 300) {
