@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.65p"
+  #define BS_DYLIB_VER     "v6.66p"
 #else
-  #define BS_DYLIB_VER     "v6.65"
+  #define BS_DYLIB_VER     "v6.66"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -6054,7 +6054,14 @@ static const int AR_BACKOFF[AR_GIVEUP_N] = { 60, 120, 300, 600, 1200 };
 //   ★ 手工解除：中控再点运行（run 0→1）自动清；或删 DATA_DIR/.bs_ar。
 #define AR_VERIFY_SECS  90      // resume 后必须在该秒数内看到 st!=0，否则算「点了没起来」
 #define AR_HARD_N       2       // 连续「点了没起来」上限（仅对 config/auth/unknown 生效）
-#define AR_HARD_HOLD    21600   // 硬失败静默 6h（覆盖一次夜班，天亮后重来一轮）
+// ★★★★★ v6.66（2026-11-09）：21600(6h) → 1800(30min)。
+//   理由：func-nil 是**厂商脚本固有缺陷**（wait_call_func 的 4~5h 自刷新定时器
+//   把模块全局函数抹成 nil、重载拿回 nil），跑满 4~5 小时必崩一次 —— 见 v6.17 结论。
+//   旧值 6h 意味着一天最多只肯自动恢复 2~3 轮，且期间人工点运行也被硬挡（v6.66 已修）。
+//   缩到 30min：崩溃后半小时内自动重来一轮，符合「崩→恢复→再崩」的实际节奏；
+//   连续硬失败时 ar.att 仍会累加，不会变成无脑连拉。
+//   ★ 手工解除仍两条：中控点运行（v6.66 起任何状态下都生效）/ 删 DATA_DIR/.bs_ar。
+#define AR_HARD_HOLD    1800    // 硬失败静默 30min（原 21600=6h，v6.66 缩短）
 
 // 失败分类（ar_fail_class 的返回值）
 enum {
@@ -6951,6 +6958,34 @@ static void *bs_watchdog(void *arg) {
                 //   零额外开销（本来就要读这块）。这是「中控下发运行」的第二证据源：
                 //   App 刚装完包时 run 标志是 0、sjz 也停摆，只能从日志看中控到底点过什么。
                 //   （v6.34：赋值已上移到 us_stop 之前，此处不再重复读盘）
+                // ★★★★★ v6.66（2026-11-09，8112/.216 事故）：**中控点运行必须能解除
+                //   hard-fail**，无论当前 stop_kind / armed 是什么组合。
+                //
+                //   事故（8112 真机，11-09 16:11~16:14）：
+                //     脚本 func-nil 崩溃（厂商 wait_call_func 4~5h 定时器固有缺陷）
+                //     → agent 自动 stop → stop_kind=4，ar.armed 仍为 1
+                //     → att 累计到 3 → 置 ar.hv，进入 AR_HARD_HOLD=21600s（6h）静默。
+                //     用户在**中控点「运行」三次**，agent.log 每次都留下完整的
+                //     `begin process run script msg` + `agent run script` + `begin run script`，
+                //     但下面这个分支的进入条件是 `kind==1 && !armed` ——
+                //     本机 kind=4、armed=1，**两个条件都不满足** ⇒
+                //     bs_ar_run_is_center() 根本没被调用 ⇒ hard-fail 永不清除 ⇒
+                //     [ar] 日志每 60s 重复 `hold=hard-fail ... stop=4`，
+                //     中控点运行完全无效，只能靠人工删 .bs_ar 才能恢复。
+                //
+                //   修法：保留 v6.54 原路径（防 3246 那种「人停后 vendor 自动拉起」误判），
+                //   另加一条**互补形态**：脚本没在跑（!run）且处于 hard-fail 期（ar.hv），
+                //   同样走 bs_ar_run_is_center() 判定；命中即清 hard-fail 三件套。
+                //   安全性不变：该函数内部要求「3 种运行签名 + 300s 新鲜度」，
+                //   音量键 / vendor bare run 依然过不了（v6.54 的保护原样保留）。
+                if (!run && ar.hv && bs_ar_run_is_center(ap, 262144)) {
+                    ar.hard = 0; ar.hv = 0; ar.vfy = 0; ar.up = 0;
+                    ar.att = 0; ar.gu = 0; ar.next = 0;
+                    bs_ar_write(&ar, "run-log");
+                    bs_evt("[ar] ★ hard-fail CLEARED by center run evidence "
+                           "(v6.66, was arming=%d lst=%d stop_kind=%d)",
+                           ar.armed, ar.lst, ar_stop_kind);
+                }
                 if (ar_stop_kind == 1 && !ar.armed) {
                     // ★★★ v6.54：同 0->1 分支 —— 只认中控 operate 签名。
                     //   bare run（音量键+/vendor 自动拉起）让 kind 变 1（run 晚于 stop），
