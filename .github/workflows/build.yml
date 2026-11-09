@@ -44,7 +44,10 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.64" || (echo "MISSING v6.64" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.65" || (echo "MISSING v6.65" && exit 1)
+          # ★ v6.65：激活即推状态包 + 叫醒 puller + 递减退避
+          strings bs_unlock.dylib | grep -q "push on login ok" || (echo "MISSING v6.65 note push on login" && exit 1)
+          strings bs_unlock.dylib | grep -q "woken by card activation" || (echo "MISSING v6.65 puller wake" && exit 1)
           strings bs_unlock.dylib | grep -q "prj guard" || (echo "MISSING v6.64 prj guard" && exit 1)
           strings bs_unlock.dylib | grep -q "disk_ver=%06x card=%s" || (echo "MISSING v6.64 prj mismatch event" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud prj ver base" || (echo "MISSING v6.64 prj_ver base log" && exit 1)
