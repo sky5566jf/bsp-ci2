@@ -53,7 +53,7 @@ jobs:
           # ★ v6.68：崩溃续跑穿透人停闸门 + 3 种真实签名
           strings bs_unlock.dylib | grep -q "func-nil PIERCES user-stop gate" || (echo "MISSING v6.68 pierce gate" && exit 1)
           # ★ v6.65：激活即推状态包 + 叫醒 puller + 递减退避
-          strings bs_unlock.dylib | grep -q "push on login ok" || (echo "MISSING v6.65 note push on login" && exit 1)
+          # ★ v6.71：push on login ok 已删（恢复零发包），断言同步移除
           strings bs_unlock.dylib | grep -q "woken by card activation" || (echo "MISSING v6.65 puller wake" && exit 1)
           strings bs_unlock.dylib | grep -q "prj guard" || (echo "MISSING v6.64 prj guard" && exit 1)
           strings bs_unlock.dylib | grep -q "disk_ver=%06x card=%s" || (echo "MISSING v6.64 prj mismatch event" && exit 1)
