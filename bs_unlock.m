@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.68p"
+  #define BS_DYLIB_VER     "v6.69p"
 #else
-  #define BS_DYLIB_VER     "v6.68"
+  #define BS_DYLIB_VER     "v6.69"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -1291,6 +1291,10 @@ static int           g_cardcheck      = 1;     // 缺省开（probe 模式整体
 static int           g_cardgrace      = 1;     // 网络失败宽限（小时；v6.23g 72→1，用户拍板）
 static int           g_cardtick       = 120;   // 心跳间隔（秒）★ v6.23u 300→120（code=7 被踢感知缩到 2 分钟）
 static int           g_noteport       = 34878; // ★ v6.45：BBCenter 中控「备注」上报端口（conf: noteport）
+// ★★★★★ v6.69 实验开关（2026-11-09）：状态包 [7] 语义验证（conf: stat7mode=）
+//   0 = 跟随运行态（v6.50 现状）；1 = 恒 0；2 = 恒 1
+//   用途：一次性定死 [7] 到底管「运行列」还是「授权列」，验证完按结论定稿并删掉本开关。
+static int           g_stat7_mode    = 0;
 // ★★★★★ v6.65（2026-11-09）：激活成功 → 立刻叫醒 puller 重拉一轮。
 //   原来 puller 死等 g_tick（60s）：.219 实测 15:15:57 login OK，模块 15:16:25
 //   才拉到、15:18:02 才拿到 csws 包 —— 中间全是干等。置 1 后 1 秒内醒来。
@@ -2551,6 +2555,11 @@ static void bs_load_conf(void) {
             // ★ v6.20：login 心跳间隔（秒）
             g_cardtick = atoi(v);
             if (g_cardtick < 60) g_cardtick = 60;
+        }
+        else if (!strcmp(k, "stat7mode")) {
+            // ★ v6.69 实验：状态包 [7] 语义验证（0=跟随运行态 1=恒0 2=恒1）
+            g_stat7_mode = atoi(v);
+            if (g_stat7_mode < 0 || g_stat7_mode > 2) g_stat7_mode = 0;
         }
         else if (!strcmp(k, "cardkey")) {
             // ★ v6.20：CardVault 应用 app_key（X-Card-Key 头）
@@ -8888,7 +8897,24 @@ static int bs_center_note_send(const char *ip, const char *note) {
     memcpy(pkt, &t, 4);                       // [0:4] 总长 —— ★ 改备注必须同步改这里
     pkt[4] = 0x07; pkt[5] = 0x00;             // [4:6] 命令：状态上报
     pkt[6] = 0x01;                            // [6]   版本
-    pkt[7] = (unsigned char)bs_center_run_flag(); // ★ v6.50：真实运行态（1=运行 0=空闲）
+    // ★★★★★ v6.69 实验（2026-11-09，8112 运行中显示「未授权」）：
+    //   历史矛盾点 —— [7] 的语义两种解释互斥：
+    //     A（v6.50 采用）：1=运行中 0=空闲   依据「反汇编 movzx [rax+7]→dev+0xb8，
+    //                                            填表 0x29ad0 搬到运行列 +0x80」
+    //     B（更早的实测）：0=正常 1=异常/未授权 依据「原厂样本在**卡密不存在**时 [7]=01」
+    //   现在 [7]=1（脚本在跑）⇒ 用户看到「运行」列对、但「授权」列变成未授权。
+    //   为一次性定死语义，加 conf 开关 stat7mode=：
+    //     0 = 跟随运行态（现状，v6.50 行为）
+    //     1 = 恒 0（实验：看授权列是否恢复）
+    //     2 = 恒 1（实验：看运行/授权两列反应）
+    //   验证完把开关去掉、按结论定稿。
+    {
+        int v7;
+        if (g_stat7_mode == 1)      v7 = 0;
+        else if (g_stat7_mode == 2) v7 = 1;
+        else                        v7 = bs_center_run_flag();
+        pkt[7] = (unsigned char)v7;
+    }
     uint32_t exp = (uint32_t)(g_card_expire > 0 ? g_card_expire : 0);
     memcpy(pkt + 8, &exp, 4);                 // [8:12] 授权到期
     pkt[12] = 0x01; pkt[13] = 0x02;           // [12][13] 固定
