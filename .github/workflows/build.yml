@@ -44,14 +44,14 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.75" || (echo "MISSING v6.75" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.76" || (echo "MISSING v6.76" && exit 1)
           # ★ v6.66：中控点运行必须解除 hard-fail（8112 事故）
           strings bs_unlock.dylib | grep -q "hard-fail CLEARED by center run evidence" || (echo "MISSING v6.66 hard-fail clear on center run" && exit 1)
           # ★ v6.67：func-nil 是本 dylib 唯一允许的自动运行路径
           strings bs_unlock.dylib | grep -q "func-nil EXEMPT: hard-fail bypassed" || (echo "MISSING v6.67 func-nil hard-fail exemption" && exit 1)
           strings bs_unlock.dylib | grep -q "v6.75" || (echo "MISSING v6.75 tag" && exit 1)
           # ★ v6.68：崩溃续跑穿透人停闸门 + 3 种真实签名
-          strings bs_unlock.dylib | grep -q "DRIFT observed" || (echo "MISSING v6.68 pierce gate" && exit 1)
+          strings bs_unlock.dylib | grep -q "func-nil PIERCES center-stop" || (echo "MISSING v6.68 pierce gate" && exit 1)
           # ★ v6.65：激活即推状态包 + 叫醒 puller + 递减退避
           # ★ v6.71：push on login ok 已删（恢复零发包），断言同步移除
           strings bs_unlock.dylib | grep -q "woken by card activation" || (echo "MISSING v6.65 puller wake" && exit 1)
@@ -193,22 +193,22 @@ jobs:
           # 实测同一批客户端有发 192 的 —— 硬等 208 会 30s 超时 auth failed）
           strings bs_unlock.dylib | grep -q "cmd pkt len=" || (echo "MISSING autolen log" && exit 1)
           strings bs_unlock.dylib | grep -q "hdr probe fail" || (echo "MISSING probe-fail log" && exit 1)
-          # ===== v6.41（2026-10-29）：设备码单一真源 —— 卸载/重装/覆盖 bspath 都不变号 =====
-          #   旧版三级回退（hw.serial→.bs_devid 随机→token→"unknown"）全部删除。
-          #   新链路：dlsym(g_script_dev_id/get_script_dev_id) 取 Agent 权威值
-          #          → 钉盘 /var/mobile/Media/.bsdeveid → 冷启窗口 set 回 Agent。
-          #   取不到就 PENDING 不绑卡不上报（宁可没号，绝不自己造号）。
-          strings bs_unlock.dylib | grep -q "bsp-deveid-v1" || (echo "MISSING v6.41 pin file magic" && exit 1)
+          # ===== v6.76（2026-11-10）：设备码**纯只读**，连缓存都废弃 =====
+          #   用户定策：「厂商贝塔 App 读取的是什么设备码就应该跟他一样，
+          #             不管什么情况下我们都不能自己生成」+「删除钉盘，并允许等待」
+          #   演进：v6.41 单一真源(只读 dlsym) + 钉盘缓存 + 冷启回填
+          #      → v6.75 去掉回填、钉盘永不改
+          #      → v6.76 **钉盘整个废弃**（它是第二个数据源，会过时/被写坏
+          #        ⇒ 同机双身份：8186 与 8115 两次事故）
+          #   现在只有两段：live 有值直接返回；live 无值返回空等下一拍。
           strings bs_unlock.dylib | grep -q "refuse to invent" || (echo "MISSING v6.41 refuse-to-invent guard" && exit 1)
-          strings bs_unlock.dylib | grep -q "\[deveid\] PENDING" || (echo "MISSING v6.41 pending banner" && exit 1)
-          strings bs_unlock.dylib | grep -q "authoritative=%.32s (src=agent, pin=%s)" || (echo "MISSING v6.41 authoritative resolve log" && exit 1)
+          strings bs_unlock.dylib | grep -q "no cache by design, v6.76" || (echo "MISSING v6.76 no-cache banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "src=agent TLV, v6.76 read-only, no cache" || (echo "MISSING v6.76 read-only authoritative log" && exit 1)
           strings bs_unlock.dylib | grep -q "src=agent.dev_id) conf_write=%d" || (echo "MISSING v6.41 identity tick conf write" && exit 1)
-          # ★ v6.75："restore skipped (setter unavailable)" 已删 —— 回填厂商的逻辑整体移除
-          #   （用户原则：设备码只读镜像厂商，绝不写回）。断言同步移除。
-          strings bs_unlock.dylib | grep -q "DRIFT observed" || (echo "MISSING v6.75 drift-observed log" && exit 1)
-          strings bs_unlock.dylib | grep -q "NO write-back to vendor" || (echo "MISSING v6.75 no-writeback" && exit 1)
-          # 反回归：v6.41 之后不许再出现任何"本地造号"痕迹
-          if strings bs_unlock.dylib | grep -q "src=local-gen"; then echo "FORBIDDEN: v6.41 local-gen devid still present" && exit 1; fi
+          # 反回归：不许再出现钉盘相关行为（已废弃，调用点必须不存在）
+          if strings bs_unlock.dylib | grep -q "pin created %"; then echo "FORBIDDEN: v6.76 pin-write still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "using pin cache"; then echo "FORBIDDEN: v6.76 pin-read decision still present" && exit 1; fi
+          if strings bs_unlock.dylib | grep -q "DRIFT observed"; then echo "FORBIDDEN: v6.76 drift-adopt log still present" && exit 1; fi
           if strings bs_unlock.dylib | grep -q ".bs_devid"; then echo "FORBIDDEN: v6.41 legacy .bs_devid path still present" && exit 1; fi
           # ===== v6.42（2026-10-29）：卡密判决的两处误判修正 =====
           #   ① 设备码 PENDING 期不否决：没有服务端裁决 ≠ 卡无效。
@@ -397,7 +397,7 @@ jobs:
           echo "=== probe variant carries the lock banner + own version tag ==="
           strings bs_unlock_probe.dylib | grep -q "probe-locked build, MODE_UNLOCK not compiled" \
             || (echo "MISSING v6.62 probe-lock banner" && exit 1)
-          strings bs_unlock_probe.dylib | grep -q "v6.75p" || (echo "MISSING v6.75p probe version tag" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "v6.76p" || (echo "MISSING v6.76p probe version tag" && exit 1)
 
           echo "=== full build must NOT carry the lock banner (macro really gated) ==="
           if strings bs_unlock.dylib | grep -q "probe-locked build"; then
