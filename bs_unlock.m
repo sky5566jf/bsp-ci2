@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.75p"
+  #define BS_DYLIB_VER     "v6.76p"
 #else
-  #define BS_DYLIB_VER     "v6.75"
+  #define BS_DYLIB_VER     "v6.76"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -8686,7 +8686,8 @@ static int __attribute__((unused)) bs_dev_write_live(const char *v) {
 }
 
 /// 读钉盘（唯一持久化副本）。
-static int bs_dev_pin_read(char out[40]) {
+/// ★ v6.76：钉盘已废弃，本函数保留只为读旧文件做迁移日志；不再用于判定。
+static int __attribute__((unused)) bs_dev_pin_read(char out[40]) {
     out[0] = 0;
     unsigned char *b = NULL;
     size_t bl = 0;
@@ -8703,7 +8704,8 @@ static int bs_dev_pin_read(char out[40]) {
 }
 
 /// 写钉盘（原子替换；值没变就不落盘，避免无谓 IO）。
-static void bs_dev_pin_write(const char *v, const char *why) {
+/// ★ v6.76：钉盘已废弃，**永不调用**（用户定策「删除钉盘」）。
+static void __attribute__((unused)) bs_dev_pin_write(const char *v, const char *why) {
     char cur[40] = {0};
     if (bs_dev_pin_read(cur) && strcmp(cur, v) == 0) return;
     char buf[64];
@@ -8743,61 +8745,53 @@ static const char *bs_deveid_resolve(void) {
     static char s_val[40] = {0};
 
     char live[40] = {0};
-    char pin[40]  = {0};
     int has_live  = bs_dev_read_live(live);
-    int has_pin   = bs_dev_pin_read(pin);
 
     if (has_live) {
-        // ── 真源有值：**它就是唯一权威**，任何情况下不得被我们的存���覆盖 ──
-        if (!has_pin) {
-            // 钉盘还不存在 → 建一次（这是唯一允许的写入时机）
-            bs_dev_pin_write(live, "seed");
-        } else if (strcmp(pin, live) != 0) {
-            // 钉盘与真源不一致：**不改钉盘**，只记录。钉盘写于更早的正确时刻，
-            // 现在的 live 可能是临时值（v6.53 实测过）。要改也只能由人判断。
-            static long s_drift_log = 0;
-            long nowd = (long)time(NULL);
-            if (!s_drift_log || nowd - s_drift_log >= 3600) {
-                s_drift_log = nowd;
-                bs_log("[deveid] ★ DRIFT observed: pin=%.32s live=%.32s "
-                       "-> using LIVE, pin left untouched (v6.75, read-only)",
-                       pin, live);
-            }
-        }
+        // ── 厂商真源有值：**唯一权威，直接返回** ──
         if (!s_val[0] || strcmp(s_val, live) != 0) {
-            snprintf(s_val, sizeof(s_val), "%s", live);
-            bs_log("[deveid] authoritative=%.32s (src=agent, pin=%s)", live,
-                   !has_pin ? "created" : (strcmp(pin, live) ? "differs(kept)" : "same"));
-        }
-        return s_val;
-    }
-
-    if (has_pin) {
-        // ── 真源暂缺：用钉盘缓存（**不写回厂商**，只当本地值用） ──
-        if (strcmp(s_val, pin) != 0) {
-            static long s_rb_log = 0;
-            long nowr = (long)time(NULL);
-            if (!s_rb_log || nowr - s_rb_log >= 600) {
-                s_rb_log = nowr;
-                bs_log("[deveid] using pin cache %.32s (agent not ready, "
-                       "NO write-back to vendor, v6.75)", pin);
+            static int s_first_ok = 0;
+            if (!s_first_ok) {
+                s_first_ok = 1;
+                bs_evt("[deveid] authoritative=%.32s (src=agent TLV, v6.76 read-only, no cache)",
+                       live);
+            } else {
+                bs_evt("[deveid] authoritative changed %.32s -> %.32s (src=agent TLV, v6.76)",
+                       s_val[0] ? s_val : "(none)", live);
             }
-            snprintf(s_val, sizeof(s_val), "%s", pin);
+            snprintf(s_val, sizeof(s_val), "%s", live);
         }
         return s_val;
     }
 
-    // ── 两边都没有：**绝不生成** ──
+    // ── 厂商还没就位：**等待，不生成、不缓存、不回填** ──
+    //
+    //   ★★★★★ v6.76（2026-11-10 用户定策 B：「删除钉盘，并允许等待」）：
+    //
+    //   用户原话（上一轮）：「可以不保存吗，反正都是从厂商生成的设备码获取的」
+    //   ⇒ 钉盘（/var/mobile/Media/.bsdeveid）**彻底废弃**：
+    //       · 不再是判定依据（不再读它做决策）
+    //       · 不再写入（seed 逻辑删除）
+    //       · 装包/卸载时由 postinst/prerm 主动清掉历史遗留文件
+    //
+    //   代价与对策：App 冷启后厂商要几秒~几十秒才把设备码算出来，这期间：
+    //       · /hb 心跳不带 key（云端按 ip 记账，下一拍补上，无副作用）
+    //       · 卡密绑定/心跳 key 延后（调用方看到空串会跳过，不会用错号）
+    //       · 中控设备列表短暂缺这台（几秒后出现）
+    //     这几项本来就是「允许延迟」的操作，等一等换掉整个漂移风险，值得。
+    //
+    //   为什么不能保留钉盘：钉盘是**第二个数据源**，它可能过时、可能被写坏，
+    //   一旦与厂商真值不一致，就会出现「同一台机两个号」的双身份问题（8186/8115 两次事故）。
+    //   删掉它 = 结构上不存在这份不一致。
     if (!s_val[0]) {
-        // ★ 可观测性：静默失败最难查。首次 + 每 5 分钟一条，带已等待时长。
         static long s_first = 0;
         static long s_last_warn = 0;
         long now = (long)time(NULL);
         if (!s_first) s_first = now;
         if (!s_last_warn || now - s_last_warn >= 300) {
             s_last_warn = now;
-            bs_evt("[deveid] PENDING %lds: agent has no dev_id yet & pin empty "
-                   "-> refuse to invent (card bind & heartbeat key deferred)", now - s_first);
+            bs_evt("[deveid] WAITING %lds: agent TLV not ready "
+                   "-> refuse to invent (no cache by design, v6.76)", now - s_first);
         }
     }
     return s_val;
