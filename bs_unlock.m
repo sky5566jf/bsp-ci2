@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.73p"
+  #define BS_DYLIB_VER     "v6.74p"
 #else
-  #define BS_DYLIB_VER     "v6.73"
+  #define BS_DYLIB_VER     "v6.74"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -6100,6 +6100,27 @@ static long bs_us_mark_ts(void) {
 #define AR_GIVEUP_HOLD  1800    // 放弃后静默多久再给一轮机会（防永久躺平）
 static const int AR_BACKOFF[AR_GIVEUP_N] = { 60, 120, 300, 600, 1200 };
 
+// ★★★★★ v6.74（2026-11-10 用户定策）：**func-nil 恢复单独用一套激进的退避**。
+//
+//   用户原话：「可以达成 崩溃后自动重新运行脚本也可以，反正 4~5 小时才一次」。
+//   ⇒ 目标从"根治"降为"能自己爬起来"，那么恢复速度就是主要指标。
+//
+//   旧问题：func-nil 走通用 AR_BACKOFF {60,120,300,600,1200}，而且 att 会一路累加：
+//     第一次崩 → 等 60s
+//     连崩两次 → 等 120s
+//     连崩三次 → 等 300s … 到 att>=5 直接 giveup 静默 30min
+//   但 func-nil **本来就是厂商定时器缺陷**（4~5h 必崩一次），
+//   跟"中控点了没反应"是两回事 —— 不该吃那套失败计数。
+//
+//   新策略（func-nil 专用）：
+//     ① 崩溃后**20 秒**就重拉（不用等 60s，用户感知更快）
+//     ② 退避只到 120s 封顶（20/40/60/90/120），永远不到 giveup
+//     ③ 不走 att 累加 → 不会因为连崩几次就静默 30 分钟
+//     ④ 仍然有 300s 冷却（防同一秒内反复拉，那是真死了）
+static const int AR_FUNCNIL_BACKOFF[5] = { 20, 40, 60, 90, 120 };
+
+#define AR_FUNCNIL_COOL 300     // 两次 func-nil 恢复最小间隔（同 v6.17 CR_COOLDOWN）
+
 // ★★★★★ v6.67：func-nil 专属恢复参数（本 dylib **唯一**允许的自动运行路径）
 //   语义边界（与 v6.24p 用户指令一致）：
 //     「除『脚本本来在跑』与『中控手动下发运行』外，其余一律不得自动运行脚本」。
@@ -7386,7 +7407,19 @@ static void *bs_watchdog(void *arg) {
             int want = 0;
             const char *why = NULL;
             // 启动静默期：躲 App 初始化 / 装包后重建 / bootstrap 铺密钥
-            if (nowa - ar_t0 >= AR_BOOT_GRACE && st == 0) {
+            //
+            // ★★★★★ v6.74：**func-nil 待恢复时把静默期从 180s 缩到 30s**。
+            //   场景：脚本崩了 → 中控/厂商 `restart desktop` → App 重启 → 新进程一个计时器
+            //   从 0 开始 ⇒ 又要等满 180s 才肯动手，用户看到"崩了 3 分钟还没动"。
+            //   而 func-nil 恢复动作本身很轻（OPER_START），App 起来 30s 足够
+            //   （实测 18:39:49 begin run 就是复起的正常速度）。
+            //   仍保留 30s 下限：App 冷启 + dylib 初始化 + st 建立大约需要 15~25s。
+            long boot_grace = AR_BOOT_GRACE;
+            if (g_crashresume && bs_funcnil_mark_age() >= 0 &&
+                bs_funcnil_mark_age() <= FUNCNIL_WIN) {
+                boot_grace = 30;
+            }
+            if (nowa - ar_t0 >= boot_grace && st == 0) {
                 if (run == 0) {
                     want = 1;
                     why = ar_cr_hit ? "crash" : "self-stop";
@@ -7595,21 +7628,45 @@ static void *bs_watchdog(void *arg) {
             }
 
             if (want) {
-                ar.att++;
+                // ★★★★★ v6.74：**func-nil 走独立计数**，不吃通用失败计数。
+                //   原因见 AR_FUNCNIL_BACKOFF 注释：func-nil 是厂商定时器固有缺陷
+                //   （4~5h 必崩一次），跟"中控点了没反应"性质完全不同。
+                //   吃通用计数会导致：连崩几次 → att>=5 → giveup 静默 30 分钟，
+                //   而实际上每次重拉都能正常跑一段，只是又到点崩了。
+                //
+                //   ★★★ 关键细节（.219 实测）：func-nil 恢复后如果又崩，第二次的 why
+                //   会变成 `"crash"`（因为 ar_funcnil_hit 已转成标记、命中条件换了一条）。
+                //   ⇒ 不能只判 `why=="funcnil"`，**标记还在就必须算 func-nil 场景**。
+                //   否则第二次之后就退回慢退避（120s/300s…），用户感知"恢复很慢"。
+                int is_fn = (why && !strcmp(why, "funcnil"))
+                         || (bs_funcnil_mark_age() >= 0 &&
+                             bs_funcnil_mark_age() <= FUNCNIL_WIN);
                 ar.last = nowa;
                 // ★★★ v6.31：开回执窗口 + 记分类基线（分类只看本次 resume 之后新增的日志字节）
                 ar.vfy = nowa + AR_VERIFY_SECS;
                 ar.up  = 0;
                 ar_sjz_mark = bs_file_size(DATA_DIR "/log/sjz.log");
                 ar_ag_mark  = bs_file_size(DATA_DIR "/log/agent.log");
-                int bi = ar.att - 1;
-                if (bi >= AR_GIVEUP_N) bi = AR_GIVEUP_N - 1;
-                ar.next = nowa + AR_BACKOFF[bi];
-                if (ar.att >= AR_GIVEUP_N) { ar.gu = 1; ar.gts = nowa; }
+                int nxt;
+                if (is_fn) {
+                    // func-nil：20/40/60/90/120 封顶，永不 giveup
+                    int fi = ar.att;                  // 用累计次数选档，但**不触发** giveup
+                    if (fi >= 5) fi = 4;
+                    if (fi < 0) fi = 0;
+                    nxt = AR_FUNCNIL_BACKOFF[fi];
+                    ar.att++;                         // 仍累加（用于选档与日志），但不置 gu
+                } else {
+                    ar.att++;
+                    int bi = ar.att - 1;
+                    if (bi >= AR_GIVEUP_N) bi = AR_GIVEUP_N - 1;
+                    nxt = AR_BACKOFF[bi];
+                    if (ar.att >= AR_GIVEUP_N) { ar.gu = 1; ar.gts = nowa; }
+                }
+                ar.next = nowa + nxt;
                 bs_ar_write(&ar, why);
                 bs_evt("[ar] ★ resume #%d (%s) run=%u st=%p hb=%d sjz=%ld next=+%ds%s -> OPER_START",
                        ar.att, why, (unsigned)run, (void *)st, g_hb_ok, a_sja,
-                       AR_BACKOFF[bi], ar.gu ? " GIVEUP-AFTER-THIS" : "");
+                       nxt, (!is_fn && ar.gu) ? " GIVEUP-AFTER-THIS" : "");
                 // ★★★ v6.34：resume 前的模块自检（纯诊断，不阻断）。
                 //   模块目录空 + 拉起的运行 = 必然 `bs_module_lost`（脚本 require 不到），
                 //   厂商会再停一次，只能等 puller 把模块铺回来靠下一轮退避重试。
