@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.72p"
+  #define BS_DYLIB_VER     "v6.73p"
 #else
-  #define BS_DYLIB_VER     "v6.72"
+  #define BS_DYLIB_VER     "v6.73"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -2968,6 +2968,8 @@ static uintptr_t bs_find_base(void) {
 
 // ---------------------------------------------------------------- 模块注入
 static int bs_inject_modules(uintptr_t base);
+// ★ v6.73：func-nil 恢复前要清掉被抹坏的模块字典（定义在 8930+），此处前置声明
+static void bs_wipe_onion_dict(uintptr_t base);
 // ★ v6.63：/hb 下发 code 后要覆盖厂商授权，这两个写入函数定义在后面（8238+），此处前置声明
 static void bs_sync_vendor_expire(void);
 static void bs_sync_vendor_auth_state(int ok);
@@ -7622,6 +7624,48 @@ static void *bs_watchdog(void *arg) {
                     bs_evt("[ar] ★ resume precheck: disk=%d last-injected=%d "
                            "-> resync will re-inject once state appears (v6.36)",
                            pre_n, mod_last_n);
+                }
+
+                // ★★★★★ v6.73（2026-11-10，.219 实测）：**func-nil 恢复必须重灌模块**。
+                //
+                //   实测现场（.219，v6.72 装好之后）：
+                //     18:33:06 [ar] ★ func-nil resume restores armed/lst (0/0 -> 1/1)
+                //     18:33:06 [ar] ★ OPER_START issued (why=funcnil)
+                //     18:33:08 [ar] resume#1 verified (st!=0) -> started     ← 起来了
+                //     18:33:18 [cr] crash detected (agent.log)               ← 10 秒后又崩
+                //
+                //   原因：func-nil 的根因是 `wait_call_func` 4~5h 定时器把 **模块全局函数**
+                //   抹成 nil（v6.17 定论）。只发 OPER_START 只是让厂商重新 `load script`，
+                //   而 onion 字典里那几段模块代码**还是同一份**、函数早已是 nil
+                //   ⇒ 重新加载拿回的仍是 nil ⇒ 必崩。**光"拉起来"治不好这个病。**
+                //
+                //   正确做法：恢复前先把模块字典清空、强制重灌（bs_inject_modules 重新
+                //   把磁盘上的 .lua 灌进字典），让脚本 load 到的是**新鲜函数**。
+                //   这也是 v6.17 时代 CR 链路的原意，只是搬进 [ar] 时漏了这一步。
+                //
+                //   ★ 只在 why=="funcnil" 时做（其他原因停的脚本不需要动模块）。
+                //   ★ 清字典用 bs_wipe_onion_dict —— 它本来就为此而写（注释：「不清的后果：
+                //     中控一点运行，厂商脚本引擎直接用封禁前注入的旧模块跑」）。
+                //
+                //   ★★★ 时序关键：**必须先灌完模块再发 OPER_START**，否则脚本 load 到的是空字典。
+                //   做法：这里同步调 bs_inject_modules 重灌（watchdog 线程上下文，
+                //   st 已就绪，runtime 早已初始化，历史上同位置注入是安全的 ——
+                //   见下面 g_need_inject 分支的注释）。灌完再往下发 OPER_START。
+                if (why && !strcmp(why, "funcnil")) {
+                    bs_wipe_onion_dict(base);
+                    int re_n = -1;
+                    if (st != 0) {
+                        re_n = bs_inject_modules(base);
+                        mod_last_n = re_n;
+                        bs_evt("[ar] ★ func-nil reinject: dict wiped + %d module(s) re-laid "
+                               "synchronously BEFORE OPER_START (v6.73)", re_n);
+                    } else {
+                        // st 还没起来 → 只能置位交给 watchdog，等 state 出现再灌
+                        g_need_inject = 1;
+                        bs_evt("[ar] ★ func-nil reinject: st==0, defer to watchdog "
+                               "(need_inject=1) (v6.73)");
+                    }
+                    g_pull_now = 1;                 // 顺带核对磁盘模块（可能被厂商抹过）
                 }
                 ((void (*)(int))(base + FN_SET_OPER))(OPER_START);
                 bs_cr_mark_clear();
