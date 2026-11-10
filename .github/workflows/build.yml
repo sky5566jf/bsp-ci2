@@ -323,7 +323,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "cloud deliver overrides kicked card" || (echo "MISSING v6.53 kicked-override log" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud deliver overrides dead card" || (echo "MISSING v6.53 dead-card-override log" && exit 1)
           # ===== v6.54（2026-11-02）：音量键停不被拉起 + 设备码严格跟厂商真源 =====
-          strings bs_unlock.dylib | grep -q "identity re-settled" || (echo "MISSING v6.54 identity re-settle log" && exit 1)
+          strings bs_unlock.dylib | grep -q "identity follows vendor live" || (echo "MISSING v6.75 identity-follow log" && exit 1)
           strings bs_unlock.dylib | grep -q "vendor live drift adopted" || (echo "MISSING v6.54 drift-adopted log" && exit 1)
           strings bs_unlock.dylib | grep -q "center operate evidence" || (echo "MISSING v6.54 center-evidence arm log" && exit 1)
           strings bs_unlock.dylib | grep -q "gate KEPT, " || (echo "MISSING v6.54 gate-kept log" && exit 1)
