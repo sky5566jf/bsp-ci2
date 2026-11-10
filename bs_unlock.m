@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.76p"
+  #define BS_DYLIB_VER     "v6.77p"
 #else
-  #define BS_DYLIB_VER     "v6.76"
+  #define BS_DYLIB_VER     "v6.77"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -1322,6 +1322,13 @@ static int           g_note_boot        = 0;   // 0=本次启动还没清过场
 //   否则中控「运行」列会停在旧值（原厂状态包并不是每次运行状态变化都发）。
 static int           g_note_lastrun     = -1;  // -1 = 还没推过
 static volatile int  g_card_blocked   = 0;     // 1=封禁（未激活/过期/冻结/绑他机/宽限耗尽）
+// ★★★★★ v6.77：**跨项目标志**（盘上 beta.so ≠ 卡密项目）。
+//   与 g_card_blocked 严格区分：
+//     g_card_blocked=1 → 授权不合法 → 清字典 + 删模块（v6.23i 封禁动作）
+//     g_prj_mismatch=1 → 只是包不对   → **只拒绝本次运行**，绝不清场
+//   事故来源：.219 装包后盘上是内置的 sjz 包、卡是 csws，
+//   旧代码把它当"未授权"⇒ 每拍清场 ⇒ 脚本永远起不来（崩溃 37 次）。
+static volatile int  g_prj_mismatch   = 0;     // 1=跨项目（包不对，非授权问题）
 static volatile long g_card_expire    = 0;     // 到期 unix ts（0=未知）
 static volatile long g_card_lastok    = 0;     // 最近一次校验成功时间
 static char          g_card_cur[80]   = {0};   // 上次见过的卡密（变更→重新激活）
@@ -7456,6 +7463,12 @@ static void *bs_watchdog(void *arg) {
                     //   [ar] 下一拍就能接上（最坏 AR_KILL_COOL_NET=90s）。
                     //   删掉这条就等于「断网恢复后必须人工点运行」，这就是事故本体。
                     want = 0; hold = "hb-not-ok";
+                } else if (g_prj_mismatch) {
+                    // ★★★★★ v6.77：**跨项目时不允许自动恢复**。
+                    //   原因：盘上包属于别的项目，即使拉起来也是跑错的脚本。
+                    //   但**不清场**（字典/模块原样保留），只等跟版线程把正确包换回来。
+                    //   ⇒ 与 v6.23i 的 blocked 封禁动作彻底分开。
+                    want = 0; hold = "prj-mismatch";
                 } else if (us_latched || bs_us_mark_exists()) {
                     // ★★★★★ v6.68（2026-11-09，8112 实测死锁）：**崩溃续跑必须能穿透人停闸门**。
                     //
@@ -9953,23 +9966,52 @@ static void *bs_cardwatch(void *arg) {
         //     · 发 OPER_STOP 停掉正在跑的脚本
         //     · 每拍打日志；跟版线程会按 BS_PRJ 重拉本项目包，包到位后自动解除
         //   ★ 只在 cardcheck=1（有卡密体系）时生效；cardcheck=0 的纯解锁机不碰。
+        //   ★★★★★ v6.77（2026-11-10，.219 事故）：**跨项目不再判 BLOCKED**。
+        //
+        //   事故现场（.219，csws，装 bspath 2.26 后）：
+        //     ① postinst 把**包内内置的 sjz beta.so（030104）**落盘
+        //     ② 卡是 csws ⇒ 闸门发现 "disk ver 030104 != card prj 'csws'"
+        //     ③ 旧代码把它当 "UNAUTHORIZED" ⇒ `blocked = 1`
+        //     ④ blocked=1 触发 v6.23i 的封禁动作：**每拍清空 onion 字典 + 删本地模块**
+        //     ⑤ 字典被清、模块被删 ⇒ 脚本 `attempt to call local 'func' (a nil value)`
+        //     ⑥ [ar] 自动恢复拉起 ⇒ 又撞闸门 ⇒ 又清场 ⇒ 又崩 —— 无限快速失败循环
+        //   实测对比：`.111`(sjz) prj guard=3 / 崩溃=11 正常；
+        //             `.219`(csws) prj guard=11 / 崩溃=37 卡死。差 3.7 倍，铁证。
+        //
+        //   ★ 语义纠正：卡是有效的（verdict_ok=1），只是**盘上包属于别的项目**。
+        //     这是"包不对"，不是"授权不合法"。两者的处置必须分开：
+        //       · 授权不合法（卡过期/撤销）→ BLOCKED → 清场是对的
+        //       · 包不对（跨项目）        → **只拒绝本次运行 + 等跟版线程换包**，
+        //                                   绝不能清字典/删模块（那会把设备搞成"永远起不来"）
+        //   现状改为：置 g_prj_mismatch 标志（供 [ar] 闸门用），不碰 blocked。
         if (g_cardcheck && !blocked && verdict_ok) {
             static int prj_blocked = 0;
-            if (bs_prj_guard_check(0)) {
+            // ★ v6.77：`0` → `1`。**必须强制换包**。
+            //   旧写法传 0（只检查不换包），导致 .219 的 csws 设备：
+            //     发现盘上是 sjz 包 → 只是拒绝运行 → 但**从不主动去拉正确的 csws 包**
+            //     → 卡在"永远不匹配"状态 → 每次运行都撞闸门。
+            //   传 1 会让 bs_so_state 的 md5 清空 ⇒ so_sync 判定"盘上包不是想要的"
+            //   ⇒ 走 self-heal 下载本项目包（实测链路：`[so] ★ self-heal -> download ver=010803`）。
+            if (bs_prj_guard_check(1)) {
                 if (!prj_blocked) {
                     prj_blocked = 1;
-                    bs_log("[prj guard] ★★ cross-project run: card prj=%s"
-                           " != on-disk pkg -> treated as UNAUTHORIZED, OPER_STOP", BS_PRJ);
-                    bs_evt("[prj guard] mismatch -> treated as unauthorized");
+                    bs_log("[prj guard] ★★ cross-project: card prj=%s"
+                           " != on-disk pkg -> refuse RUN only, do NOT wipe modules (v6.77)", BS_PRJ);
+                    bs_evt("[prj guard] mismatch -> run refused, gates kept intact (v6.77)");
                     if (base)
                         ((void (*)(int))(base + FN_SET_OPER))(OPER_STOP);
                 }
-                blocked = 1;
-            } else if (prj_blocked) {
-                prj_blocked = 0;
-                bs_log("[prj guard] on-disk pkg back to card prj %s -> resolved", BS_PRJ);
-                bs_evt("[prj guard] resolved (on-disk == %s)", BS_PRJ);
+                g_prj_mismatch = 1;     // ★ 只标记，不置 blocked（不清字典/不删模块）
+            } else {
+                g_prj_mismatch = 0;
+                if (prj_blocked) {
+                    prj_blocked = 0;
+                    bs_log("[prj guard] on-disk pkg back to card prj %s -> resolved", BS_PRJ);
+                    bs_evt("[prj guard] resolved (on-disk == %s)", BS_PRJ);
+                }
             }
+        } else {
+            g_prj_mismatch = 0;
         }
 
         if (blocked != prev_blocked) {
