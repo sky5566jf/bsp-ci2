@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.74p"
+  #define BS_DYLIB_VER     "v6.75p"
 #else
-  #define BS_DYLIB_VER     "v6.74"
+  #define BS_DYLIB_VER     "v6.75"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -2723,7 +2723,10 @@ static void bs_identity_tick(void) {
     if (!prev[0])
         bs_evt("[id] token settled %.8s (src=agent.dev_id) conf_write=%d", g_token, w);
     else
-        bs_evt("[id] identity re-settled %.8s -> %.8s (vendor live drift adopted) conf_write=%d",
+        // ★ v6.75：文案改为中性。旧文案 `vendor live drift adopted` 读起来像是
+        //   "我们主动采纳了漂移"，实际只是**忠实跟随厂商真源**（v6.54 起每拍重读）。
+        //   8115 复盘后统一口径：号只在厂商手里，我们只做只读镜像。
+        bs_evt("[id] identity follows vendor live %.8s -> %.8s (source=agent TLV) conf_write=%d",
                prev, g_token, w);
     bs_log("[id] identity settled devid=%.32s q=%s", g_token, g_qbuf);
 }
@@ -8663,7 +8666,12 @@ static int bs_dev_read_live(char out[40]) {
 }
 
 /// 把值写回 Agent 的真值全局（仅冷启窗口使用）。返回 1 = 已下发。
-static int bs_dev_write_live(const char *v) {
+///
+/// ★★★★★ v6.75：**本函数已停止使用，保留定义仅为将来需要时不再重写一遍**。
+///   用户原则：「不管什么情况下我们都不能自己生成」—— 同理，往厂商内存里写我们的值
+///   也是一种干预。8115 漂移复盘后，全部回填调用已删除（见 bs_deveid_resolve 注释）。
+///   加 unused 属性防 -Wunused-function。
+static int __attribute__((unused)) bs_dev_write_live(const char *v) {
     static bs_dev_set_fn s_set = NULL;
     static int s_init = 0;
     if (!s_init) {
@@ -8708,6 +8716,29 @@ static void bs_dev_pin_write(const char *v, const char *why) {
 
 /// **唯一决策点**：全项目所有"设备号"都必须经过这里。
 /// 返回进程内静态缓冲区；空串 = 真源尚未就位（调用方必须跳过绑定）。
+///
+/// ★★★★★ v6.75（2026-11-10 用户定策，8115 漂移复盘后重写）：
+///
+///   用户原话：「厂商贝塔 App 自己读取的是什么设备码就应该跟他一样，
+///             不管什么情况下我们都不能自己生成」
+///
+///   这是**唯一正确的原则**，之前的实现违背了它两处：
+///     ① `bs_dev_write_live(pin)` —— **往厂商内存里写我们的值**。
+///        虽本意是"冷启动窗口提前可用"，但本质是**干预厂商**。
+///        一旦写进去，后续厂商自己的 TLV 可能被污染，且我们无法预知 setter 的副作用。
+///     ② `drift adopted` —— **只要 live 有值就无条件覆盖钉盘**。
+///        若某次 live 读到临时/异常值（v6.53 时期确有发生），钉盘被永久写坏，
+///        而钉盘又会反过来影响后续 —— 这才是 8115 从 48dc9764 漂到 feee23d4 的元凶。
+///
+///   现语义（严格三段，无第四种情况）：
+///     · live 有值          → **只信 live**。钉盘仅在**空时**建立一次（seed），
+///                            之后**永不改写**（哪怕 live 变了也不动钉盘，
+///                            只在日志里记一条 drift 供人排查）。
+///     · live 无值 + 钉盘有值 → 用钉盘（**但不回填厂商**，纯读缓存），
+///                            且打 `restore` 日志说明这是缓存值、不是真源。
+///     · 两边都无            → 返回空串，**绝不生成**（调用方跳过绑定/心跳）。
+///
+///   ⇒ 我们彻底退出"决定设备号"这件事：号只在厂商手里生成，我们只做只读镜像。
 static const char *bs_deveid_resolve(void) {
     static char s_val[40] = {0};
 
@@ -8717,36 +8748,48 @@ static const char *bs_deveid_resolve(void) {
     int has_pin   = bs_dev_pin_read(pin);
 
     if (has_live) {
-        // 真源有值 = 权威。钉盘跟随（换机/刷机导致号变了也自动跟上）
-        if (!has_pin || strcmp(pin, live) != 0)
-            bs_dev_pin_write(live, has_pin ? "drift adopted" : "seed");
+        // ── 真源有值：**它就是唯一权威**，任何情况下不得被我们的存���覆盖 ──
+        if (!has_pin) {
+            // 钉盘还不存在 → 建一次（这是唯一允许的写入时机）
+            bs_dev_pin_write(live, "seed");
+        } else if (strcmp(pin, live) != 0) {
+            // 钉盘与真源不一致：**不改钉盘**，只记录。钉盘写于更早的正确时刻，
+            // 现在的 live 可能是临时值（v6.53 实测过）。要改也只能由人判断。
+            static long s_drift_log = 0;
+            long nowd = (long)time(NULL);
+            if (!s_drift_log || nowd - s_drift_log >= 3600) {
+                s_drift_log = nowd;
+                bs_log("[deveid] ★ DRIFT observed: pin=%.32s live=%.32s "
+                       "-> using LIVE, pin left untouched (v6.75, read-only)",
+                       pin, live);
+            }
+        }
         if (!s_val[0] || strcmp(s_val, live) != 0) {
             snprintf(s_val, sizeof(s_val), "%s", live);
             bs_log("[deveid] authoritative=%.32s (src=agent, pin=%s)", live,
-                   !has_pin ? "created" : (strcmp(pin, live) ? "updated" : "same"));
+                   !has_pin ? "created" : (strcmp(pin, live) ? "differs(kept)" : "same"));
         }
         return s_val;
     }
 
     if (has_pin) {
-        // Agent 还没收到服务端下发：回填钉盘值，让下游从第一秒就一致
+        // ── 真源暂缺：用钉盘缓存（**不写回厂商**，只当本地值用） ──
         if (strcmp(s_val, pin) != 0) {
-            static int s_rb_fail = 0;
-            if (bs_dev_write_live(pin))
-                bs_evt("[deveid] restore %.32s -> agent (ahead of server TLV)", pin);
-            else if (s_rb_fail < 3) {
-                s_rb_fail++;
-                bs_log("[deveid] restore skipped (setter unavailable) pin=%.32s", pin);
+            static long s_rb_log = 0;
+            long nowr = (long)time(NULL);
+            if (!s_rb_log || nowr - s_rb_log >= 600) {
+                s_rb_log = nowr;
+                bs_log("[deveid] using pin cache %.32s (agent not ready, "
+                       "NO write-back to vendor, v6.75)", pin);
             }
             snprintf(s_val, sizeof(s_val), "%s", pin);
         }
         return s_val;
     }
 
-    // 两边都没有：绝不生成
+    // ── 两边都没有：**绝不生成** ──
     if (!s_val[0]) {
-        // ★ 可观测性：静默失败最难查。首次 + 每 5 分钟一条，带已等待时长，
-        //   中控/云端 devlog 一眼能看出「是设备号没下来」而不是「卡坏了」。
+        // ★ 可观测性：静默失败最难查。首次 + 每 5 分钟一条，带已等待时长。
         static long s_first = 0;
         static long s_last_warn = 0;
         long now = (long)time(NULL);
