@@ -49,7 +49,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "hard-fail CLEARED by center run evidence" || (echo "MISSING v6.66 hard-fail clear on center run" && exit 1)
           # ★ v6.67：func-nil 是本 dylib 唯一允许的自动运行路径
           strings bs_unlock.dylib | grep -q "func-nil EXEMPT: hard-fail bypassed" || (echo "MISSING v6.67 func-nil hard-fail exemption" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.75" || (echo "MISSING v6.75 tag" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.76" || (echo "MISSING v6.76 tag" && exit 1)
           # ★ v6.68：崩溃续跑穿透人停闸门 + 3 种真实签名
           strings bs_unlock.dylib | grep -q "func-nil PIERCES center-stop" || (echo "MISSING v6.68 pierce gate" && exit 1)
           # ★ v6.65：激活即推状态包 + 叫醒 puller + 递减退避
