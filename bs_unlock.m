@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.78p"
+  #define BS_DYLIB_VER     "v6.79p"
 #else
-  #define BS_DYLIB_VER     "v6.78"
+  #define BS_DYLIB_VER     "v6.79"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -7724,7 +7724,27 @@ static void *bs_watchdog(void *arg) {
                 //   做法：这里同步调 bs_inject_modules 重灌（watchdog 线程上下文，
                 //   st 已就绪，runtime 早已初始化，历史上同位置注入是安全的 ——
                 //   见下面 g_need_inject 分支的注释）。灌完再往下发 OPER_START。
-                if (why && !strcmp(why, "funcnil")) {
+                //
+                // ★★★★★ v6.79（2026-11-10，.219 实证）：**整段停用**。
+                //
+                //   实测时序（.219，v6.78，csws）：
+                //     23:48:13 agent run script
+                //     23:48:25 崩
+                //     23:48:26 agent run script（[ar] 拉起）
+                //     23:48:28 [wd] state change st=0x... dict=0x9ce819c30 (empty=0) -> inject
+                //     23:48:36 崩
+                //     23:48:46 agent run script（又拉）
+                //     23:48:48 [wd] state change st=0x... dict=0x9ce819c30 (empty=0) -> inject
+                //   ⇒ **每次拉起都伴随一次 re-inject，然后 10 秒内又崩**。
+                //
+                //   机理：本段在 `st == 0` 时置 `g_need_inject = 1`，
+                //   watchdog 在**厂商刚开始 load script 的那一拍**执行注入
+                //   ⇒ 模块字典在 load 中途被换 ⇒ 脚本后半段拿到 nil ⇒ 崩 ⇒ 又触发恢复 ⇒ 死循环。
+                //
+                //   ★ 结论（与 v6.78 一致）：**运行时永远不要主动清字典/重灌**。
+                //     字典空了（count==0）watchdog 会自己灌（v6.78 的 dict_empty 兜底），
+                //     不需要这里再"关心"一次。恢复脚本**只发 OPER_START**，别碰模块。
+                if (0 && why && !strcmp(why, "funcnil")) {
                     bs_wipe_onion_dict(base);
                     int re_n = -1;
                     if (st != 0) {
@@ -7897,11 +7917,23 @@ static void *bs_watchdog(void *arg) {
                 // 退化成每拍 opendir —— 记 1 把它变成正常时间戳。
                 mod_sync_at = nows ? nows : 1;
                 int cur = bs_count_local_modules();
-                if (cur != mod_last_n && cur != mod_try_n) {
-                    mod_try_n = cur;
-                    bs_log("[mod] resync: disk=%d last=%d -> re-inject", cur, mod_last_n);
-                    mod_last_n = bs_inject_modules(base);
-                    bs_log("[mod] resync done n=%d", mod_last_n);
+                // ★★★★★ v6.79：**脚本运行中绝不重灌**（run != 0 直接跳过）。
+                //   与 v6.78 同一理由：任何在 load/运行期替换字典的行为都会让脚本拿到 nil。
+                //   盘面变了要补模块，也得等脚本停下来再补 —— 那时才会重新 load。
+                if (run == 0) {
+                    if (cur != mod_last_n && cur != mod_try_n) {
+                        mod_try_n = cur;
+                        bs_log("[mod] resync: disk=%d last=%d -> re-inject", cur, mod_last_n);
+                        mod_last_n = bs_inject_modules(base);
+                        bs_log("[mod] resync done n=%d", mod_last_n);
+                    }
+                } else if (cur != mod_last_n) {
+                    static long s_hold_log = 0;
+                    if (!s_hold_log || nows - s_hold_log >= 300) {
+                        s_hold_log = nows;
+                        bs_log("[mod] resync DEFERRED: script running (run=%u disk=%d last=%d)",
+                               (unsigned)run, cur, mod_last_n);
+                    }
                 }
             }
         }
