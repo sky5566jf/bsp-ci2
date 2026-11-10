@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.79p"
+  #define BS_DYLIB_VER     "v6.80p"
 #else
-  #define BS_DYLIB_VER     "v6.79"
+  #define BS_DYLIB_VER     "v6.80"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -6382,9 +6382,31 @@ static int bs_ar_stop_kind(const char *path, long want) {
                     if (!lr || p > lr) { netfail = 1; break; }
                 } else if (!strncmp(p, "connect remote server", 21)) {
                     // ★ v6.54：排除成功行 "connect remote serverN:P success!"
+                    //
+                    // ★★★★★ v6.80（2026-11-10，.219 实测）：**上面这行排除根本无效**。
+                    //
+                    //   实际日志行是：`connect remote server2:14 success!`
+                    //                                        ↑ p+21 指向这里（是 '2'）
+                    //   而比较的是 `strncmp(tail, " success", 8)` —— tail 以 '2' 开头，
+                    //   与 " success"（以空格开头）必然不等 ⇒ is_ok 恒为 0
+                    //   ⇒ **每一条"连接成功"都被当成网络失败** ⇒ kind=6 误判 ⇒ [ar] 拒绝恢复。
+                    //
+                    //   实测后果（.219，17:34）：脚本僵死 2 小时后 func-nil，[ar] 收到崩溃信号，
+                    //   却因为窗口里有 `connect remote server2:14 success!` 判成 kind=6 自停，
+                    //   **永不恢复**（日志连打两条 `stop evidence = network failure (kind=6)`）。
+                    //   而厂商 agent 每 30s 就发一次 success 行 ⇒ 这个窗口几乎必中 ⇒
+                    //   该设备**所有**自动恢复全部失效。
+                    //
+                    //   修法：向后**搜索** " success"（不要求紧邻），命中即视为成功行。
                     const char *tail = p + 21;
-                    size_t room = (size_t)(ls - tail) < 24 ? (size_t)(ls - tail) : 24;
-                    int is_ok = room >= 8 && strncmp(tail, " success", 8) == 0;
+                    size_t room = (size_t)(ls - tail) < 40 ? (size_t)(ls - tail) : 40;
+                    int is_ok = 0;
+                    for (size_t k = 0; k + 8 <= room; k++) {
+                        if (tail[k] == ' ' && !strncmp(tail + k, " success", 8)) {
+                            is_ok = 1;
+                            break;
+                        }
+                    }
                     if (!is_ok && (!lr || p > lr)) { netfail = 1; break; }
                 }
                 ++p;
