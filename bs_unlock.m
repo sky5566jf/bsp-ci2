@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.71p"
+  #define BS_DYLIB_VER     "v6.72p"
 #else
-  #define BS_DYLIB_VER     "v6.71"
+  #define BS_DYLIB_VER     "v6.72"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -5971,6 +5971,12 @@ static long bs_cr_mark_age(void) {          // -1 = 无 marker
     long a = (long)(time(NULL) - (time_t)sb.st_mtime);
     return a < 0 ? 0 : a;
 }
+/// ★ v6.72：崩溃证据的时间戳（-1 = 无）。用来判断「证据早于人停还是晚于人停」。
+static long bs_cr_mark_ts(void) {
+    struct stat sb;
+    if (stat(CR_MARK, &sb) != 0) return -1;
+    return (long)sb.st_mtime;
+}
 
 // ★★★★★ v6.67：func-nil 专属恢复标记（本 dylib 唯一允许的自动运行路径）
 //   为什么需要持久化标记：ar_funcnil_hit 只在「本轮扫到新字节」时为 1，下一拍归零；
@@ -7007,6 +7013,61 @@ static void *bs_watchdog(void *arg) {
             }
         }
 
+        // --- ★★★★★ v6.72（2026-11-10，设备 103a10f1 实证）：func-nil **尾部全文复查** ---
+        //
+        //   问题：上面的增量扫描只看 `sz > cr_size` 那一截。脚本崩溃停下来之后
+        //   agent.log **不再增长** ⇒ 增量恒为 0 ⇒ 永远扫不到签名 ⇒ `ar_funcnil_hit` 恒 0
+        //   ⇒ hard-fail / giveup 的 func-nil 豁免全部失效（103a10f1 就是 67 拍都在等这个）。
+        //
+        //   现场（103a10f1，bs_unlock.log 8846 行）：tag 统计
+        //     pull 3855 / off 3751 / hb 670 / devlog 335 / card 167 / cr 67 / log 1
+        //     —— **[ar] 一条都没有**，状态恒 `run=0 st=0 us=1 ar=0/0/2 lst=0`。
+        //
+        //   做法：不论有没有新字节，**每 FUNCNIL_RESCAN 秒对 agent.log 尾部 64KB 做一次
+        //   全文签名复查**（不限增量）。命中即写 `.cr_funcnil` 持久标记，
+        //   后续每拍的判定都走标记，不再依赖"这一拍刚好扫到"。
+        //   频率 60s 一次、每次读 64KB，开销可忽略；只在 run==0 时做（跑着就不需要）。
+        if (g_crashresume && run == 0 && !g_card_blocked) {
+            static time_t s_fn_rescan = 0;
+            time_t nowr = time(NULL);
+            if (nowr - s_fn_rescan >= 60) {
+                s_fn_rescan = nowr;
+                char ap2[300];
+                snprintf(ap2, sizeof(ap2), "%s/log/agent.log", DATA_DIR);
+                int fd2 = open(ap2, O_RDONLY);
+                if (fd2 >= 0) {
+                    struct stat sb2;
+                    if (fstat(fd2, &sb2) == 0 && sb2.st_size > 0) {
+                        long want2 = 65536;
+                        long off2 = ((long)sb2.st_size > want2) ? (long)sb2.st_size - want2 : 0;
+                        long len2 = (long)sb2.st_size - off2;
+                        char *buf2 = (char *)malloc((size_t)len2 + 1);
+                        if (buf2) {
+                            lseek(fd2, off2, SEEK_SET);
+                            ssize_t g2 = read(fd2, buf2, (size_t)len2);
+                            if (g2 > 0) {
+                                buf2[g2] = 0;
+                                // 只认 v6.68 那 3 种可自动恢复的签名
+                                int fn2 = (strstr(buf2, "attempt to call local 'func' (a nil value)") != NULL ||
+                                           strstr(buf2, "attempt to call local func (a nil value)")  != NULL ||
+                                           strstr(buf2, "bs_module_lost:")                          != NULL);
+                                if (fn2) {
+                                    long have = bs_funcnil_mark_age();
+                                    if (have < 0 || have > FUNCNIL_WIN) {
+                                        bs_funcnil_mark_write();
+                                        bs_evt("[cr] ★ func-nil tail-rescan HIT "
+                                               "(run=0, no new bytes) -> mark written (v6.72)");
+                                    }
+                                }
+                            }
+                            free(buf2);
+                        }
+                    }
+                    close(fd2);
+                }
+            }
+        }
+
         // --- ★ v6.24e：停摆兜底扫描（不依赖日志增量）---
         //   cr_pending 只在「本轮扫到新签名行」时置位；而 dylib 进程一旦重启，
         //   cr_size 基线重置 → 崩溃签名永远扫不到 → 静默停摆（10-19 07:57 .216：
@@ -7046,10 +7107,37 @@ static void *bs_watchdog(void *arg) {
                 //   kind==2 才有「stop 前无错误签名」这一层约束，是唯一可信的人停判据。
                 ar_stop_kind = bs_ar_stop_kind(ap, 262144);
                 int us_stop = us_latched || (ar_stop_kind == 2);
+                // ★★★★★ v6.72（2026-11-10，设备 103a10f1 实证）：**这里不能无条件清崩溃证据**。
+                //
+                //   事故现场（103a10f1，csws，bspath 2.23/dylib v6.71）：
+                //     bs_unlock.log 8846 行，tag 统计 pull 3855 / off 3751 / hb 670 /
+                //     devlog 335 / card 167 / cr 67 ——**一条 [ar] / [us] 都没有**，
+                //     67 拍（约 5.6h）状态恒为 `run=0 st=0 us=1 ar=0/0/2 lst=0`。
+                //     即「[ar] 一次都没真正动手」，功能全在，路径全被堵死。
+                //
+                //   堵死的链：脚本停后 agent.log 不再增长 ⇒ 增量扫描永远扫不到 func-nil 签名
+                //   ⇒ ar_funcnil_hit 恒 0 ⇒ ① hard-fail 分支的 func-nil 豁免不成立
+                //   ② .cr_funcnil 持久标记永远不写 ⇒ user-stop 穿透也不成立。
+                //
+                //   ★ 而这段每 CR_STALL_SCAN(300s) 一拍，只要 us_stop 就把 mage 抹成 -1，
+                //     **哪怕标记真的写过也会被这里清掉** —— 等于在"人曾停过一次"的设备上，
+                //     func-nil 续跑永远没有机会。
+                //
+                //   语义辨析：`us_stop` 的含义是「停的归属是人」，
+                //   而 func-nil 证据的含义是「脚本曾经因为模块被抹而崩过」。
+                //   两者不是同一件事 —— 人停之后脚本再崩，崩溃证据仍然有效，
+                //   不该因为"上一次是人停的"就把新产生的崩溃证据抹掉。
+                //   旧代码混为一谈（v6.34 为修"厂商错停被误认为人停"而加），
+                //   现在只保留**真正需要的那一半**：清 ar 状态，不清崩溃证据。
                 if (us_stop) {
-                    // 用户停的：把残留崩溃证据也作废，避免误导后续诊断
-                    if (mage >= 0) bs_cr_mark_clear();
-                    mage = -1;
+                    // ★ 只作废「人停之前的」崩溃证据；人停之后新产生的必须留着。
+                    long umk2 = bs_us_mark_ts();
+                    long cmk2 = bs_cr_mark_ts();
+                    if (mage >= 0 && umk2 >= 0 && cmk2 >= 0 && cmk2 < umk2) {
+                        bs_cr_mark_clear();     // 证据早于人停 ⇒ 确是旧证据，作废
+                        mage = -1;
+                    }
+                    // 人停之后产生的崩溃证据（cmk2 > umk2）保留，交给 [ar] 的 func-nil 判定
                 }
                 // ★★★ v6.28：agent.log 尾部「最后一条 run/stop 事件是谁的」——60s 一次，
                 //   零额外开销（本来就要读这块）。这是「中控下发运行」的第二证据源：
@@ -7186,7 +7274,32 @@ static void *bs_watchdog(void *arg) {
         //     （v6.28 把旧 5 个入口换成 [ar] 时漏了这个条件，导致该开关空转了一整版。）
         //     注意：postinst 的 conf_set 会强制写 1，历史现场被手改成 0 的机器装包后自动恢复；
         //     想让某台机器不自动拉起，装包后再改文件（此处只读，不覆盖现场）。
-        if (g_mode == MODE_UNLOCK && ar.armed && ar.lst && g_crashresume) {
+        //     ★★★★★ v6.72（2026-11-10，103a10f1 实证）：入口条件补一条「func-nil 标记」旁路。
+        //
+        //   原条件 `ar.armed && ar.lst` 意味着「中控给了运行权」且「曾经看到脚本确实在跑」。
+        //   但 103a10f1 的落盘状态是 `ar=0/0/2 lst=0`（lst 被前一个进程清成 0），
+        //   于是 **整个 [ar] 块一次都没进去** —— bs_unlock.log 8846 行里 `[ar]` 标签计数为 0，
+        //   所有恢复逻辑（含 v6.68 的 func-nil 穿透）全部形同不存在。
+        //
+        //   语义上 `lst=0` 只说明"现在没观察到在跑"，但 func-nil 标记证明的是
+        //   "这台机最近确实因为模块被抹而崩过、且当时是跑的"。
+        //   两者冲突时，**崩溃证据更具体**，应让它有机会走到判定矩阵里，
+        //   由矩阵里的硬闸门（card-blocked / hb-not-ok / user-stop / center-stop）决定放不放。
+        //   ⇒ 不直接放行，只是"允许进入判定"，安全性由矩阵保证。
+        int ar_enter = ar.armed && ar.lst;
+        if (!ar_enter && g_crashresume && !ar.armed && !ar.lst &&
+            bs_funcnil_mark_age() >= 0 && bs_funcnil_mark_age() <= FUNCNIL_WIN) {
+            ar_enter = 1;
+            static time_t s_bypass_log = 0;
+            time_t nowby = time(NULL);
+            if (nowby - s_bypass_log >= 300) {
+                s_bypass_log = nowby;
+                bs_evt("[ar] ★ func-nil mark present with armed=0 lst=0 "
+                       "-> enter matrix anyway (v6.72, mark_age=%lds)",
+                       (long)bs_funcnil_mark_age());
+            }
+        }
+        if (g_mode == MODE_UNLOCK && ar_enter && g_crashresume) {
             time_t nowa  = time(NULL);
             long   a_sja = bs_file_age(DATA_DIR "/log/sjz.log");
 
@@ -7362,6 +7475,36 @@ static void *bs_watchdog(void *arg) {
                         kage3 <= AR_KILL_SELF_WIN) {
                         bs_evt("[ar] matrix: center-stop is OUR killswitch (%lds ago) "
                                "-> not blocking", kage3);
+                    } else if (g_crashresume &&
+                               (ar_funcnil_hit || bs_funcnil_mark_age() >= 0)) {
+                        // ★★★★★ v6.72（2026-11-10）：`center-stop` 也允许 func-nil 穿透。
+                        //
+                        //   103a10f1 现场：00:47:26 func-nil 崩 → 00:47:51 中控下发
+                        //   `begin process operate script msg` → 判成 center-stop，
+                        //   之后 9 小时一次 run 都没有。用户**不记得**是自己点的还是
+                        //   中控/厂商自动发的（"这个我不确定 忘记了"）。
+                        //
+                        //   语义判别：无论谁点的"停止"，它表达的都是「现在别跑了」，
+                        //   而 func-nil 表达的是「它自己跑崩了、模块被抹了」。
+                        //   这两个意图冲突时，取**时间更晚的一方**：
+                        //     停止发生在崩溃之后 → 人的意图更新 → 不恢复
+                        //     崩溃发生在停止之后 → 是停着停着又崩（或崩溃时日志才落盘）→ 可恢复
+                        //   用 `.bs_userstop` / 崩溃标记的 mtime 比较即可，与 v6.68 的
+                        //   user-stop 穿透同一套判据，行为可预期。
+                        long umkC = bs_us_mark_ts();
+                        long fmkC = bs_funcnil_mark_ts();
+                        long cmkC = bs_cr_mark_ts();
+                        long later = fmkC > cmkC ? fmkC : cmkC;   // 崩溃证据取较晚的那个
+                        if (umkC < 0 || (later >= 0 && later > umkC)) {
+                            bs_evt("[ar] ★ func-nil PIERCES center-stop "
+                                   "(crash/better-evidence newer than stop: us=%ld cr=%ld fn=%ld) (v6.72)",
+                                   umkC, cmkC, fmkC);
+                            // 穿透即清人停标记，避免下一拍又被同一条挡住
+                            bs_us_mark_clear();
+                            us_latched = 0;
+                        } else {
+                            want = 0; hold = "center-stop";
+                        }
                     } else {
                         want = 0; hold = "center-stop";
                     }
@@ -7384,10 +7527,19 @@ static void *bs_watchdog(void *arg) {
                         want = 0; hold = "vendor-cool";
                     }
                 } else if (ar.hv && nowa - ar.hv < AR_HARD_HOLD) {
-                    if (g_crashresume && ar_funcnil_hit) {
+                    // ★★★★★ v6.72（2026-11-10，103a10f1 实证）：豁免判据从
+                    //   `ar_funcnil_hit`（单拍）改为 **(单拍命中 || 持久标记存在)**。
+                    //
+                    //   原缺陷：`ar_funcnil_hit` 只在"本轮扫到 agent.log 新字节"时为 1，
+                    //   而脚本停后日志**不再增长** ⇒ 永远扫不到 ⇒ 恒 0 ⇒ 豁免永不成立。
+                    //   103a10f1 实测：67 拍（5.6h）状态恒 `ar=0/0/2`，一次都没尝试恢复。
+                    //   持久标记 `.cr_funcnil` 就是为了解决这个而加的（v6.67），
+                    //   但这里判断还停留在单拍变量上 —— 属于漏改。
+                    if (g_crashresume && (ar_funcnil_hit || bs_funcnil_mark_age() >= 0)) {
                         bs_evt("[ar] ★ func-nil EXEMPT: hard-fail bypassed "
-                               "(hv=%lds ago, the only auto-resume allowed, v6.67)",
-                               (long)(nowa - ar.hv));
+                               "(hv=%lds ago, src=%s, the only auto-resume allowed, v6.72)",
+                               (long)(nowa - ar.hv),
+                               ar_funcnil_hit ? "scan" : "mark");
                         ar.hv = 0; ar.hard = 0;   // 清掉硬失败，让它真的跑起来
                     } else {
                         want = 0; hold = "hard-fail";
@@ -7396,8 +7548,8 @@ static void *bs_watchdog(void *arg) {
                     if (nowa - ar.gts > AR_GIVEUP_HOLD) {
                         ar.gu = 0; ar.att = 0; ar.next = 0;
                         bs_evt("[ar] giveup window over -> new retry round");
-                    } else if (g_crashresume && ar_funcnil_hit) {
-                        bs_evt("[ar] ★ func-nil EXEMPT: giveup bypassed (v6.67)");
+                    } else if (g_crashresume && (ar_funcnil_hit || bs_funcnil_mark_age() >= 0)) {
+                        bs_evt("[ar] ★ func-nil EXEMPT: giveup bypassed (v6.72)");
                         ar.gu = 0; ar.att = 0; ar.next = 0;
                     } else {
                         want = 0; hold = "giveup";
@@ -7475,6 +7627,20 @@ static void *bs_watchdog(void *arg) {
                 bs_cr_mark_clear();
                 ar_cr_hit = 0;
                 ar_notrun = 0;
+                // ★★★★★ v6.72：旁路进来的这一次，恢复 armed/lst，让后续每拍走正常路径。
+                //   否则 `.bs_ar` 永远停在 `armed=0 lst=0`，每一拍都要靠
+                //   "func-nil 标记旁路"才进得来 —— 但那需要标记一直存在，
+                //   而标记会在 run==1 时被清 ⇒ 下一次崩溃又要重新等尾部复查。
+                //   这里恢复后：lst=1（"这台机本来在跑"这个事实成立）、
+                //   armed=1（中控授权仍在，卡没被封）。两个都是崩溃前就成立的，
+                //   不是新开权限，安全性与崩溃前一致。
+                if (!ar.armed || !ar.lst) {
+                    int pa = ar.armed, pl = ar.lst;
+                    ar.armed = 1; ar.lst = 1;
+                    bs_ar_write(&ar, "funcnil-rearm");
+                    bs_evt("[ar] ★ func-nil resume restores armed/lst (%d/%d -> 1/1) (v6.72)",
+                           pa, pl);
+                }
                 // ★ v6.67：记下本次 func-nil 恢复时刻（冷却基准）。
                 //   ★ 故意**不清** .cr_funcnil 标记 —— func-nil 往往连崩 2~3 次
                 //     （每次重载拿回的还是 nil，见 v6.17 根因），
