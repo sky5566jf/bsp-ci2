@@ -44,16 +44,16 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.79" || (echo "MISSING v6.79" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.80" || (echo "MISSING v6.80" && exit 1)
           # ★ v6.66：中控点运行必须解除 hard-fail（8112 事故）
           strings bs_unlock.dylib | grep -q "hard-fail CLEARED by center run evidence" || (echo "MISSING v6.66 hard-fail clear on center run" && exit 1)
           # ★ v6.67：func-nil 是本 dylib 唯一允许的自动运行路径
           strings bs_unlock.dylib | grep -q "func-nil EXEMPT: hard-fail bypassed" || (echo "MISSING v6.67 func-nil hard-fail exemption" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.79" || (echo "MISSING v6.79 tag" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.80" || (echo "MISSING v6.80 tag" && exit 1)
           # ★ v6.68：崩溃续跑穿透人停闸门 + 3 种真实签名
           strings bs_unlock.dylib | grep -q "run refused, gates kept intact (v6.77)" || (echo "MISSING v6.77 prj" && exit 1)
-          strings bs_unlock.dylib | grep -q "resync DEFERRED" || (echo "MISSING v6.79 deferred guard" && exit 1)
-          strings bs_unlock.dylib | grep -q "(empty=%d)" || (echo "MISSING v6.79 dict-empty guard" && exit 1) || (echo "MISSING v6.79 prj-mismatch log" && exit 1)
+          strings bs_unlock.dylib | grep -q "resync DEFERRED" || (echo "MISSING v6.80 deferred guard" && exit 1)
+          strings bs_unlock.dylib | grep -q "(empty=%d)" || (echo "MISSING v6.80 dict-empty guard" && exit 1) || (echo "MISSING v6.80 prj-mismatch log" && exit 1)
           strings bs_unlock.dylib | grep -q "func-nil PIERCES center-stop" || (echo "MISSING v6.68 pierce gate" && exit 1)
           # ★ v6.65：激活即推状态包 + 叫醒 puller + 递减退避
           # ★ v6.71：push on login ok 已删（恢复零发包），断言同步移除
@@ -205,8 +205,8 @@ jobs:
           #        ⇒ 同机双身份：8186 与 8115 两次事故）
           #   现在只有两段：live 有值直接返回；live 无值返回空等下一拍。
           strings bs_unlock.dylib | grep -q "refuse to invent" || (echo "MISSING v6.41 refuse-to-invent guard" && exit 1)
-          strings bs_unlock.dylib | grep -q "no cache by design, v6.76" || (echo "MISSING v6.79 no-cache banner" && exit 1)
-          strings bs_unlock.dylib | grep -q "src=agent TLV, v6.76 read-only, no cache" || (echo "MISSING v6.79 read-only authoritative log" && exit 1)
+          strings bs_unlock.dylib | grep -q "no cache by design, v6.76" || (echo "MISSING v6.80 no-cache banner" && exit 1)
+          strings bs_unlock.dylib | grep -q "src=agent TLV, v6.76 read-only, no cache" || (echo "MISSING v6.80 read-only authoritative log" && exit 1)
           strings bs_unlock.dylib | grep -q "src=agent.dev_id) conf_write=%d" || (echo "MISSING v6.41 identity tick conf write" && exit 1)
           # 反回归：不许再出现钉盘相关行为（已废弃，调用点必须不存在）
           if strings bs_unlock.dylib | grep -q "pin created %"; then echo "FORBIDDEN: v6.76 pin-write still present" && exit 1; fi
@@ -400,7 +400,7 @@ jobs:
           echo "=== probe variant carries the lock banner + own version tag ==="
           strings bs_unlock_probe.dylib | grep -q "probe-locked build, MODE_UNLOCK not compiled" \
             || (echo "MISSING v6.62 probe-lock banner" && exit 1)
-          strings bs_unlock_probe.dylib | grep -q "v6.79p" || (echo "MISSING v6.79p probe version tag" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "v6.80p" || (echo "MISSING v6.80p probe version tag" && exit 1)
 
           echo "=== full build must NOT carry the lock banner (macro really gated) ==="
           if strings bs_unlock.dylib | grep -q "probe-locked build"; then
