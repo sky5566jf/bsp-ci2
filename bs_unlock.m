@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.77p"
+  #define BS_DYLIB_VER     "v6.78p"
 #else
-  #define BS_DYLIB_VER     "v6.77"
+  #define BS_DYLIB_VER     "v6.78"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -7828,10 +7828,42 @@ static void *bs_watchdog(void *arg) {
         }
 
         // --- v4.1：state 出现 且 字典对象换过 → 重灌本地模块 ---
+        //
+        // ★★★★★ v6.78（2026-11-10，.219 实证）：**去掉 `st != last_state` 条件**。
+        //
+        //   现场（.219，csws，v6.77）：
+        //     23:37:52 [ar] resume#5 verified (st!=0) -> started
+        //     23:37:52 [wd] state change st=0xcacd57840 dict=0xcac982620 -> inject
+        //     23:37:52 [mod] injected 3 个 ... [wd] inject returned n=3
+        //     23:37:59 脚本崩（只跑 6 秒）
+        //   csws.log 内容正常（find backpack goods 等），说明**逻辑本身没坏**，
+        //   是被中途打断的 —— 而打断者只有我们自己。
+        //
+        //   ★ 机理：`st` 是**脚本运行容器**，每次 run 都是新地址；
+        //     `dict` 才是**模块字典**。旧条件 `st != last_state` 意味着
+        //     **每次 run 都会重灌模块**——而 `st` 恰好在厂商 `load script` 刚开始时出现，
+        //     于是模块字典在 load 进行中被替换 ⇒ 脚本拿到的模块状态不一致 ⇒ func nil。
+        //
+        //   ★ 语义纠正：模块字典只在**字典对象换了**（App 重启 / 厂商重灌）时才需要重填。
+        //     脚本重跑（st 变但 dict 不变）**不该动字典** —— 上次填的模块还在，直接用。
+        //     这也正是 v6.73 想做的"重灌救活"，实际上是**它自己在制造问题**。
         if (st != 0) {
             void *dict = *(void **)(base + OFF_ONION_DICT);
-            if (dict != last_dict || st != last_state) {
-                bs_log("[wd] state change st=%p dict=%p -> inject", (void *)st, dict);
+            // ★ v6.78 兜底：字典没换但**里面是空的**（App 首启 / 曾被清空）也要灌。
+            //   否则只认 dict 变化会导致"从来不注入"的极端情况。
+            int dict_empty = 0;
+            if (dict) {
+                @autoreleasepool {
+                    id d = (__bridge id)dict;
+                    if ([d respondsToSelector:@selector(count)]) {
+                        NSUInteger cnt = [(NSDictionary *)d count];
+                        if (cnt == 0) dict_empty = 1;
+                    }
+                }
+            }
+            if (dict != last_dict || dict_empty) {
+                bs_log("[wd] state change st=%p dict=%p (empty=%d) -> inject",
+                       (void *)st, dict, dict_empty);
                 last_state = st;
                 last_dict  = dict;
                 if (g_card_blocked) {
