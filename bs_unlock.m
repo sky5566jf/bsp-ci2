@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.81p"
+  #define BS_DYLIB_VER     "v6.82p"
 #else
-  #define BS_DYLIB_VER     "v6.81"
+  #define BS_DYLIB_VER     "v6.82"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -3599,6 +3599,31 @@ static int bs_hb_ping(uintptr_t base) {
                 strstr(s, "\"ok\" :true") || strstr(s, "\"ok\" : true")) {
                 verdict = 1;
             } else if (strstr(s, "\"ok\":false") || strstr(s, "\"ok\": false")) {
+                // ★★★★★ v6.82（2026-11-14，.111 实证）：**拒绝之前先取走卡号**。
+                //
+                //   盲区：这里原来直接 `free(buf); return -1;`，后面那一整段
+                //   bindcard 解析根本执行不到 ⇒ 云端 bsmod v3.63 特意在
+                //   `{"ok":false, "why":"no-activated-card", "bindcard":"SNAIL…"}`
+                //   里带出的卡号**全被丢掉**（.111 实测：云端带出了
+                //   SNAILXUJ010BUKD1…，设备 bs_card.txt 始终 card= 空）。
+                //   ⇒ 设备永远没机会自激活 ⇒ 换绑后必挂，v6.81 也救不了。
+                //
+                //   现在：先把 bindcard 存进 g_card_cloud（与正常路径同一变量），
+                //   再照旧 return -1 判死 —— 脚本照样停、模块照样抹（killswitch
+                //   语义一个字节都不改），但 cardwatch 下一拍就能拿到卡号去激活。
+                {
+                    char bcd[80];
+                    char ds[1024];
+                    if (bs_json_pick_str((const unsigned char *)s, n, "bindcard",
+                                         bcd, sizeof(bcd)) && bcd[0] &&
+                        strcmp(bcd, g_card_cur) != 0) {
+                        snprintf(g_card_cloud, sizeof(g_card_cloud), "%s", bcd);
+                        snprintf(ds, sizeof(ds),
+                                 "[hb] deny but bindcard delivered %.20s... (cur=%s)",
+                                 bcd, g_card_cur[0] ? g_card_cur : "(none)");
+                        bs_log("%s", ds);
+                    }
+                }
                 // ★ 明确拒绝：不计数，立即死
                 bs_log("[hb] explicit deny -> immediate kill");
                 free(buf);
