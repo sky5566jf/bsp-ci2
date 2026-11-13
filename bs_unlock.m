@@ -1016,9 +1016,9 @@ static unsigned g_prj_ver_lo = 0;
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.80p"
+  #define BS_DYLIB_VER     "v6.81p"
 #else
-  #define BS_DYLIB_VER     "v6.80"
+  #define BS_DYLIB_VER     "v6.81"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -3625,8 +3625,44 @@ static int bs_hb_ping(uintptr_t base) {
                         long nowb = (long)time(NULL);
                         int healthy = (g_card_cur[0] && g_card_expire > 0 &&
                                        nowb < g_card_expire);
+                        // ★★★★★ v6.81（2026-11-14）：换绑后免手输的**真正闭环**。
+                        //   bug（本日实测）：rebind 只改云端 device 字段，设备 g_card_cur 仍空
+                        //   ⇒ 云端 bindcard 只进 g_card_cloud（心跳临时卡号，不写 g_card_cur）
+                        //   ⇒ verdict_ok 恒 0 ⇒ 中控「未授权」但「到期时间」有值（两个全局打架）。
+                        //   修法：本机无卡对象（g_card_cur 空）时，把云端下发的 bindcard 直接
+                        //   走一次 act=new 激活 —— 与人工输卡完全同款路径，激活成功即写
+                        //   g_card_cur + lastok + cache，中控两列立刻自洽，且**永不覆盖在用卡**。
+                        //   安全边界：① 只在 g_card_cur 为空时触发（有卡一律尊重本机）；
+                        //            ② 同一张卡 300s 冷却，被 code=7 踢过的不再自动试；
+                        //            ③ 云端只把 bindcard 发给「这卡绑在此 devid 名下」的设备。
                         if (strcmp(bc, g_card_cur) == 0) {
                             // 云端仍在补发但本机已激活同一张：静默
+                        } else if (!g_card_cur[0]) {
+                            static char bcl_try[80] = {0};
+                            static long bcl_at = 0;
+                            int bc_skip = (g_card_kicked[0] && strcmp(bc, g_card_kicked) == 0);
+                            if (!bc_skip && !(strcmp(bc, bcl_try) == 0 && nowb - bcl_at < 300)) {
+                                snprintf(bcl_try, sizeof(bcl_try), "%s", bc);
+                                bcl_at = nowb;
+                                bs_log("[card] cloud deliver ACTIVATE %.20s... (no local card)",
+                                       bc);
+                                if (bs_card_login(bc, 1) == 0) {
+                                    snprintf(g_card_cur, sizeof(g_card_cur), "%s", bc);
+                                    g_card_kicked[0]  = 0;
+                                    g_card_kickts     = 0;
+                                    g_note_cf_card[0] = 0;
+                                    g_note_cf_ts      = 0;
+                                    g_note_cf_evt     = 0;
+                                    g_note_cf_sent    = 0;
+                                    g_note_force      = 1;
+                                    bs_card_cache_save();
+                                    bs_log("[card] cloud deliver activated -> center auth/time fixed "
+                                           "(%.20s...)", bc);
+                                } else {
+                                    bs_log("[card] cloud deliver activate failed (%.20s...)",
+                                           bc);
+                                }
+                            }
                         } else if (healthy) {
                             static long last_bc_skip = 0;
                             if (nowb - last_bc_skip >= 300) {

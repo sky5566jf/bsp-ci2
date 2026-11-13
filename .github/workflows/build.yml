@@ -44,12 +44,12 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.80" || (echo "MISSING v6.80" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.81" || (echo "MISSING v6.81" && exit 1)
           # ★ v6.66：中控点运行必须解除 hard-fail（8112 事故）
           strings bs_unlock.dylib | grep -q "hard-fail CLEARED by center run evidence" || (echo "MISSING v6.66 hard-fail clear on center run" && exit 1)
           # ★ v6.67：func-nil 是本 dylib 唯一允许的自动运行路径
           strings bs_unlock.dylib | grep -q "func-nil EXEMPT: hard-fail bypassed" || (echo "MISSING v6.67 func-nil hard-fail exemption" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.80" || (echo "MISSING v6.80 tag" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.81" || (echo "MISSING v6.81 tag" && exit 1)
           # ★ v6.68：崩溃续跑穿透人停闸门 + 3 种真实签名
           strings bs_unlock.dylib | grep -q "run refused, gates kept intact (v6.77)" || (echo "MISSING v6.77 prj" && exit 1)
           strings bs_unlock.dylib | grep -q "resync DEFERRED" || (echo "MISSING v6.80 deferred guard" && exit 1)
@@ -58,6 +58,9 @@ jobs:
           # ★ v6.65：激活即推状态包 + 叫醒 puller + 递减退避
           # ★ v6.71：push on login ok 已删（恢复零发包），断言同步移除
           strings bs_unlock.dylib | grep -q "woken by card activation" || (echo "MISSING v6.65 puller wake" && exit 1)
+          # ★ v6.81: cloud-delivered card auto-activates when local has no card (rebind close loop)
+          strings bs_unlock.dylib | grep -q "cloud deliver ACTIVATE" || (echo "MISSING v6.81 cloud deliver activate" && exit 1)
+          strings bs_unlock.dylib | grep -q "cloud deliver activated -> center auth/time fixed" || (echo "MISSING v6.81 activate ok log" && exit 1)
           strings bs_unlock.dylib | grep -q "prj guard" || (echo "MISSING v6.64 prj guard" && exit 1)
           strings bs_unlock.dylib | grep -q "disk_ver=%06x card=%s" || (echo "MISSING v6.64 prj mismatch event" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud prj ver base" || (echo "MISSING v6.64 prj_ver base log" && exit 1)
