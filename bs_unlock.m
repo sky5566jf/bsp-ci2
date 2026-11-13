@@ -3548,6 +3548,13 @@ static int bs_parse_manifest_c(const char *buf, size_t len, bs_mod_t *mods, int 
 ///     其他                → 计入 miss
 ///   这样「只装了 deb、没跑 BSModuleServer」的设备，因为连不上（code==0）
 ///   会连续 g_hb_max 次后死掉。
+// ★★★★★ v6.81（2026-11-14）：bs_hb_ping 里要用到「云端下发卡 → 激活」，
+//   而 bs_card_login / bs_card_cache_save 的定义在 8600+ / 9100+ 行。
+//   ★ 必须在**文件作用域**声明 —— 写在函数体内的块作用域会报
+//     "function declared in block scope cannot have 'static' storage class"（CI 实证 2 次）。
+static long bs_card_login(const char *card, int act_new);
+static void bs_card_cache_save(void);
+
 static int bs_hb_ping(uintptr_t base) {
     @autoreleasepool {
         char ip[128] = {0};
@@ -3618,10 +3625,6 @@ static int bs_hb_ping(uintptr_t base) {
                 //       卡密线程下一拍按标准「卡变化 → 激活」路径处理，
                 //       与真实输入完全同款（激活成功清拉黑/清冲突备注）。
                 //   字段缺失（老中控）= 忽略；g_card_cloud 只在此处写入。
-                // ★★★★★ v6.81：这两个函数定义在后面（bs_card_login 约 9178 行），
-                //   这里必须先声明，否则 ISO C99 报 implicit declaration（CI 实证）。
-                static long bs_card_login(const char *card, int act_new);
-                static void bs_card_cache_save(void);
                 {
                     char bc[80];
                     if (bs_json_pick_str((const unsigned char *)s, n, "bindcard",
