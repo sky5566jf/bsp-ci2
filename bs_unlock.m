@@ -3618,6 +3618,10 @@ static int bs_hb_ping(uintptr_t base) {
                 //       卡密线程下一拍按标准「卡变化 → 激活」路径处理，
                 //       与真实输入完全同款（激活成功清拉黑/清冲突备注）。
                 //   字段缺失（老中控）= 忽略；g_card_cloud 只在此处写入。
+                // ★★★★★ v6.81：这两个函数定义在后面（bs_card_login 约 9178 行），
+                //   这里必须先声明，否则 ISO C99 报 implicit declaration（CI 实证）。
+                static long bs_card_login(const char *card, int act_new);
+                static void bs_card_cache_save(void);
                 {
                     char bc[80];
                     if (bs_json_pick_str((const unsigned char *)s, n, "bindcard",
