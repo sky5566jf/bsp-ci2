@@ -4404,6 +4404,33 @@ static void bs_ensure_payload_key(uintptr_t base) {
     }
 }
 
+
+/// ★ v6.87：字典 key 形态诊断（在密钥注入完成后调用一次）。
+static void bs_dump_dict_keys(uintptr_t base, const char *tag) {
+    void *d = *(void **)(base + OFF_MH);
+    if (!d) { bs_log("[mhdump2] %s: dict nil", tag); return; }
+    @autoreleasepool {
+        NSDictionary *dict = (__bridge NSDictionary *)d;
+        NSArray *ks = [dict allKeys];
+        bs_log("[mhdump2] %s dict=%p count=%lu", tag, d, (unsigned long)ks.count);
+        for (NSUInteger i = 0; i < ks.count && i < 20; i++) {
+            id k = ks[i];
+            char kh[64] = {0};
+            if ([k isKindOfClass:[NSData class]]) {
+                NSData *kd = (NSData *)k;
+                const unsigned char *p = (const unsigned char *)kd.bytes;
+                NSUInteger n = kd.length;
+                for (NSUInteger j = 0; j < n && j < 8; j++) sprintf(kh + j*3, "%02x ", p[j]);
+            } else {
+                snprintf(kh, sizeof(kh), "<cls=%s>", [[k class] description].UTF8String);
+            }
+            bs_log("[mhdump2]   [%lu] cls=%s len=%lu bytes=%s", (unsigned long)i,
+                   [[k class] description].UTF8String,
+                   [k isKindOfClass:[NSData class]] ? (unsigned long)[(NSData *)k length] : 0UL, kh);
+        }
+    }
+}
+
 /// ★★★ v6.18：把任意版本键合并进字典（幂等）。须在带 autoreleasepool 的线程调用。
 ///   返回 1 = 字典已含该键（或本次注入成功）。
 static int bs_mh_merge_key(uintptr_t base, const unsigned char kk[3], const unsigned char vv[32]) {
@@ -8032,47 +8059,6 @@ static void *bs_watchdog(void *arg) {
             }
         }
 
-        // ★★★ v6.87 诊断：把字典实际 key 形态 dump 出来。
-        //   背景：dylib 日志显示 13 条密钥全部注入成功（含 030108），
-        //   13 秒后 agent 却报 `can not find version key`。
-        //   偏移 0x53020 已由符号表实证正确（_g_script_mushroom_head vmaddr
-        //   0x100053020）。剩下的可能是**键的字节形态不一致**
-        //   （3 字节 NSData vs NSString / 4 字节 / 大小端），
-        //   agent 查表时 key 不等 ⇒ objectForKey 返回 nil。
-        //   本 dump 打印每个 key 的实际字节，与 agent 侧比对即可定论。
-        {
-            static int dumped = 0;
-            if (!dumped) {
-                void *d = *(void **)((uintptr_t)base + OFF_MH);
-                if (d) {
-                    dumped = 1;
-                    @autoreleasepool {
-                        NSDictionary *dict = (__bridge NSDictionary *)d;
-                        NSArray *ks = [dict allKeys];
-                        bs_log("[mhdump2] dict ptr=%p count=%lu", d, (unsigned long)ks.count);
-                        for (NSUInteger i = 0; i < ks.count && i < 20; i++) {
-                            id k = ks[i];
-                            id v = [dict objectForKey:k];
-                            char kh[64] = {0};
-                            if ([k isKindOfClass:[NSData class]]) {
-                                NSData *kd = (NSData *)k;
-                                const unsigned char *p = (const unsigned char *)kd.bytes;
-                                NSUInteger n = kd.length;
-                                for (NSUInteger j = 0; j < n && j < 8; j++)
-                                    sprintf(kh + j*3, "%02x ", p[j]);
-                            } else {
-                                snprintf(kh, sizeof(kh), "<cls=%s>", [[k class] description].UTF8String);
-                            }
-                            bs_log("[mhdump2]   key[%lu] cls=%s len=%lu bytes=%s", (unsigned long)i,
-                                   [[k class] description].UTF8String,
-                                   [k isKindOfClass:[NSData class]] ? (unsigned long)[(NSData *)k length] : 0UL,
-                                   kh);
-                        }
-                    }
-                }
-            }
-        }
-
         // ★ v6.84：script state 错误串转储 —— agent 的 bb_set_script_state(1,lua错误串)
         //   写在 agent 基址+0x531a8(state int)/+0x531e0(NSString* msg)，msg 变化即打日志。
         //   用于拿到 030108 load snail module failed 的具体 Lua 错误（App UI 同源）。
@@ -8105,6 +8091,15 @@ static void *bs_watchdog(void *arg) {
         //     puller 线程（凡是会在裸线程上触发 runtime 懒加载的都得小心）。
         //     watchdog 线程虽然也是裸 pthread，但它在 state 就绪后(下面分支)
         //     才注入，此刻 runtime 早已被产品自己初始化完毕，实测安全。
+        // ★ v6.87：字典 key 形态诊断（只打一次，st 无关）
+        {
+            static int dd = 0;
+            if (!dd) {
+                void *dchk = *(void **)((uintptr_t)base + OFF_MH);
+                if (dchk) { dd = 1; @autoreleasepool { bs_dump_dict_keys(base, "watchdog"); } }
+            }
+        }
+
         if (g_need_inject) {
             g_need_inject = 0;
             if (g_card_blocked) {
