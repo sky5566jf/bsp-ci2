@@ -7927,7 +7927,8 @@ static void *bs_watchdog(void *arg) {
                     @autoreleasepool {
                         id m = (__bridge id)msgp;
                         if ([m respondsToSelector:@selector(UTF8String)]) {
-                            const char *u = (const char *)((const char *(*)(id, SEL))objc_msgSend)(m, sel_registerName("UTF8String"));
+                            extern id objc_msgSend(id, SEL, ...);
+                            const char *u = [m UTF8String];
                             bs_log("[state] st=%d msg=%s", sst, u ? u : "(null)");
                         } else {
                             bs_log("[state] st=%d msg=<non-string obj>", sst);
