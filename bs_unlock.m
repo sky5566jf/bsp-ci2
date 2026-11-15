@@ -7914,6 +7914,31 @@ static void *bs_watchdog(void *arg) {
             }
         }
 
+        // ★ v6.84：script state 错误串转储 —— agent 的 bb_set_script_state(1,lua错误串)
+        //   写在 agent 基址+0x531a8(state int)/+0x531e0(NSString* msg)，msg 变化即打日志。
+        //   用于拿到 030108 load snail module failed 的具体 Lua 错误（App UI 同源）。
+        {
+            static void *last_msg = (void *)-1;
+            void *msgp = *(void **)((uintptr_t)base + 0x531e0);
+            int32_t sst = *(volatile int32_t *)((uintptr_t)base + 0x531a8);
+            if (msgp != last_msg) {
+                last_msg = msgp;
+                if (msgp) {
+                    @autoreleasepool {
+                        id m = (__bridge id)msgp;
+                        if ([m respondsToSelector:@selector(UTF8String)]) {
+                            const char *u = (const char *)((const char *(*)(id, SEL))objc_msgSend)(m, sel_registerName("UTF8String"));
+                            bs_log("[state] st=%d msg=%s", sst, u ? u : "(null)");
+                        } else {
+                            bs_log("[state] st=%d msg=<non-string obj>", sst);
+                        }
+                    }
+                } else {
+                    bs_log("[state] st=%d msg=nil", sst);
+                }
+            }
+        }
+
         // --- v5.4：puller 拉到新模块后只置位，实际注入在这里做 ---
         //     puller 是裸 pthread，而 bs_inject_modules 要调 Agent 内部函数、
         //     造 NSString/NSData、写 NSMutableDictionary —— 这些都必须躲开
