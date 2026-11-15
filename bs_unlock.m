@@ -2978,6 +2978,7 @@ static uintptr_t bs_find_base(void) {
 
 // ---------------------------------------------------------------- 模块注入
 static int bs_inject_modules(uintptr_t base);
+static void bs_install_state_hook(uintptr_t base);
 // ★ v6.73：func-nil 恢复前要清掉被抹坏的模块字典（定义在 8930+），此处前置声明
 static void bs_wipe_onion_dict(uintptr_t base);
 // ★ v6.63：/hb 下发 code 后要覆盖厂商授权，这两个写入函数定义在后面（8238+），此处前置声明
@@ -9152,6 +9153,111 @@ static void bs_neutralize_st_setter(uintptr_t base) {
         bs_log("[card] st setter write nop (0xd8fc) -> display ours");
 }
 
+/// ★★★ v6.85：bb_set_script_state inline hook —— 抓 Lua 层错误串
+///
+/// 背景（.111 实测 01:55:36）：030108 密钥 12 段全部命中（cloud key OK /
+/// 12 extra key OK / can not find version key 归零），beta.so 1199561B 就位，
+/// 但 agent 依旧 `load snail module failed`。按 re-agent 逆向（ANALYSIS_load_script.md
+/// §2 失败路径表），失败只剩路径 D：bb_load_one_module 里 luaL_loadstring /
+/// lua_pcallk 失败 —— 该分支**没有专属日志**，只把 lua 错误串交给
+/// bb_set_script_state(1, err)，随后被产品 UI 文案「加载运行库出错！」覆盖。
+///
+/// v6.84 的 2 秒轮询抓不到（错误串在 0x531e0 存活不足一拍）；
+/// 本版直接 inline hook agent+0x5770，每次调用都记录 (state, msg) —— 
+/// 这是唯一能 100% 抓到 Lua 原始错误（含 "not enough memory"/模块名+行号）的方式。
+///
+/// hook 方式：ARM64 4 指令桩（16B），跳绝对地址：
+///   ldr x16, #8 ; br x16 ; <8 字节目标地址>
+/// 打完桩后不能"再调原函数"（前 16B 已被覆盖），所以桩里只记录参数、
+/// 然后按 bb_set_script_state 的可见副作用手工完成（写 state int + msg 全局），
+/// 再正常 return。副作用面已由 re-agent 确认仅这两个全局。
+/// bb_set_script_state(int state, NSString *msg) 的替身。
+/// x0 = state, x1 = msg(NSString*)。返回 void。
+static void bs_bb_state_hook(int state, void *msg);
+
+/// 生成并安装 16B 绝对跳转桩（复用 16KB 页 vm_remap 通道，一次改整页）。
+static int bs_patch_text_quad(uintptr_t va, const uint32_t w[4]) {
+    mach_port_t self = mach_task_self();
+    const vm_size_t PGSZ = (vm_size_t)sysconf(_SC_PAGESIZE);
+    vm_address_t page_a = (vm_address_t)(va & ~((vm_address_t)PGSZ - 1));
+    if (va + 16 > page_a + PGSZ) {
+        bs_log("[hook] stub crosses page boundary va=%p", (void *)va);
+        return -1;
+    }
+    vm_address_t tmp = 0;
+    kern_return_t kr = vm_allocate(self, &tmp, PGSZ, VM_FLAGS_ANYWHERE);
+    if (kr != KERN_SUCCESS) { bs_log("[hook] vm_allocate fail kr=%d", kr); return -1; }
+    memcpy((void *)(uintptr_t)tmp, (const void *)page_a, (size_t)PGSZ);
+    memcpy((void *)(uintptr_t)(tmp + (va - page_a)), w, 16);
+    mprotect((void *)(uintptr_t)tmp, (size_t)PGSZ, PROT_READ | PROT_EXEC);
+    vm_address_t dst = page_a;
+    vm_prot_t cur = 0, mx = 0;
+    kr = vm_remap(self, &dst, PGSZ, 0, VM_FLAGS_OVERWRITE,
+                  self, tmp, FALSE, &cur, &mx, VM_INHERIT_COPY);
+    vm_deallocate(self, tmp, PGSZ);
+    if (kr != KERN_SUCCESS) { bs_log("[hook] vm_remap fail kr=%d", kr); return -1; }
+    mprotect((void *)(uintptr_t)page_a, (size_t)PGSZ, PROT_READ | PROT_EXEC);
+    sys_icache_invalidate((void *)va, 16);
+    return 0;
+}
+
+/// 记录 agent state 的全局地址（hook 里要用，不能每拍重新算）
+static volatile int32_t *g_state_slot = NULL;
+static void **g_state_msg_slot = NULL;
+static unsigned long g_state_hook_n = 0;
+
+static void bs_bb_state_hook(int state, void *msg) {
+    g_state_hook_n++;
+    // 复现原函数副作用：写 state int + msg 槽（re-agent 确认这是全部可见副作用）
+    if (g_state_slot) *(volatile int32_t *)g_state_slot = state;
+    if (g_state_msg_slot) {
+        void *old = *g_state_msg_slot;
+        if (msg && old != msg) { @autoreleasepool { (void)CFBridgingRetain((__bridge id)msg); } }
+        *g_state_msg_slot = msg;
+    }
+    // ★ 核心：把 Lua 原始错误串打进我们的日志（不看 state，全部记录）
+    @autoreleasepool {
+        const char *u = NULL;
+        if (msg) {
+            id m = (__bridge id)msg;
+            if ([m isKindOfClass:[NSString class]]) u = [m UTF8String];
+            else if ([m respondsToSelector:@selector(description)]) u = [[m description] UTF8String];
+        }
+        bs_log("[statehook] #%lu st=%d msg=%s", g_state_hook_n, state, u ? u : "(null)");
+    }
+}
+
+/// 安装 hook。只 unlock 模式调用（probe 真卡机绝不动厂商代码）。
+static void bs_install_state_hook(uintptr_t base) {
+    static int installed = 0;
+    if (installed) return;
+    installed = 1;
+    g_state_slot = (volatile int32_t *)(base + 0x531a8);
+    g_state_msg_slot = (void **)(base + 0x531e0);
+
+    uintptr_t target = base + 0x5770;
+    uint32_t cur0 = *(volatile uint32_t *)target;
+    bs_log("[hook] target=%p first_insn=0x%08x", (void *)target, cur0);
+    // 防护：目标处必须是一条合法指令（非 0 非全 1），否则说明基址/偏移不对
+    if (cur0 == 0 || cur0 == 0xffffffffu) {
+        bs_log("[hook] abort: bad insn at target (base=%p)", (void *)base);
+        return;
+    }
+
+    uintptr_t fn = (uintptr_t)&bs_bb_state_hook;
+    uint32_t stub[4];
+    stub[0] = 0x58000050u;  // ldr x16, #8   (PC+8)
+    stub[1] = 0xd61f0200u;  // br  x16
+    stub[2] = (uint32_t)(fn & 0xffffffffu);
+    stub[3] = (uint32_t)(fn >> 32);
+
+    if (bs_patch_text_quad(target, stub) == 0) {
+        bs_log("[hook] bb_set_script_state hooked -> bs_bb_state_hook (stub @%p)", (void *)target);
+    } else {
+        bs_log("[hook] install failed");
+    }
+}
+
 static void bs_sync_vendor_expire(void) {
     if (!g_vend_vt) {
         int *p = (int *)dlsym(RTLD_DEFAULT, "g_agent_auth_valid_time");
@@ -9626,6 +9732,7 @@ static void *bs_cardwatch(void *arg) {
     bs_card_cache_load();
     bs_neutralize_vt_setter(base);                // ★ v6.23：厂商 setter 变空操作
     bs_neutralize_st_setter(base);                // ★ v6.42e：厂商 state 写入点 nop（同页累积）
+    bs_install_state_hook(base);                  // ★ v6.85：hook bb_set_script_state 抓 Lua 错误串
 
     // 解析 Agent 的卡密 getter（厂商符号表暴露，get_* 系列优先）
     typedef char *(*get_str_fn)(void);
