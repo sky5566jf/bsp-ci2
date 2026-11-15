@@ -1270,7 +1270,13 @@ static char          g_pay_miss[8]   = {0};
 static int           g_pay_try       = 0;
 
 // ★ v6.18：多版本键（3.0.5 起 lua 记录自带独立版本键）—— per-ver 节流表 + 扫描缓存
-#define EK_VERS_MAX       12     // 一份 beta.so 里最多跟踪 12 个不同版本键
+#define EK_VERS_MAX       48     // ★ v6.88：12 -> 48。030108 实测用了 45 个不同版本
+                                 //   （18 条 type=1 脚本 + 404 条 type=2 资源，各带自己的
+                                 //   版本标签）。上限 12 只扫到前 12 个 ⇒ 后 33 个版本
+                                 //   永远不请求密钥 ⇒ agent 遍历到那些记录时 objectForKey
+                                 //   返回 nil ⇒ "can not find version key!!"
+                                 //   （.111 2026-11-16 02:56 实锤：字典 count=13，
+                                 //    beta.so 需要 45，45 条 dump 与需求 100% 匹配零缺失）
 static char          g_ek_miss[EK_VERS_MAX][8] = {{0}};   // 上次取键失败的版本（节流）
 static int           g_ek_try[EK_VERS_MAX]     = {0};
 static unsigned char g_ek_vers[EK_VERS_MAX][3] = {{0}};   // 盘上 beta.so 扫出的段版本集合
