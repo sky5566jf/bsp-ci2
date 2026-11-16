@@ -1024,9 +1024,9 @@ static unsigned g_prj_ver_lo = 0;
 //       grep statehook      <dylib>     # ≥v6.85 才有
 //       stat -c %s          <dylib>     # v6.88 = 223968 B
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.89p"
+  #define BS_DYLIB_VER     "v6.89bp"
 #else
-  #define BS_DYLIB_VER     "v6.89"
+  #define BS_DYLIB_VER     "v6.89b"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -5572,6 +5572,8 @@ static void bs_so_repair_if_dirty(const char *ip, int port, const char *verhex) 
         char vh[8];
         snprintf(vh, sizeof(vh), "%02x%02x%02x",
                  g_ek_vers[i][0], g_ek_vers[i][1], g_ek_vers[i][2]);
+        // ★ v6.89b：ekonly 白名单外版本不计入「缺键」判定
+        if (!bs_ek_only_allow(vh)) continue;
         total++;
         if (!bs_ensure_extra_key(g_base, vh, 1)) {
             if (still == 0) snprintf(first_missing, sizeof(first_missing), "%s", vh);
@@ -5761,15 +5763,18 @@ SO_DL:
         //   `load snail module failed`。这里当场补完，等于把窗口压到 0。
         g_ek_scan_size = -1;                      // 使缓存失效，强制重扫
         int nv2 = bs_refresh_so_vers();
-        int keyed = 0;
+        int keyed = 0, ktotal = 0;
         for (int i = 0; i < nv2; i++) {
             char vh[8];
             snprintf(vh, sizeof(vh), "%02x%02x%02x",
                      g_ek_vers[i][0], g_ek_vers[i][1], g_ek_vers[i][2]);
+            // ★ v6.89b：ekonly 白名单外版本不补、不计
+            if (!bs_ek_only_allow(vh)) continue;
+            ktotal++;
             if (bs_ensure_extra_key(g_base, vh, 1)) keyed++;
         }
-        if (nv2 > 0)
-            bs_evt("[so] post-write keys ready: %d/%d vers keyed", keyed, nv2);
+        if (ktotal > 0)
+            bs_evt("[so] post-write keys ready: %d/%d vers keyed", keyed, ktotal);
         // ★ v6.7 在跑→重启 / 没在跑→只落盘；v6.23n 抽到 bs_so_maybe_reload 复用
         bs_so_maybe_reload(cver, so, sn);
     }
@@ -10680,13 +10685,23 @@ static void *bs_bootstrap(void *arg) {
         //   赶在中控下发 run 之前把键备齐。
         {
             int pv = bs_refresh_so_vers();
+            int psk = 0;
             for (int pi = 0; pi < pv; pi++) {
                 char pvh[8];
                 snprintf(pvh, sizeof(pvh), "%02x%02x%02x",
                          g_ek_vers[pi][0], g_ek_vers[pi][1], g_ek_vers[pi][2]);
+                // ★★★★★ v6.89b：ekonly 白名单外版本**这里也必须跳过**。
+                //   首版 v6.89 漏了这一段（prewarm 是独立代码块，不在 bs_verwatch 里），
+                //   实测 .111：`ekonly=030108` 已在 1794810427.869 加载，
+                //   但紧接着 1794810427.985 又对全部 45 个版本灌键
+                //   ⇒ 字典里预铺了 44 把错键 ⇒ 运行仍报 `加载运行库出错`（乱码一字不差）。
+                if (!bs_ek_only_allow(pvh)) { psk++; continue; }
                 bs_ensure_extra_key(g_base, pvh, 1);   // bypass_throttle：首铺必取
             }
             if (pv > 0) bs_log("[mh] prewarm done, %d ver(s) ensured", pv);
+            if (psk && bs_ek_only_on())
+                bs_log("[mh] prewarm ekonly: %d/%d skipped (whitelist=%s)",
+                       psk, pv, g_ek_only);
         }
 
         // 1b) ★ v6.5：起版本哨兵 —— 3s 轮询 beta.so 版本，跃迁即补密钥
