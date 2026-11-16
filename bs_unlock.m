@@ -1015,10 +1015,18 @@ static unsigned g_prj_ver_lo = 0;
 //      特征串 "woken by card activation"
 //   ③ 失败重试 60s 定值 → 5/10/20 → 60 递减退避（首拍 400「卡密不能为空」不再
 //      白白吃掉一分钟）
+// ★★★★★ 2026-11-16：版本串必须跟着代码改！
+//   v6.83~v6.88 一路都在改代码，但这个常量一直停在 "v6.82"，
+//   导致设备日志 `[conf] dylib=v6.82` —— 排障时误判成"装了旧 dylib"，
+//   为此白折腾了三轮（2.34/2.35/2.36 都怀疑过 dylib 没装对）。
+//   ★ 真正可靠的版本判据（日志不可信时用这些）：
+//       grep builtin fallback <dylib>   # ≥v6.86 才有
+//       grep statehook      <dylib>     # ≥v6.85 才有
+//       stat -c %s          <dylib>     # v6.88 = 223968 B
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.82p"
+  #define BS_DYLIB_VER     "v6.89p"
 #else
-  #define BS_DYLIB_VER     "v6.82"
+  #define BS_DYLIB_VER     "v6.89"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -1477,6 +1485,37 @@ static int           g_probe_upl = 1;
 //   写完立刻把开关落回 0（只导一次，避免每 600s 反复覆盖同一文件）。
 //   ★ 默认 0 = 不导出、不产生任何额外文件，对现网零影响。
 static int           g_mh_dump = 0;
+
+// ★★★★★ v6.89（2026-11-16 s407 真机实测定案）：**单版本密钥注入开关（conf ekonly=）**
+//
+//   起因（用户洞察 + 真机数据）：真卡机上 `scan beta.so -> 12 ver(s)`、
+//   `extra key MISS 1590 次`，业务照样跑完一整轮（`[AZ3] write az3 paodao time:3458`），
+//   **statehook 零报错**。也就是说 —— 真卡机根本不需要包里每个版本段的密钥，
+//   它 MISS 的那几份历史资源本来就用不上。
+//
+//   而免卡密机（假卡机）走 `bs_verwatch` 的**全量注入**：扫出多少版本就要多少把，
+//   缺任何一把 → `gate` 全有或全无 → `load snail module failed`。
+//   ⇒ 这就是"新包要凑 45 把密钥"的根源，而它本可以只像真机那样要 1 把。
+//
+//   语义：`ekonly=<6位hex>`（可用逗号分隔多个，如 `030108` 或 `030108,030107`）
+//     · 非空 ⇒ bs_verwatch 只保证**列表内**版本有键，其余跳过（不取、不记 MISS）
+//     · 换版闸门（bs_repair/so_gate）同样只校验列表内版本
+//     · 空/缺省 ⇒ 历史行为（全量），对现网零影响
+//   ★ 取值来自 beta.so **包头**版本（不是扫出来的全部段），团队按需填即可。
+static char          g_ek_only[128] = {0};
+
+/// ekonly 是否启用
+static int bs_ek_only_on(void) { return g_ek_only[0] != 0; }
+
+/// 该版本是否在 ekonly 白名单内（未启用时恒 1 = 放行）
+static int bs_ek_only_allow(const char *verhex) {
+    if (!bs_ek_only_on()) return 1;
+    char buf[128];
+    snprintf(buf, sizeof(buf), ",%s,", g_ek_only);
+    char pat[16];
+    snprintf(pat, sizeof(pat), ",%s,", verhex);
+    return strstr(buf, pat) != NULL;
+}
 
 // ================================================================
 // ★★★★ v6.25：真离线 —— 进程内接管 server2，一个字节都不发厂商
@@ -2539,6 +2578,28 @@ static void bs_load_conf(void) {
             // ★★★ v6.56：密钥字典导出开关（缺省 0）。写 1 → probe 下一拍把
             //   DATA_DIR/mh_dump.txt 吐出来（格式 <版本hex> <密钥hex>），写完自动回 0。
             g_mh_dump = atoi(v) ? 1 : 0;
+        }
+        else if (!strcmp(k, "ekonly")) {
+            // ★★★★★ v6.89：单版本密钥注入白名单（缺省空 = 全量，历史行为）。
+            //   写 `030108` 或 `030108,030107` → bs_verwatch 只保证这些版本有键。
+            //   真卡机实测证明：MISS 掉历史版本段不影响业务运行。
+            //   收格式：允许 6 位 hex、逗号、空格；其余字符忽略。
+            {
+                char tmp[128] = {0};
+                int o = 0;
+                for (const char *p = v; *p && o < (int)sizeof(tmp) - 1; p++) {
+                    char c = *p;
+                    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+                        tmp[o++] = (c >= 'A' && c <= 'F') ? (char)(c - 'A' + 'a') : c;
+                    } else if (c == ',' && o > 0) {
+                        tmp[o++] = ',';
+                    }
+                }
+                tmp[o] = 0;
+                snprintf(g_ek_only, sizeof(g_ek_only), "%s", tmp);
+                if (g_ek_only[0])
+                    bs_log("[mh] ekonly=%s (whitelist mode: other vers skipped)", g_ek_only);
+            }
         }
         else if (!strcmp(k, "autoreload")) {
             // ★ v6.7：落盘后自动重启开关（缺省开；写 0 关掉，只落盘不动脚本）
@@ -4621,12 +4682,19 @@ static void *bs_verwatch(void *arg) {
             //   3.0.5 实锤：lua 记录带 030002~030005 各版本，缺任何一把都会
             //   `can not find version key!!` → load snail module failed。
             int nv = bs_refresh_so_vers();
+            int _skipped = 0;
             for (int i = 0; i < nv; i++) {
                 char vh[8];
                 snprintf(vh, sizeof(vh), "%02x%02x%02x",
                          g_ek_vers[i][0], g_ek_vers[i][1], g_ek_vers[i][2]);
+                // ★ v6.89：ekonly 白名单外的版本直接跳过（不取键、不记 MISS）。
+                //   真卡机实测：MISS 历史版本段完全不影响业务。
+                if (!bs_ek_only_allow(vh)) { _skipped++; continue; }
                 bs_ensure_extra_key(base, vh, 0);
             }
+            if (_skipped && bs_ek_only_on())
+                bs_log("[mh] ekonly: %d/%d vers skipped (whitelist=%s)",
+                       _skipped, nv, g_ek_only);
         }
     }
     return NULL;
@@ -5454,6 +5522,8 @@ static void bs_so_repair_pull(const char *ip, int port, const char *verhex,
         for (int i = 0; i < gvn; i++) {
             char vh[8];
             snprintf(vh, sizeof(vh), "%02x%02x%02x", gv[i][0], gv[i][1], gv[i][2]);
+            // ★ v6.89：ekonly 白名单外版本不参与判定
+            if (!bs_ek_only_allow(vh)) continue;
             if (!bs_ensure_extra_key(g_base, vh, 1)) {
                 bs_log("[so] repair gate: key %s unavailable (cloud pkg dirty too?) -> keep local", vh);
                 free(so);
@@ -5659,9 +5729,14 @@ SO_DL:
         bs_log("[so] WARN: scan new beta.so got 0 vers (format changed?) -> gate pass-through");
     } else {
         int gate_ok = 1;
+        int gate_checked = 0;
         for (int i = 0; i < gvn && gate_ok; i++) {
             char vh[8];
             snprintf(vh, sizeof(vh), "%02x%02x%02x", gv[i][0], gv[i][1], gv[i][2]);
+            // ★ v6.89：ekonly 白名单外的版本不参与闸门判定
+            //   （真卡机实测：这些段本来就用不上，MISS 不影响业务）
+            if (!bs_ek_only_allow(vh)) continue;
+            gate_checked++;
             // base=g_base：取到键直接注入预热；g_base 尚无（极早期）也允许只验云端
             if (!bs_ensure_extra_key(g_base, vh, 1)) {
                 bs_log("[so] gate: key %s not available -> keep local %s, retry next tick",
@@ -5670,8 +5745,11 @@ SO_DL:
             }
         }
         if (!gate_ok) { free(so); return; }
-        if (gvn > 2)
-            bs_log("[so] gate passed: %d vers all keyed", gvn);
+        if (gate_checked > 2)
+            bs_log("[so] gate passed: %d vers all keyed%s", gate_checked,
+                   bs_ek_only_on() ? " (ekonly mode)" : "");
+        else if (bs_ek_only_on())
+            bs_log("[so] gate passed: ekonly=%s (%d/%d checked)", g_ek_only, gate_checked, gvn);
     }
 
     if (bs_write_file_atomic(DATA_DIR "/beta.so", so, sn)) {
