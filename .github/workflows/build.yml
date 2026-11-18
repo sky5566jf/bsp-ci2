@@ -51,7 +51,7 @@ jobs:
           strings bs_unlock.dylib | grep -q "func-nil EXEMPT: hard-fail bypassed" || (echo "MISSING v6.67 func-nil hard-fail exemption" && exit 1)
           strings bs_unlock.dylib | grep -q "v6.93" || (echo "MISSING v6.93 tag" && exit 1)
           # ★ v6.93：plan-C exec 禁用（bb_load_one_module 栈不平衡 → runner pcall 布尔崩溃），回归 dict-only 下发
-          strings bs_unlock.dylib | grep -q "v6.93 DISABLED" || (echo "MISSING v6.93 plan-C disable marker" && exit 1)
+          strings bs_unlock.dylib | grep -q "plan-C exec DISABLED" || (echo "MISSING v6.93 plan-C disable marker" && exit 1)
           # ★ v6.93：dict-only 下发链路仍在（waitCallModule 消费端 + watchdog 重灌）
           strings bs_unlock.dylib | grep -q "onion dict wiped" || (echo "MISSING dict wipe fn" && exit 1)
           # ★ v6.90：crash-resume 扫描路径补 <prj>.log（csws 机 func-nil 不自愈）
