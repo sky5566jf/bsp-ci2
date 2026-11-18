@@ -733,6 +733,9 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 
 #define FN_SET_OPER   0xd8a0    // void _set_user_script_operate(int)
 #define FN_SET_ONION  0x4914    // void _set_script_onion_data(NSString *name, NSString *code)
+// ★ v6.91 C 方案：模块直接执行原语（re-agent ANALYSIS_load_script.md §7 速查）
+#define FN_BB_LOAD_SCRIPT      0xc1bc  // int bb_load_script(void) —— 0 参（调用点 0xd4e4 实测不设 x0）
+#define FN_BB_LOAD_ONE_MODULE  0xb948  // int bb_load_one_module(const char *name, const char *code)
 
 // 0 = 启动  1 = 停止  4 = 重启
 #define OPER_START     0    // ★ v6.7：启动（等价于「点运行」）
@@ -1024,14 +1027,21 @@ static unsigned g_prj_ver_lo = 0;
 //       grep statehook      <dylib>     # ≥v6.85 才有
 //       stat -c %s          <dylib>     # v6.88 = 223968 B
 //
-// ★★★★★ v6.90（2026-11-18，客户 csws 机）：crash-resume 扫描路径补 <prj>.log。
-//   客户 csws 机报 `attempt to call local 'func' (a nil value)` 后不自愈、要人点。
-//   根因：cr_paths 硬编码 agent.log + sjz.log —— csws 的脚本日志 csws.log 不在
-//   扫描范围，签名落那里永远漏。改为 agent.log + sjz.log + <g_prj>.log 三路。
+// ★★★★★ v6.91（2026-11-18，csws 必卡死根治 = C 方案）：模块直接执行进 VM。
+//   根因链（逆向+解包双实锤）：vendor 主线任务调
+//   wait_call_func(operate_pickup_goods,"operate_pickup_goods")，该函数 vendor
+//   代码里根本没有（留白等热更），胶水 pcall(nil) 失败后进
+//   while true { waitCallModule ? load(name)() : mSleep(1000) }，而 waitCallModule
+//   在我们设备上恒 false → 静默死循环（无报错、st=1、无签名，[ar]/[cr] 全不覆盖）。
+//   v4 起的 setOnion 字典注入无效：vendor require 链不含我们的模块名，永不执行。
+//   ★ 修法：hook bb_load_script（trampoline 保 orig），orig 返回 0 后在加载线程
+//   上直接调 bb_load_one_module 把 bs_modules/*.lua 执行进 g_luaState ——
+//   此刻所有 vendor 模块已装完、main 还没跑（解包实锤「main 不执行，交给上层」），
+//   VM 空闲线程安全；main 一跑，wait_call_func 第一参即解析到真函数，pcall 直接成功。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.90p"
+  #define BS_DYLIB_VER     "v6.91p"
 #else
-  #define BS_DYLIB_VER     "v6.90"
+  #define BS_DYLIB_VER     "v6.91"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -9514,6 +9524,126 @@ static void bs_install_state_hook(uintptr_t base) {
     }
 }
 
+// ---------------------------------------------------------------- ★★★ v6.91 C 方案：模块直接执行进 VM
+// 与 setOnion 字典注入的本质区别：字典条目 vendor require 链永不引用（11-18 解包
+// 实锤），永远不执行；这里把模块源码当 vendor 模块直接执行，顶层 function 定义
+// 进全局 —— wait_call_func(func,name) 第一参在调用点解析到真函数，pcall 直接成功，
+// 不再进胶水等待循环。顺带消灭「字典注入从来没生效过」这个历史悬案。
+
+/// 把 g_mod_dir/*.lua 逐个经 bb_load_one_module 执行进当前 lua state。
+/// 前提：必须在 bb_load_script orig 返回 0 之后调（加载线程、VM 空闲、main 未跑）。
+static void bs_exec_modules_direct(uintptr_t base, void *L) {
+    typedef int (*lom_t)(const char *, const char *);
+    lom_t lom = (lom_t)(base + FN_BB_LOAD_ONE_MODULE);
+    @autoreleasepool {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray<NSString *> *files = [fm contentsOfDirectoryAtPath:@(g_mod_dir) error:nil];
+        int n = 0, ok = 0;
+        for (NSString *f in files) {
+            if (![f hasSuffix:@".lua"]) continue;
+            NSString *name = [f stringByDeletingPathExtension];
+            NSData *code = [NSData dataWithContentsOfFile:
+                            [@(g_mod_dir) stringByAppendingPathComponent:f]];
+            if (code.length == 0) {
+                bs_log("[mi] read failed: %s", f.UTF8String);
+                continue;
+            }
+            // bb_load_one_module 内部按 luaL_loadstring 语义读 C 串 → 末尾补 \0
+            NSMutableData *buf = [NSMutableData dataWithData:code];
+            char last = ((const char *)buf.bytes)[buf.length - 1];
+            if (last != 0) [buf appendBytes:"" length:1];
+            int rc = lom(name.UTF8String, (const char *)buf.bytes);
+            n++;
+            if (rc == 0) ok++;
+            bs_log("[mi] exec %s rc=%d (%lu B)", name.UTF8String, rc,
+                   (unsigned long)code.length);
+        }
+        bs_log("[mi] plan-C done ok=%d/%d L=%p", ok, n, L);
+    }
+}
+
+/// 生成 trampoline：拷贝原函数前 n_insns 条指令 + 跳回 原函数+n*4。
+/// 拷贝区指令必须无 PC 相对寻址 —— 这里做防护校验，命中即拒绝（返回 NULL）。
+/// bb_load_script 前 8 条实测全为 sub/stp/add（adrp 在第 9 条，0xc1dc）。
+static void *bs_make_trampoline(uintptr_t va, int n_insns) {
+    if (n_insns < 1 || n_insns > 16) return NULL;
+    mach_port_t self = mach_task_self();
+    const vm_size_t PGSZ = (vm_size_t)sysconf(_SC_PAGESIZE);
+    uint32_t w[16];
+    for (int i = 0; i < n_insns; i++) {
+        w[i] = *(volatile uint32_t *)(va + i * 4);
+        uint32_t x = w[i];
+        int pcrel =
+            (x & 0x9F000000u) == 0x90000000u ||   // adrp
+            (x & 0x7C000000u) == 0x14000000u ||   // b / bl
+            (x & 0xBF000000u) == 0x18000000u ||   // ldr/ldrsw literal
+            (x & 0x7E000000u) == 0x34000000u ||   // cbz / cbnz
+            (x & 0x7E000000u) == 0x36000000u;     // tbz / tbnz
+        if (pcrel) {
+            bs_log("[mi] trampoline reject: pc-relative insn #%d @%p 0x%08x",
+                   i, (void *)(va + i * 4), x);
+            return NULL;
+        }
+    }
+    vm_address_t tmp = 0;
+    if (vm_allocate(self, &tmp, PGSZ, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        bs_log("[mi] trampoline vm_allocate fail");
+        return NULL;
+    }
+    memcpy((void *)tmp, w, (size_t)n_insns * 4);
+    // 尾部：ldr x16, [pc+8]; br x16; <8B 原函数+n*4>
+    static const uint32_t tail[2] = { 0x58000050u, 0xd61f0200u };
+    memcpy((void *)(tmp + (uintptr_t)n_insns * 4), tail, 8);
+    uintptr_t back = va + (uintptr_t)n_insns * 4;
+    memcpy((void *)(tmp + (uintptr_t)n_insns * 4 + 8), &back, 8);
+    mprotect((void *)tmp, PGSZ, PROT_READ | PROT_EXEC);
+    sys_icache_invalidate((void *)tmp, (size_t)n_insns * 4 + 16);
+    return (void *)tmp;
+}
+
+static void    *g_blscript_tramp = NULL;   // bb_load_script 原 Prologue + 跳回
+static uintptr_t g_lom_base      = 0;      // agent 基址（hook 里读 L / 调原语用）
+
+/// bb_load_script 替身（0 参，调用点 0xd4e4 实测不设 x0）。
+/// orig 返回 0 = vendor 模块全部装完、main 尚未执行 —— 本 dylib 唯一
+/// 「VM 空闲 + 在加载线程上」的注入窗口。
+static int bs_blscript_hook(void) {
+    int rc = ((int (*)(void))g_blscript_tramp)();
+    if (rc == 0 && g_lom_base) {
+        void *L = *(void **)(g_lom_base + OFF_STATE);
+        if (L) bs_exec_modules_direct(g_lom_base, L);
+        else   bs_log("[mi] load ok but L==0, skip");
+    }
+    return rc;
+}
+
+/// 安装 bb_load_script trampoline hook。仅 unlock 模式调用（probe 真卡机绝不动厂商代码）。
+static void bs_install_blscript_hook(uintptr_t base) {
+    static int installed = 0;
+    if (installed) return;
+    installed = 1;
+    uintptr_t target = base + FN_BB_LOAD_SCRIPT;
+    uint32_t cur0 = *(volatile uint32_t *)target;
+    bs_log("[mi] target=%p first_insn=0x%08x", (void *)target, cur0);
+    if (cur0 == 0 || cur0 == 0xffffffffu) {
+        bs_log("[mi] abort: bad insn at target (base=%p)", (void *)base);
+        return;
+    }
+    void *tramp = bs_make_trampoline(target, 8);   // ★ 先拷贝再打桩
+    if (!tramp) { bs_log("[mi] trampoline failed, plan-C off"); return; }
+    g_blscript_tramp = tramp;
+    g_lom_base = base;
+    uintptr_t fn = (uintptr_t)&bs_blscript_hook;
+    uint32_t stub[4] = { 0x58000050u, 0xd61f0200u,
+                         (uint32_t)(fn & 0xffffffffu), (uint32_t)(fn >> 32) };
+    if (bs_patch_text_quad(target, stub) == 0)
+        bs_log("[mi] bb_load_script hooked -> plan-C module exec armed");
+    else {
+        bs_log("[mi] hook install failed, plan-C off");
+        g_lom_base = 0;
+    }
+}
+
 static void bs_sync_vendor_expire(void) {
     if (!g_vend_vt) {
         int *p = (int *)dlsym(RTLD_DEFAULT, "g_agent_auth_valid_time");
@@ -9989,6 +10119,7 @@ static void *bs_cardwatch(void *arg) {
     bs_neutralize_vt_setter(base);                // ★ v6.23：厂商 setter 变空操作
     bs_neutralize_st_setter(base);                // ★ v6.42e：厂商 state 写入点 nop（同页累积）
     bs_install_state_hook(base);                  // ★ v6.85：hook bb_set_script_state 抓 Lua 错误串
+    bs_install_blscript_hook(base);               // ★ v6.91：C 方案 —— bb_load_script 返回后模块直执行进 VM
 
     // 解析 Agent 的卡密 getter（厂商符号表暴露，get_* 系列优先）
     typedef char *(*get_str_fn)(void);
