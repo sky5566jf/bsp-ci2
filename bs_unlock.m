@@ -1023,10 +1023,15 @@ static unsigned g_prj_ver_lo = 0;
 //       grep builtin fallback <dylib>   # ≥v6.86 才有
 //       grep statehook      <dylib>     # ≥v6.85 才有
 //       stat -c %s          <dylib>     # v6.88 = 223968 B
+//
+// ★★★★★ v6.90（2026-11-18，客户 csws 机）：crash-resume 扫描路径补 <prj>.log。
+//   客户 csws 机报 `attempt to call local 'func' (a nil value)` 后不自愈、要人点。
+//   根因：cr_paths 硬编码 agent.log + sjz.log —— csws 的脚本日志 csws.log 不在
+//   扫描范围，签名落那里永远漏。改为 agent.log + sjz.log + <g_prj>.log 三路。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.89bp"
+  #define BS_DYLIB_VER     "v6.90p"
 #else
-  #define BS_DYLIB_VER     "v6.89b"
+  #define BS_DYLIB_VER     "v6.90"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -6990,7 +6995,7 @@ static void *bs_watchdog(void *arg) {
     // ★ v6.7：自动重启状态机（相位 + 超时计数）—— ★ v6.24q 已随 [rl] 整体移除
 
     // ★ v6.17：func-nil 崩溃自动恢复（agent.log 增量扫描）—— v6.24p 起仅做证据与日志
-    long   cr_size[2] = {-1, -1}; // ★ v6.23u [0]=agent.log [1]=sjz.log 上次尺寸（-1=首轮只记基线）
+    long   cr_size[3] = {-1, -1, -1}; // ★ v6.23u [0]=agent.log [1]=sjz.log [2]=<prj>.log(v6.90) 上次尺寸（-1=首轮只记基线）
     time_t fg_last     = 0; // ★ v6.24d：上次 [fg] uiopen 游戏时刻（限速）
     time_t cr_stall_last = 0; // ★ v6.24p：上次停摆诊断扫描时刻
     int    us_latched = 0;    // ★ v6.24k：用户停止闸门在本进程内的缓存（配合 .bs_userstop）
@@ -7271,8 +7276,17 @@ static void *bs_watchdog(void *arg) {
         // 发 OPER_START 拉起（等价中控再点一次运行）。
         // 中控点停 / killswitch / 心跳失联等路径不含该签名，自然不会误拉。
         {
-            const char *cr_paths[2] = { DATA_DIR "/log/agent.log",
-                                        DATA_DIR "/log/sjz.log" };
+            // ★★★ v6.90（2026-11-18，客户 csws 机 func-nil 不自愈实锤）：扫描路径补上项目日志。
+            //   旧路径硬编码 agent.log + sjz.log —— csws 设备的脚本日志是 csws.log，
+            //   签名若落在那里永远扫不到 ⇒ csws 机崩了不会自愈（sjz 机一直正常）。
+            //   现按 g_prj 动态拼第三条路径 <prj>.log；prj 为空回落 sjz（与旧行为兼容，
+            //   sjz 机第三条与第二条同文件，各持基线重复扫一遍无副作用）。
+            char cr_prj_path[288];
+            snprintf(cr_prj_path, sizeof(cr_prj_path), DATA_DIR "/log/%s.log",
+                     (g_prj[0] ? g_prj : "sjz"));
+            const char *cr_paths[3] = { DATA_DIR "/log/agent.log",
+                                        DATA_DIR "/log/sjz.log",
+                                        cr_prj_path };
             int cr_hit = 0, cr_src = -1;
             int cr_loadfail = 0;   // ★ v6.24c：本次命中是否属「加载期失败」类
             int cri;

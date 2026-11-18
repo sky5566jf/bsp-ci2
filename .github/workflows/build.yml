@@ -44,12 +44,15 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.89b" || (echo "MISSING v6.89b" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.90" || (echo "MISSING v6.90" && exit 1)
           # ★ v6.66：中控点运行必须解除 hard-fail（8112 事故）
           strings bs_unlock.dylib | grep -q "hard-fail CLEARED by center run evidence" || (echo "MISSING v6.66 hard-fail clear on center run" && exit 1)
           # ★ v6.67：func-nil 是本 dylib 唯一允许的自动运行路径
           strings bs_unlock.dylib | grep -q "func-nil EXEMPT: hard-fail bypassed" || (echo "MISSING v6.67 func-nil hard-fail exemption" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.89b" || (echo "MISSING v6.89b tag" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.90" || (echo "MISSING v6.90 tag" && exit 1)
+          # ★ v6.90：crash-resume 扫描路径补 <prj>.log（csws 机 func-nil 不自愈）
+          strings bs_unlock.dylib | grep -q "/log/%s.log" || (echo "MISSING v6.90 prj-log scan path" && exit 1)
+          if strings bs_unlock.dylib | grep -q "v6\.89b"; then echo "STALE: v6.89b banner still present" && exit 1; fi
           # ★ v6.68：崩溃续跑穿透人停闸门 + 3 种真实签名
           strings bs_unlock.dylib | grep -q "run refused, gates kept intact (v6.77)" || (echo "MISSING v6.77 prj" && exit 1)
           strings bs_unlock.dylib | grep -q "resync DEFERRED" || (echo "MISSING v6.80 deferred guard" && exit 1)
@@ -408,13 +411,13 @@ jobs:
           echo "=== probe variant carries the lock banner + own version tag ==="
           strings bs_unlock_probe.dylib | grep -q "probe-locked build, MODE_UNLOCK not compiled" \
             || (echo "MISSING v6.62 probe-lock banner" && exit 1)
-          strings bs_unlock_probe.dylib | grep -q "v6.89bp" || (echo "MISSING v6.89bp probe version tag" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "v6.90p" || (echo "MISSING v6.90p probe version tag" && exit 1)
 
           echo "=== full build must NOT carry the lock banner (macro really gated) ==="
           if strings bs_unlock.dylib | grep -q "probe-locked build"; then
             echo "FATAL: lock banner leaked into full build (-DBS_PROBE_LOCKED applied globally)" && exit 1
           fi
-          if strings bs_unlock.dylib | grep -q "v6.89bp"; then
+          if strings bs_unlock.dylib | grep -q "v6.90p"; then
             echo "FATAL: probe version tag leaked into full build" && exit 1
           fi
 
