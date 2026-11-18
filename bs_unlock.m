@@ -1038,10 +1038,17 @@ static unsigned g_prj_ver_lo = 0;
 //   上直接调 bb_load_one_module 把 bs_modules/*.lua 执行进 g_luaState ——
 //   此刻所有 vendor 模块已装完、main 还没跑（解包实锤「main 不执行，交给上层」），
 //   VM 空闲线程安全；main 一跑，wait_call_func 第一参即解析到真函数，pcall 直接成功。
+//
+// ★★★★★ v6.92（2026-11-18，v6.91 首测翻车修正）：plan-C 执行清单排除 vendor 自带模块。
+//   v6.91 首测：3 模块 rc=0 注入成功，但 bb_control 与 vendor 自家模块（rec005，
+//   main require）撞名 —— 注册表项被覆盖成布尔标记，main require 拿回布尔 →
+//   "attempt to call a boolean value" 脚本起不来。跳过 vendor 同名模块后，
+//   只执行 3 个留白补位模块（operate_pickup_goods / task_lhdb_into /
+//   tool_cgxg_change，vendor 模块清单 0 冲突实锤）。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.91p"
+  #define BS_DYLIB_VER     "v6.92p"
 #else
-  #define BS_DYLIB_VER     "v6.91"
+  #define BS_DYLIB_VER     "v6.92"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -9542,6 +9549,15 @@ static void bs_exec_modules_direct(uintptr_t base, void *L) {
         for (NSString *f in files) {
             if (![f hasSuffix:@".lua"]) continue;
             NSString *name = [f stringByDeletingPathExtension];
+            // ★★★ v6.92：跳过 vendor beta.so 自带模块（.219 v6.91 实测翻车）——
+            //   bb_control 是 vendor 自家模块（rec005，main 启动 require "bb_control"）。
+            //   我们 exec 它后 bb_load_one_module 的注册表项被覆盖成 nil/true 布尔标记，
+            //   main require 拿回布尔 → "attempt to call a boolean value" → 脚本起不来。
+            //   bb_control 只该走 onion 字典注入（历史行为），plan-C 清单必须排除。
+            if ([name isEqualToString:@"bb_control"]) {
+                bs_log("[mi] skip %s (vendor-shipped module, dict-only)", name.UTF8String);
+                continue;
+            }
             NSData *code = [NSData dataWithContentsOfFile:
                             [@(g_mod_dir) stringByAppendingPathComponent:f]];
             if (code.length == 0) {
