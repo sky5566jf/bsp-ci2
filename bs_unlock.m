@@ -1045,10 +1045,21 @@ static unsigned g_prj_ver_lo = 0;
 //   "attempt to call a boolean value" 脚本起不来。跳过 vendor 同名模块后，
 //   只执行 3 个留白补位模块（operate_pickup_goods / task_lhdb_into /
 //   tool_cgxg_change，vendor 模块清单 0 冲突实锤）。
+//
+// ★★★★★ v6.93（2026-11-18，plan-C 禁用 + csws 模块补齐）：v6.92 仍崩，排障定论：
+//   ① 崩溃真因不是撞名 —— bb_load_one_module 无栈平衡（见 bs_cardwatch 内长注），
+//      runner pcall 栈顶残留布尔 → 启动即崩。plan-C exec 整体禁用。
+//   ② dict 注入链路本来就是通的：wait_call_func 胶水（bb_common）每 1s 轮询
+//      waitCallModule(name)，后者从 onion 字典取 NSData 源码执行后返回 true，
+//      glue 拿回全局函数继续跑。sjz 的 operate_pickup_goods 三件套一直在生效。
+//   ③ csws 010803 卡死真因 = 模块名不匹配：csws 的 glue 等待 task_day_pickup /
+//      check_attack_monster（csws 解包实锤），bs_modules 补齐这两件即通。
+//   ④ 顺带解悬案：v6.67 的「4~5h func-nil」家族 —— 胶水定时 load(name.."=nil")()
+//      抹全局后，dict 有源码即可自动重执行恢复，无需 [ar] 拉起。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.92p"
+  #define BS_DYLIB_VER     "v6.93p"
 #else
-  #define BS_DYLIB_VER     "v6.92"
+  #define BS_DYLIB_VER     "v6.93"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -10135,7 +10146,22 @@ static void *bs_cardwatch(void *arg) {
     bs_neutralize_vt_setter(base);                // ★ v6.23：厂商 setter 变空操作
     bs_neutralize_st_setter(base);                // ★ v6.42e：厂商 state 写入点 nop（同页累积）
     bs_install_state_hook(base);                  // ★ v6.85：hook bb_set_script_state 抓 Lua 错误串
-    bs_install_blscript_hook(base);               // ★ v6.91：C 方案 —— bb_load_script 返回后模块直执行进 VM
+    // ★★★★★ v6.93（2026-11-18）：plan-C exec **禁用** —— v6.92 实测翻车根因定论。
+    //   bb_load_one_module（vendor require 装载器 @+0xb948）对返回 nil 的 chunk 走
+    //   pushboolean+pushvalue+setfield 路径且**全程无栈平衡**（capstone 实锤，
+    //   成功路径 ba8c 直接 mov w19,#0 返回，无 settop）。我们 3 个模块源码都返回 nil
+    //   → 每次调用栈上残留 [.., _LOADED, nil, nil, true]，栈顶=true。而 runner 线程
+    //   （0xd060）直接 lua_pcallk(L,0,0,0) 执行**栈顶** —— 执行的是 true →
+    //   "attempt to call a boolean value" 启动即崩（.219 实测每轮必现）。
+    //   ★ 模块下发回归 dict-only：wait_call_func 胶水每 1s 轮询 waitCallModule(name)，
+    //   它从 onion 字典（base+0x532c0，值必须是 NSData，selector 'bytes' 实锤）
+    //   取源码 loadstring+pcall 执行后返回 true → glue load("return name")() 拿到
+    //   全局函数继续跑。这条链路 v4 起的 bs_inject_modules/watchdog 重灌一直正常，
+    //   csws 卡死的真因只是**模块名不匹配**：csws 010803 glue 等待
+    //   task_day_pickup / check_attack_monster（解包实锤），不是 sjz 的
+    //   operate_pickup_goods 三件套。v6.93 起 bs_modules 补齐 csws 两件即可。
+    // bs_install_blscript_hook(base);               // [v6.93 DISABLED] 栈不平衡，见上
+    bs_log("[mi] plan-C exec DISABLED (v6.93): bb_load_one_module stack imbalance -> dict-only");
 
     // 解析 Agent 的卡密 getter（厂商符号表暴露，get_* 系列优先）
     typedef char *(*get_str_fn)(void);
