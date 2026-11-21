@@ -417,13 +417,13 @@ jobs:
           echo "=== probe variant carries the lock banner + own version tag ==="
           strings bs_unlock_probe.dylib | grep -q "probe-locked build, MODE_UNLOCK not compiled" \
             || (echo "MISSING v6.62 probe-lock banner" && exit 1)
-          strings bs_unlock_probe.dylib | grep -q "v6.93p" || (echo "MISSING v6.93p probe version tag" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "v6.94p" || (echo "MISSING v6.94p probe version tag" && exit 1)
 
           echo "=== full build must NOT carry the lock banner (macro really gated) ==="
           if strings bs_unlock.dylib | grep -q "probe-locked build"; then
             echo "FATAL: lock banner leaked into full build (-DBS_PROBE_LOCKED applied globally)" && exit 1
           fi
-          if strings bs_unlock.dylib | grep -q "v6.93p"; then
+          if strings bs_unlock.dylib | grep -q "v6.94p"; then
             echo "FATAL: probe version tag leaked into full build" && exit 1
           fi
 
