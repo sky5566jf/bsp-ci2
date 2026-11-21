@@ -1067,10 +1067,18 @@ static unsigned g_prj_ver_lo = 0;
 //   收养 —— 本机卡不健康（过期/被清）即不再是「运营在用的卡」，云端 bindcard
 //   只发给「卡绑在此 devid 名下」的设备，收养即与真实归属对齐。安全闸不变：
 //   300s 同卡冷却 + code=7 被踢卡不自动试 + 健康卡绝不覆盖。
+// ★★★★★ v6.95（2026-11-21 用户拍板）：健康在用卡也收养云端 bindcard。
+//   v6.94 只对「本地卡不健康」收养；本机卡健康时仍跳过（v6.81 的「运营在用
+//   的卡最大」保护）。用户定策：**换绑操作本身就是管理员的权威意图** ——
+//   bindcard 只发给「卡绑在此 devid 名下」的设备（云端 bindcard_deliver 同源
+//   判定），不存在误收养别人的卡；且收养后 cc==云端优先卡 → bindcard 停发，
+//   天然无振荡。据此撤销健康跳过：healthy 与 unhealthy 两路统一走 act=new
+//   收养，日志区分来源（cloud rebind wins / local card unhealthy）。
+//   安全闸不变：300s 同卡冷却 + code=7 被踢卡不自动试。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.94p"
+  #define BS_DYLIB_VER     "v6.95p"
 #else
-  #define BS_DYLIB_VER     "v6.94"
+  #define BS_DYLIB_VER     "v6.95"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -3807,23 +3815,18 @@ static int bs_hb_ping(uintptr_t base) {
                                            bc);
                                 }
                             }
-                        } else if (healthy) {
-                            static long last_bc_skip = 0;
-                            if (nowb - last_bc_skip >= 300) {
-                                last_bc_skip = nowb;
-                                bs_log("[card] cloud deliver skipped - "
-                                       "own card healthy (%.20s...)", g_card_cur);
-                            }
                         } else {
-                            // ★★★★★ v6.94（2026-11-21 dac35ca5 现场根治）：本机有卡
-                            //   对象但**不健康**（残留过期卡/被云端判死的卡）——旧逻辑只把
-                            //   bindcard 收进 g_card_cloud 临时变量；cardwatch 每拍校验残留
-                            //   旧卡，服务端回过期卡 expires_ts 把 g_card_expire 刷回旧值，
-                            //   与 hb code=0 分支互刷 ⇒ verdict_ok 恒 0 ⇒ 中控「未授权+
-                            //   旧到期」死锁。修法：与上方「无卡」分支同款，直接 act=new
-                            //   收养云端卡 —— bindcard 只发给「卡绑在此 devid 名下」的设备，
-                            //   收养即与本机真实归属对齐。安全闸：300s 同卡冷却 +
-                            //   code=7 被踢卡不自动试 + 健康卡绝不覆盖（上方分支）。
+                            // ★★★★★ v6.94→v6.95（2026-11-21 dac35ca5 现场根治 + 用户拍板）：
+                            //   本机有卡对象 —— 不论**不健康**（残留过期卡/被云端判死）还是
+                            //   **健康在用**，一律 act=new 收养云端 bindcard。
+                            //   · v6.94 先根治病锁：残留旧卡被 cardwatch 每拍校验刷回旧
+                            //     expire，与 hb code=0 分支互刷 ⇒ verdict_ok 恒 0 ⇒
+                            //     中控「未授权+旧到期」；不健康路径与空卡分支同款收养。
+                            //   · v6.95 撤销「健康跳过」：换绑操作本身即管理员权威意图，
+                            //     bindcard 只发给「卡绑在此 devid 名下」的设备（云端
+                            //     bindcard_deliver 同源判定），收养后 cc==云端优先卡 →
+                            //     bindcard 停发，天然无振荡。
+                            //   安全闸：300s 同卡冷却 + code=7 被踢卡不自动试。
                             snprintf(g_card_cloud, sizeof(g_card_cloud), "%s", bc);
                             static char bcl_try2[80] = {0};
                             static long bcl_at2 = 0;
@@ -3833,9 +3836,11 @@ static int bs_hb_ping(uintptr_t base) {
                                 !(strcmp(bc, bcl_try2) == 0 && nowb - bcl_at2 < 300)) {
                                 snprintf(bcl_try2, sizeof(bcl_try2), "%s", bc);
                                 bcl_at2 = nowb;
-                                bs_log("[card] cloud deliver ACTIVATE %.20s... "
-                                       "(local card unhealthy cur=%.20s...)",
-                                       bc, g_card_cur);
+                                bs_log("[card] cloud deliver ACTIVATE %.20s... (%s cur=%.20s...)",
+                                       bc,
+                                       healthy ? "own card healthy, cloud rebind wins"
+                                               : "local card unhealthy",
+                                       g_card_cur);
                                 if (bs_card_login(bc, 1) == 0) {
                                     snprintf(g_card_cur, sizeof(g_card_cur), "%s", bc);
                                     g_card_kicked[0]  = 0;

@@ -44,14 +44,15 @@ jobs:
       - name: Sanity strings
         run: |
           strings bs_unlock.dylib | grep -q "keyhunt" || (echo "MISSING keyhunt" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.94" || (echo "MISSING v6.94" && exit 1)
-          # ★ v6.94：本地残留不健康卡时收养云端 bindcard（换绑后中控未授权+旧到期死锁根治）
+          strings bs_unlock.dylib | grep -q "v6.95" || (echo "MISSING v6.95" && exit 1)
+          # ★ v6.94/v6.95：本地卡不健康或健康在用都收养云端 bindcard（换绑死锁根治 + 用户拍板换绑即权威意图）
           strings bs_unlock.dylib | grep -q "local card unhealthy" || (echo "MISSING v6.94 unhealthy adopt" && exit 1)
+          strings bs_unlock.dylib | grep -q "cloud rebind wins" || (echo "MISSING v6.95 healthy adopt" && exit 1)
           # ★ v6.66：中控点运行必须解除 hard-fail（8112 事故）
           strings bs_unlock.dylib | grep -q "hard-fail CLEARED by center run evidence" || (echo "MISSING v6.66 hard-fail clear on center run" && exit 1)
           # ★ v6.67：func-nil 是本 dylib 唯一允许的自动运行路径
           strings bs_unlock.dylib | grep -q "func-nil EXEMPT: hard-fail bypassed" || (echo "MISSING v6.67 func-nil hard-fail exemption" && exit 1)
-          strings bs_unlock.dylib | grep -q "v6.94" || (echo "MISSING v6.94 tag" && exit 1)
+          strings bs_unlock.dylib | grep -q "v6.95" || (echo "MISSING v6.95 tag" && exit 1)
           # ★ v6.93：plan-C exec 禁用（bb_load_one_module 栈不平衡 → runner pcall 布尔崩溃），回归 dict-only 下发
           strings bs_unlock.dylib | grep -q "plan-C exec DISABLED" || (echo "MISSING v6.93 plan-C disable marker" && exit 1)
           # ★ v6.93：dict-only 下发链路仍在（waitCallModule 消费端 + watchdog 重灌）
@@ -417,13 +418,13 @@ jobs:
           echo "=== probe variant carries the lock banner + own version tag ==="
           strings bs_unlock_probe.dylib | grep -q "probe-locked build, MODE_UNLOCK not compiled" \
             || (echo "MISSING v6.62 probe-lock banner" && exit 1)
-          strings bs_unlock_probe.dylib | grep -q "v6.94p" || (echo "MISSING v6.94p probe version tag" && exit 1)
+          strings bs_unlock_probe.dylib | grep -q "v6.95p" || (echo "MISSING v6.95p probe version tag" && exit 1)
 
           echo "=== full build must NOT carry the lock banner (macro really gated) ==="
           if strings bs_unlock.dylib | grep -q "probe-locked build"; then
             echo "FATAL: lock banner leaked into full build (-DBS_PROBE_LOCKED applied globally)" && exit 1
           fi
-          if strings bs_unlock.dylib | grep -q "v6.94p"; then
+          if strings bs_unlock.dylib | grep -q "v6.95p"; then
             echo "FATAL: probe version tag leaked into full build" && exit 1
           fi
 
