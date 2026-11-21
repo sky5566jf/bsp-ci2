@@ -1056,10 +1056,21 @@ static unsigned g_prj_ver_lo = 0;
 //      check_attack_monster（csws 解包实锤），bs_modules 补齐这两件即通。
 //   ④ 顺带解悬案：v6.67 的「4~5h func-nil」家族 —— 胶水定时 load(name.."=nil")()
 //      抹全局后，dict 有源码即可自动重执行恢复，无需 [ar] 拉起。
+// ★★★★★ v6.94（2026-11-21，dac35ca5 现场根治「换绑后中控未授权+旧到期」死锁）：
+//   现场闭环：设备本地 g_card_cur 残留一张已过期+已被云端解绑的旧卡（VDKA，
+//   expire=11/07），客户换绑新卡（ZD93）后云端 bindcard 一直下发，但 v6.81 的
+//   收养分支只覆盖「g_card_cur 为空」；本地有卡但不健康走 else 只 stash 不激活。
+//   同时 cardwatch 每拍校验残留旧卡，服务端回过期卡 expires_ts=11/07 →
+//   g_card_expire 被刷回旧值，与 hb code=0 分支（写 12-21）两路互刷 ⇒
+//   verdict_ok 恒 0 ⇒ 中控「未授权」但「到期时间」有值，重装 deb/换绑均无效。
+//   修法：bindcard 分支的「本机有卡但不健康」路径补上与空卡同款的 act=new
+//   收养 —— 本机卡不健康（过期/被清）即不再是「运营在用的卡」，云端 bindcard
+//   只发给「卡绑在此 devid 名下」的设备，收养即与真实归属对齐。安全闸不变：
+//   300s 同卡冷却 + code=7 被踢卡不自动试 + 健康卡绝不覆盖。
 #ifdef BS_PROBE_LOCKED
-  #define BS_DYLIB_VER     "v6.93p"
+  #define BS_DYLIB_VER     "v6.94p"
 #else
-  #define BS_DYLIB_VER     "v6.93"
+  #define BS_DYLIB_VER     "v6.94"
 #endif
 // ★★★★★ v6.59（2026-11-07 用户定策）：beta.so 分发**彻底脱离云端**。
 //   ① 版本查询 GET /ver 改打局域网中控（BSModuleServer v1.3.33 新增 /ver 转发，
@@ -3804,9 +3815,47 @@ static int bs_hb_ping(uintptr_t base) {
                                        "own card healthy (%.20s...)", g_card_cur);
                             }
                         } else {
+                            // ★★★★★ v6.94（2026-11-21 dac35ca5 现场根治）：本机有卡
+                            //   对象但**不健康**（残留过期卡/被云端判死的卡）——旧逻辑只把
+                            //   bindcard 收进 g_card_cloud 临时变量；cardwatch 每拍校验残留
+                            //   旧卡，服务端回过期卡 expires_ts 把 g_card_expire 刷回旧值，
+                            //   与 hb code=0 分支互刷 ⇒ verdict_ok 恒 0 ⇒ 中控「未授权+
+                            //   旧到期」死锁。修法：与上方「无卡」分支同款，直接 act=new
+                            //   收养云端卡 —— bindcard 只发给「卡绑在此 devid 名下」的设备，
+                            //   收养即与本机真实归属对齐。安全闸：300s 同卡冷却 +
+                            //   code=7 被踢卡不自动试 + 健康卡绝不覆盖（上方分支）。
                             snprintf(g_card_cloud, sizeof(g_card_cloud), "%s", bc);
-                            bs_log("[card] cloud deliver received %.20s... (cur=%s)",
-                                   bc, g_card_cur[0] ? g_card_cur : "(none)");
+                            static char bcl_try2[80] = {0};
+                            static long bcl_at2 = 0;
+                            int bc_skip2 = (g_card_kicked[0] &&
+                                            strcmp(bc, g_card_kicked) == 0);
+                            if (!bc_skip2 &&
+                                !(strcmp(bc, bcl_try2) == 0 && nowb - bcl_at2 < 300)) {
+                                snprintf(bcl_try2, sizeof(bcl_try2), "%s", bc);
+                                bcl_at2 = nowb;
+                                bs_log("[card] cloud deliver ACTIVATE %.20s... "
+                                       "(local card unhealthy cur=%.20s...)",
+                                       bc, g_card_cur);
+                                if (bs_card_login(bc, 1) == 0) {
+                                    snprintf(g_card_cur, sizeof(g_card_cur), "%s", bc);
+                                    g_card_kicked[0]  = 0;
+                                    g_card_kickts     = 0;
+                                    g_note_cf_card[0] = 0;
+                                    g_note_cf_ts      = 0;
+                                    g_note_cf_evt     = 0;
+                                    g_note_cf_sent    = 0;
+                                    g_note_force      = 1;
+                                    bs_card_cache_save();
+                                    bs_log("[card] cloud deliver activated -> "
+                                           "center auth/time fixed (%.20s...)", bc);
+                                } else {
+                                    bs_log("[card] cloud deliver activate failed "
+                                           "(%.20s...)", bc);
+                                }
+                            } else {
+                                bs_log("[card] cloud deliver received %.20s... (cur=%s)",
+                                       bc, g_card_cur[0] ? g_card_cur : "(none)");
+                            }
                         }
                     }
                 }
