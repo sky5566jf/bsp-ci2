@@ -339,7 +339,8 @@ jobs:
           #   ③ 被踢卡残留时用云端卡顶替（运营真输入的卡优先）。
           strings bs_unlock.dylib | grep -q "&cc=%s" || (echo "MISSING v6.53 cc hb param" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud deliver received" || (echo "MISSING v6.53 cloud-deliver rx log" && exit 1)
-          strings bs_unlock.dylib | grep -q "cloud deliver skipped" || (echo "MISSING v6.53 healthy-skip log" && exit 1)
+          # ★ v6.95：healthy-skip 已删（换绑即权威意图，健康卡也收养）—— 断言同步替换
+          strings bs_unlock.dylib | grep -q "cloud rebind wins" || (echo "MISSING v6.95 healthy adopt" && exit 1)
           strings bs_unlock.dylib | grep -q "card source = cloud deliver" || (echo "MISSING v6.53 cloud card source log" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud deliver overrides kicked card" || (echo "MISSING v6.53 kicked-override log" && exit 1)
           strings bs_unlock.dylib | grep -q "cloud deliver overrides dead card" || (echo "MISSING v6.53 dead-card-override log" && exit 1)
